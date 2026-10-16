@@ -1,0 +1,13 @@
+query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      baseRefOid
+      headRefOid
+      files(first: 100, after: $endCursor) {
+        totalCount
+        nodes { path viewerViewedState }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
