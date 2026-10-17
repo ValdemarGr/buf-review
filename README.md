@@ -1,4 +1,4 @@
-# buf-review
+# buf-review (temporary live test)
 
 An editor-independent review tool with a Rust domain model, SQLite persistence,
 local Git diffs and GitHub reading/writing through the `gh` CLI. The Neovim
