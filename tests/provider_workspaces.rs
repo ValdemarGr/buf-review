@@ -27,7 +27,7 @@ fn invalid_diff_location_still_requires_explicit_relocation() {
 }
 
 #[test]
-fn grouped_submission_keeps_standalone_queued_and_exact_historical_head() {
+fn publication_preserves_global_order_and_exact_historical_head() {
     run("grouped");
 }
 #[test]
@@ -51,11 +51,11 @@ fn prepared_review_retries_without_duplicate_roots() {
     run("retry");
 }
 #[test]
-fn removed_prepared_drafts_do_not_get_submitted() {
+fn successfully_prepared_drafts_cannot_be_deleted() {
     run("drop");
 }
 #[test]
-fn submitted_review_survives_progress_failure() {
+fn progress_failure_preserves_prepared_comments_and_blocks_conclusion() {
     run("progress");
 }
 #[test]
@@ -63,35 +63,35 @@ fn uncertain_submission_reconciles_without_second_submit() {
     run("uncertain_submit");
 }
 #[test]
-fn summaries_edit_and_react_using_review_resources() {
+fn summaries_are_immutable_but_reactions_use_review_resources() {
     run("summary");
 }
 #[test]
-fn uncertain_review_allows_unrelated_standalone_and_progress() {
+fn uncertain_review_blocks_later_operations_without_skipping() {
     run("uncertain_review");
 }
 #[test]
-fn relocated_prepared_roots_and_replies_replace_only_private_versions() {
+fn prepared_roots_and_replies_reject_relocation() {
     run("relocate");
 }
 #[test]
-fn relocated_head_rebuilds_known_private_review_at_new_commit() {
+fn prepared_review_retains_original_commit_after_relocation_rejection() {
     run("relocate_head");
 }
 #[test]
-fn grouped_reply_targets_published_standalone_before_refetch() {
+fn reply_targets_prepared_root_receipt_before_refetch() {
     run("receipt_reply");
 }
 #[test]
-fn lost_progress_response_reconciles_and_does_not_resubmit_review() {
+fn lost_progress_response_reconciles_before_concluding_review_once() {
     run("uncertain_progress");
 }
 #[test]
-fn uncertain_delete_uses_canonical_published_identity() {
+fn fetched_comment_delete_rejected_before_provider_writes() {
     run("alias_delete");
 }
 #[test]
-fn uncertain_edit_uses_canonical_published_identity() {
+fn fetched_comment_edit_rejected_before_provider_writes() {
     run("alias_edit");
 }
 #[test]
@@ -99,16 +99,102 @@ fn uncertain_reaction_uses_canonical_published_identity() {
     run("alias_reaction");
 }
 #[test]
-fn resumed_attempt_rechecks_remote_body_before_writing() {
+fn remote_body_changes_cannot_be_overwritten_by_local_edit() {
     run("resumed_conflict");
 }
 #[test]
 fn provider_receipts_merge_concurrent_unrelated_saves() {
     run("concurrent");
 }
+#[test]
+fn adjacent_roots_share_native_review_creation_and_keep_individual_receipts() {
+    run("bulk");
+}
+#[test]
+fn terminal_conclusion_joins_native_review_creation() {
+    run("bulk_conclude");
+}
+#[test]
+fn failed_bulk_receipt_read_retries_without_recreating_review() {
+    run("bulk_receipts");
+}
+#[test]
+fn viewed_operation_separates_root_groups_without_reordering() {
+    run("bulk_boundary");
+}
+#[test]
+fn failed_group_boundary_blocks_later_roots_until_retry() {
+    run("bulk_boundary_failure");
+}
+#[test]
+fn reply_before_root_uses_the_roots_pinned_head_for_pending_review() {
+    run("reply_first");
+}
+#[test]
+fn owned_pending_review_refresh_imports_members_and_external_submission_starts_fresh() {
+    run("bulk_external");
+}
+#[test]
+fn external_review_submission_preserves_newly_queued_conclusion() {
+    run("bulk_external_conclusion");
+}
+#[test]
+fn historical_bulk_receipts_match_original_anchors() {
+    run("bulk_old_anchor");
+}
+#[test]
+fn reply_lookup_failure_is_retryable_without_an_uncertain_write() {
+    run("reply_lookup_fail");
+}
+#[test]
+fn legacy_standalone_inline_drafts_require_explicit_move_before_publication() {
+    run("legacy_standalone");
+}
 
 fn run(case: &str) {
     let directory = tempdir().unwrap();
+    fs::write(directory.path().join("review.py"), r#"import json, os, pathlib, sys
+root = pathlib.Path(os.environ["PROVIDER_ROOT"])
+case = os.environ["PROVIDER_CASE"]
+if sys.argv[1] == "thread":
+    body = json.load(sys.stdin)
+    counter = root / "thread-counter"
+    count = int(counter.read_text()) if counter.exists() else len(json.loads((root / "review-comments.json").read_text()))
+    identity = 201 + count
+    counter.write_text(str(count + 1))
+    print(json.dumps({"data": {"addPullRequestReviewThread": {"thread": {"id": "T" + str(identity), "comments": {"nodes": [{"id": "C" + str(identity), "databaseId": identity}]}}}}}))
+elif sys.argv[1] == "comments":
+    if case == "bulk_receipts" and not (root / "discovery").exists():
+        (root / "discovery").touch()
+        sys.stderr.write("HTTP 503 review comments temporarily unavailable")
+        sys.exit(1)
+    comments = json.loads((root / "review-comments.json").read_text())
+    if case == "bulk_old_anchor":
+        for comment in comments:
+            comment["original_commit_id"] = comment["commit_id"]
+            comment["original_line"] = comment["line"]
+            comment["original_start_line"] = comment.get("start_line")
+            comment.update(commit_id="new-head", line=None, start_line=None)
+    print(json.dumps([comments]))
+else:
+    body = json.load(sys.stdin)
+    if case == "anchor_rejection" or (case == "schema_rejection" and not (root / "rejected").exists()):
+        (root / "rejected").touch()
+        sys.stderr.write(os.environ["PROVIDER_REJECTION_ERROR"])
+        sys.exit(1)
+    counter = root / "review-counter"
+    review_id = int(counter.read_text()) if counter.exists() else 100
+    counter.write_text(str(review_id + 1))
+    first_comment = 201 + 100 * (review_id - 100)
+    comments = [dict(comment, id=first_comment + index, node_id="C" + str(first_comment + index), commit_id=body["commit_id"])
+                for index, comment in enumerate(body.get("comments", []))]
+    (root / "review-comments.json").write_text(json.dumps(comments))
+    if case == "uncertain_review":
+        sys.stderr.write("connection lost after preparing comment")
+        sys.exit(1)
+    state = {"COMMENT": "COMMENTED", "APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}.get(body.get("event"), "PENDING")
+    print(json.dumps(dict(id=review_id, node_id="R" + str(review_id), state=state, body=body.get("body", ""))))
+"#).unwrap();
     let executable = directory.path().join("gh");
     fs::write(&executable,r#"#!/bin/sh
 if [ "$1" = repo ]; then printf '{"nameWithOwner":"owner/repo"}'; exit; fi
@@ -144,7 +230,8 @@ case "$endpoint" in
    fi
    printf '{"id":100,"node_id":"R100","state":"COMMENTED","body":"Summary"}' ;;
  */reviews/100) printf '{"id":100,"node_id":"R100","state":"COMMENTED","body":"Summary"}' ;;
- */reviews) printf '{"id":100,"node_id":"R100","state":"PENDING"}' ;;
+ */reviews/*/comments?*) python3 "$PROVIDER_ROOT/review.py" comments ;;
+ */reviews) printf '%s' "$body" | python3 "$PROVIDER_ROOT/review.py" create ;;
  */pulls/comments/400) printf '{"id":400,"body":"Root","in_reply_to_id":null}' ;;
  */pulls/comments/*)
    if [ "$method" = PATCH ]; then printf 'HTTP 404 private review comments are unavailable through REST update' >&2; exit 1; fi
@@ -163,14 +250,16 @@ case "$endpoint" in
     *addPullRequestReviewThreadReply*) printf '{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"C202","databaseId":202}}}}' ;;
     *addPullRequestReviewThread*)
       if [ "$PROVIDER_CASE" = uncertain_review ]; then printf 'connection lost after preparing comment' >&2; exit 1; fi
-      printf '{"data":{"addPullRequestReviewThread":{"thread":{"id":"T201","comments":{"nodes":[{"id":"C201","databaseId":201}]}}}}}' ;;
+      printf '%s' "$body" | python3 "$PROVIDER_ROOT/review.py" thread ;;
     *updatePullRequestReviewComment*) printf '{"data":{"updatePullRequestReviewComment":{"pullRequestReviewComment":{"id":"C201","body":"Root edited"}}}}' ;;
     *markFileAsViewed*)
-      if [ "$PROVIDER_CASE" = progress ] && [ ! -f "$PROVIDER_ROOT/progress" ]; then touch "$PROVIDER_ROOT/progress"; printf 'HTTP 422 viewed state rejected' >&2; exit 1; fi
+      if { [ "$PROVIDER_CASE" = progress ] || [ "$PROVIDER_CASE" = bulk_boundary_failure ]; } && [ ! -f "$PROVIDER_ROOT/progress" ]; then touch "$PROVIDER_ROOT/progress"; printf 'HTTP 422 viewed state rejected' >&2; exit 1; fi
       if [ "$PROVIDER_CASE" = uncertain_progress ] && [ ! -f "$PROVIDER_ROOT/progress" ]; then touch "$PROVIDER_ROOT/progress"; printf 'connection lost after setting viewed state' >&2; exit 1; fi
       printf '{"data":{"markFileAsViewed":{"clientMutationId":"done"}}}' ;;
     *addReaction*) printf '{"data":{"addReaction":{"clientMutationId":"done"}}}' ;;
-    *reviewThreads*) printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"T400","comments":{"nodes":[{"databaseId":400}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' ;;
+    *reviewThreads*)
+      if [ "$PROVIDER_CASE" = reply_lookup_fail ] && [ ! -f "$PROVIDER_ROOT/thread-lookup" ]; then touch "$PROVIDER_ROOT/thread-lookup"; printf 'HTTP 503 thread lookup unavailable' >&2; exit 1; fi
+      printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"T400","comments":{"nodes":[{"databaseId":400}]}},{"id":"T201","comments":{"nodes":[{"databaseId":201}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' ;;
     null) printf '[{"data":{"repository":{"pullRequest":{"baseRefOid":"old-base","headRefOid":"new-head","files":{"totalCount":1,"nodes":[{"path":"file.rs","viewerViewedState":"VIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}]' ;;
     *) printf 'unexpected GraphQL' >&2; exit 1 ;;
    esac ;;
@@ -328,8 +417,50 @@ fn provider_child() {
             },
         ],
     };
+    if matches!(case.as_str(), "reply_first" | "reply_lookup_fail") {
+        read.pull_request.revision.head = "new-head".into();
+        let CommentTarget::Diff(anchor) = location("old-head") else {
+            unreachable!()
+        };
+        read.comments.push(ReadComment {
+            content: CommentContent {
+                id: CommentId("existing-root".into()),
+                body: "Existing root".into(),
+            },
+            author: Some(reviewer.clone()),
+            draft: false,
+            target: CommentTarget::Diff(ReadDiffLocation {
+                original: ReadCommentAnchor {
+                    revision: ReadCommentRevision::Comparison(anchor.revision),
+                    position: anchor.position,
+                },
+                current: None,
+                subject: Some(CommentSubject::Line),
+                diff_hunk: None,
+                outdated: Some(true),
+            }),
+        });
+        backend.mappings.extend([
+            IdMapping {
+                resource: "review_comment".into(),
+                core_id: "existing-root".into(),
+                remote_id: "400".into(),
+            },
+            IdMapping {
+                resource: "review_thread".into(),
+                core_id: "existing-root".into(),
+                remote_id: "T400".into(),
+            },
+        ]);
+        if case == "reply_lookup_fail" {
+            backend
+                .mappings
+                .retain(|mapping| mapping.resource != "review_thread");
+        }
+    }
     if case.starts_with("alias_") || case == "resumed_conflict" {
         read.comments.push(ReadComment {
+            draft: false,
             content: CommentContent {
                 id: CommentId("local-alias".into()),
                 body: "Original".into(),
@@ -345,6 +476,7 @@ fn provider_child() {
     }
     if case == "summary" {
         read.comments.push(ReadComment {
+            draft: false,
             content: CommentContent {
                 id: CommentId("summary".into()),
                 body: "Summary".into(),
@@ -369,6 +501,499 @@ fn provider_child() {
         .import_review(&ReviewId("snapshot".into()), &reviewer, &read, &backend)
         .unwrap();
     let mut workspace = store.open_workspace(&ReviewId("snapshot".into())).unwrap();
+    if case == "legacy_standalone" {
+        workspace = store
+            .mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::Save {
+                    comment: None,
+                    target: Some(location("old-head")),
+                    body: "Legacy inline draft".into(),
+                    destination: Some(buf_review::workspace::Destination::Standalone),
+                },
+            )
+            .unwrap();
+        let comment = workspace.saved_comment.clone().unwrap();
+        workspace.destinations.insert(
+            comment.clone(),
+            buf_review::workspace::Destination::Standalone,
+        );
+        workspace = store
+            .save_workspace(workspace.generation, &workspace)
+            .unwrap();
+        let error =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                .unwrap_err();
+        assert!(error.to_string().contains("move"));
+        workspace = store.workspace(&workspace.id).unwrap().unwrap();
+        assert!(workspace.completed.is_empty());
+        let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap_or_default();
+        assert!(!log.contains("\"method\":\"POST\""));
+        workspace = store
+            .mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::MoveToReview {
+                    comments: vec![comment],
+                },
+            )
+            .unwrap();
+        workspace =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                .unwrap();
+        assert_eq!(workspace.completed.len(), 1);
+        assert!(workspace.pending().unwrap().operations.is_empty());
+        return;
+    }
+    if matches!(case.as_str(), "reply_first" | "reply_lookup_fail") {
+        workspace.comparison.head = "old-head".into();
+        workspace = store
+            .save_workspace(workspace.generation, &workspace)
+            .unwrap();
+        for (target, body) in [
+            (
+                CommentTarget::Reply(CommentId("existing-root".into())),
+                "Reply first",
+            ),
+            (location("old-head"), "Pinned root after reply"),
+        ] {
+            workspace = store
+                .mutate_workspace(
+                    &workspace.id,
+                    workspace.generation,
+                    Action::Save {
+                        comment: None,
+                        target: Some(target),
+                        body: body.into(),
+                        destination: None,
+                    },
+                )
+                .unwrap();
+        }
+        if case == "reply_lookup_fail" {
+            let error =
+                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                    .unwrap_err();
+            assert!(error.to_string().contains("thread lookup unavailable"));
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+            assert!(workspace.completed.is_empty());
+            assert_eq!(workspace.suspended_attempts.len(), 1);
+            assert!(!workspace.suspended_attempts[0].uncertain);
+            let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+            assert!(!log.contains("AddPullRequestReviewThreadReplyInput"));
+        }
+        workspace =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                .unwrap();
+        assert!(workspace.pending().unwrap().operations.is_empty());
+        assert_eq!(workspace.completed.len(), 2);
+        let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let created = requests
+            .iter()
+            .find(|request| {
+                request["method"] == "POST"
+                    && request["endpoint"] == "repos/owner/repo/pulls/1/reviews"
+            })
+            .unwrap();
+        assert_eq!(
+            created["body"]["commit_id"], "old-head",
+            "pending review must use later root's saved anchor"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["body"]["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("AddPullRequestReviewThreadReplyInput")))
+                .count(),
+            1
+        );
+        return;
+    }
+    if case.starts_with("bulk") {
+        let mut ids = Vec::new();
+        for body in ["First bulk root", "Second bulk root"] {
+            workspace = store
+                .mutate_workspace(
+                    &workspace.id,
+                    workspace.generation,
+                    Action::Save {
+                        comment: None,
+                        target: Some(location("old-head")),
+                        body: body.into(),
+                        destination: None,
+                    },
+                )
+                .unwrap();
+            ids.push(workspace.saved_comment.clone().unwrap());
+        }
+        if case.starts_with("bulk_boundary") {
+            workspace = store
+                .mutate_workspace(
+                    &workspace.id,
+                    workspace.generation,
+                    Action::Viewed {
+                        path: "file.rs".into(),
+                        viewed: true,
+                    },
+                )
+                .unwrap();
+            for body in ["Third bulk root", "Fourth bulk root"] {
+                workspace = store
+                    .mutate_workspace(
+                        &workspace.id,
+                        workspace.generation,
+                        Action::Save {
+                            comment: None,
+                            target: Some(location("old-head")),
+                            body: body.into(),
+                            destination: None,
+                        },
+                    )
+                    .unwrap();
+                ids.push(workspace.saved_comment.clone().unwrap());
+            }
+        }
+        if case == "bulk_conclude" {
+            workspace = store
+                .mutate_workspace(
+                    &workspace.id,
+                    workspace.generation,
+                    Action::Summary {
+                        conclusion: ReviewConclusion {
+                            outcome: ReviewOutcome::Comment,
+                            body: Some("Summary".into()),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        if case == "bulk_receipts" {
+            let error =
+                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                    .unwrap_err();
+            assert!(error.to_string().contains("503"));
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+            assert!(workspace.completed.is_empty());
+            assert_eq!(workspace.suspended_attempts.len(), 1);
+        }
+        if case == "bulk_boundary_failure" {
+            let error =
+                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                    .unwrap_err();
+            assert!(error.to_string().contains("viewed state rejected"));
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+            assert_eq!(workspace.completed.len(), 2);
+            let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+            assert!(!log.contains("AddPullRequestReviewThreadInput"));
+        }
+        workspace =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                .unwrap();
+        assert!(workspace.pending().unwrap().operations.is_empty());
+        assert_eq!(
+            workspace.completed.len(),
+            if case == "bulk_conclude" {
+                3
+            } else if case.starts_with("bulk_boundary") {
+                5
+            } else {
+                2
+            }
+        );
+        for (index, id) in ids.iter().enumerate() {
+            let result = workspace
+                .results
+                .iter()
+                .find(|result| {
+                    matches!(&result.operation.change,
+                Event::CreateComment { comment } if &comment.content.id == id)
+                })
+                .unwrap();
+            assert!(
+                result
+                    .mappings
+                    .iter()
+                    .any(|mapping| mapping.resource == "review_comment"
+                        && mapping.core_id == id.0
+                        && mapping.remote_id == (201 + index).to_string())
+            );
+        }
+        let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let creates = requests
+            .iter()
+            .filter(|request| {
+                request["method"] == "POST"
+                    && request["endpoint"] == "repos/owner/repo/pulls/1/reviews"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0]["body"]["commit_id"], "old-head");
+        assert_eq!(creates[0]["body"]["comments"].as_array().unwrap().len(), 2);
+        assert_eq!(creates[0]["body"]["comments"][0]["body"], "First bulk root");
+        assert_eq!(
+            creates[0]["body"]["comments"][1]["body"],
+            "Second bulk root"
+        );
+        assert_eq!(creates[0]["body"]["comments"][0]["line"], 4);
+        assert_eq!(creates[0]["body"]["comments"][0]["start_line"], 2);
+        assert_eq!(creates[0]["body"]["comments"][0]["side"], "RIGHT");
+        assert_eq!(
+            creates[0]["body"]["event"].as_str(),
+            (case == "bulk_conclude").then_some("COMMENT")
+        );
+        assert!(!requests.iter().any(|request| {
+            request["endpoint"]
+                .as_str()
+                .is_some_and(|endpoint| endpoint.ends_with("/events"))
+        }));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["endpoint"]
+                    == "repos/owner/repo/pulls/1/reviews/100/comments?per_page=100")
+                .count(),
+            if case == "bulk_receipts" { 2 } else { 1 }
+        );
+        if case.starts_with("bulk_boundary") {
+            let viewed = requests
+                .iter()
+                .position(|request| {
+                    request["body"]["query"]
+                        .as_str()
+                        .is_some_and(|query| query.contains("markFileAsViewed"))
+                })
+                .unwrap();
+            let roots = requests
+                .iter()
+                .enumerate()
+                .filter(|(_, request)| {
+                    request["body"]["query"]
+                        .as_str()
+                        .is_some_and(|query| query.contains("AddPullRequestReviewThreadInput"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(roots.len(), 2);
+            assert!(viewed < roots[0].0 && roots[0].0 < roots[1].0);
+            assert_eq!(
+                roots[0].1["body"]["variables"]["input"]["body"],
+                "Third bulk root"
+            );
+            assert_eq!(
+                roots[1].1["body"]["variables"]["input"]["body"],
+                "Fourth bulk root"
+            );
+        }
+        if case.starts_with("bulk_external") {
+            let mut fresh = workspace.review.read.clone();
+            fresh.comments = workspace
+                .completed
+                .iter()
+                .filter_map(|operation| {
+                    let Event::CreateComment { comment } = &operation.change else {
+                        return None;
+                    };
+                    let CommentTarget::Diff(location) = &comment.target else {
+                        return None;
+                    };
+                    Some(ReadComment {
+                        content: CommentContent {
+                            id: CommentId(format!("fetched-{}", comment.content.id.0)),
+                            body: comment.content.body.clone(),
+                        },
+                        author: Some(comment.author.clone()),
+                        draft: true,
+                        target: CommentTarget::Diff(ReadDiffLocation {
+                            original: ReadCommentAnchor {
+                                revision: ReadCommentRevision::Comparison(
+                                    location.revision.clone(),
+                                ),
+                                position: location.position.clone(),
+                            },
+                            current: None,
+                            subject: Some(CommentSubject::Line),
+                            diff_hunk: None,
+                            outdated: Some(false),
+                        }),
+                    })
+                })
+                .collect();
+            fresh.comments.push(ReadComment {
+                content: CommentContent {
+                    id: CommentId("external-reply".into()),
+                    body: "Additional pending reply from another tool".into(),
+                },
+                author: Some(reviewer.clone()),
+                draft: true,
+                target: CommentTarget::Reply(fresh.comments[0].content.id.clone()),
+            });
+            fresh.reviews = vec![ReadReview {
+                id: Some(ReviewResourceId("fetched-review".into())),
+                author: Some(reviewer.clone()),
+                state: ReadReviewState::Inactive {
+                    state: InactiveReviewState::Pending,
+                    body: None,
+                },
+            }];
+            let mut fetched_backend = backend.clone();
+            fetched_backend.mappings.push(IdMapping {
+                resource: "review".into(),
+                core_id: "fetched-review".into(),
+                remote_id: "100".into(),
+            });
+            for (index, comment) in fresh.comments.iter().enumerate() {
+                for resource in ["review_comment", "review_member:100"] {
+                    fetched_backend.mappings.push(IdMapping {
+                        resource: resource.into(),
+                        core_id: comment.content.id.0.clone(),
+                        remote_id: (201 + index).to_string(),
+                    });
+                }
+            }
+            let pending_snapshot = ReviewId("fetched-pending".into());
+            store
+                .import_review(&pending_snapshot, &reviewer, &fresh, &fetched_backend)
+                .unwrap();
+            workspace = store
+                .refresh_workspace(&workspace.id, workspace.generation, &pending_snapshot)
+                .unwrap();
+            let pending = workspace.view().unwrap();
+            assert_eq!(pending.comments.len(), 3);
+            assert!(
+                pending
+                    .comments
+                    .iter()
+                    .all(|comment| comment.fetched && comment.draft)
+            );
+            assert!(pending.todo.is_empty() && workspace.pending().unwrap().operations.is_empty());
+            for id in &ids {
+                assert!(
+                    pending
+                        .comments
+                        .iter()
+                        .any(|comment| comment.comment.content().id == *id)
+                );
+            }
+            assert!(
+                pending
+                    .comments
+                    .iter()
+                    .any(|comment| comment.comment.content().body
+                        == "Additional pending reply from another tool")
+            );
+            assert_eq!(workspace.preparation["pending"]["id"], 100);
+            if case == "bulk_external_conclusion" {
+                workspace = store
+                    .mutate_workspace(
+                        &workspace.id,
+                        workspace.generation,
+                        Action::Summary {
+                            conclusion: ReviewConclusion {
+                                outcome: ReviewOutcome::Comment,
+                                body: Some("Next review summary".into()),
+                            },
+                        },
+                    )
+                    .unwrap();
+            }
+            for comment in &mut fresh.comments {
+                comment.draft = false;
+            }
+            fresh.reviews[0].state = ReadReviewState::Submitted(ReviewConclusion {
+                outcome: ReviewOutcome::Comment,
+                body: Some("Concluded externally".into()),
+            });
+            let submitted_snapshot = ReviewId("fetched-submitted".into());
+            store
+                .import_review(&submitted_snapshot, &reviewer, &fresh, &fetched_backend)
+                .unwrap();
+            workspace = store
+                .refresh_workspace(&workspace.id, workspace.generation, &submitted_snapshot)
+                .unwrap();
+            let submitted = workspace.view().unwrap();
+            assert_eq!(submitted.comments.len(), 3);
+            assert!(
+                submitted
+                    .comments
+                    .iter()
+                    .all(|comment| comment.fetched && !comment.draft)
+            );
+            for id in &ids {
+                assert!(
+                    submitted
+                        .comments
+                        .iter()
+                        .any(|comment| comment.comment.content().id == *id)
+                );
+            }
+            assert_eq!(submitted.todo.len(), 3);
+            assert!(workspace.preparation.is_null());
+            if case == "bulk_external_conclusion" {
+                assert_eq!(
+                    workspace
+                        .wip
+                        .as_ref()
+                        .unwrap()
+                        .conclusion
+                        .as_ref()
+                        .unwrap()
+                        .body
+                        .as_deref(),
+                    Some("Next review summary")
+                );
+            } else {
+                assert!(workspace.wip.is_none());
+                assert!(workspace.pending().unwrap().operations.is_empty());
+            }
+            assert!(
+                store
+                    .get_review(&pending_snapshot)
+                    .unwrap()
+                    .unwrap()
+                    .read
+                    .comments
+                    .iter()
+                    .all(|comment| comment.draft)
+            );
+            workspace = store
+                .mutate_workspace(
+                    &workspace.id,
+                    workspace.generation,
+                    Action::Save {
+                        comment: None,
+                        target: Some(location("old-head")),
+                        body: "New review after external submission".into(),
+                        destination: None,
+                    },
+                )
+                .unwrap();
+            workspace =
+                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                    .unwrap();
+            assert!(workspace.pending().unwrap().operations.is_empty());
+            let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+            assert_eq!(
+                log.matches(
+                    "\"endpoint\":\"repos/owner/repo/pulls/1/reviews\",\"method\":\"POST\""
+                )
+                .count(),
+                2
+            );
+            if case == "bulk_external" {
+                assert_eq!(workspace.preparation["pending"]["id"], 101);
+            }
+        }
+        return;
+    }
     if matches!(
         case.as_str(),
         "schema_rejection" | "schema_recovery" | "anchor_rejection"
@@ -387,7 +1012,6 @@ fn provider_child() {
             )
             .unwrap();
         let draft = workspace.saved_comment.clone().unwrap();
-        let mut rejected = None;
         if case == "schema_recovery" {
             workspace = store
                 .mutate_workspace(
@@ -411,20 +1035,36 @@ fn provider_child() {
                     },
                 )
                 .unwrap();
-            rejected = workspace.saved_comment.clone();
+            let rejected = workspace.saved_comment.clone().unwrap();
             workspace = store
                 .mutate_workspace(
                     &workspace.id,
                     workspace.generation,
                     Action::RejectAnchor {
-                        comment: rejected.clone().unwrap(),
+                        comment: rejected.clone(),
                         message: ANCHOR_REJECTION.into(),
                     },
                 )
                 .unwrap();
             drop(store);
             store = Store::open(&root).unwrap();
-            assert_eq!(store.workspace(&workspace.id).unwrap().unwrap(), workspace);
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+            assert!(workspace.rejected_anchors.contains_key(&rejected));
+            let error =
+                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                    .unwrap_err();
+            assert!(error.to_string().contains("resolution"));
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+            assert!(!workspace.rejected_anchors.contains_key(&draft));
+            assert!(workspace.rejected_anchors.contains_key(&rejected));
+            assert!(!std::path::Path::new(&std::env::var("PROVIDER_LOG").unwrap()).exists());
+            workspace = store
+                .mutate_workspace(
+                    &workspace.id,
+                    workspace.generation,
+                    Action::Delete { comment: rejected },
+                )
+                .unwrap();
         } else {
             let error =
                 github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
@@ -432,50 +1072,42 @@ fn provider_child() {
             assert!(error.to_string().contains("HTTP 422"));
             workspace = store.workspace(&workspace.id).unwrap().unwrap();
             assert!(workspace.attempt.is_none());
-            assert!(workspace.suspended_attempts.is_empty());
+            assert_eq!(workspace.suspended_attempts.len(), 1);
+            assert!(!workspace.suspended_attempts[0].uncertain);
             assert_eq!(workspace.pending().unwrap().operations.len(), 1);
             if case == "anchor_rejection" {
                 assert!(workspace.rejected_anchors.contains_key(&draft));
-            } else {
-                assert!(workspace.rejected_anchors.is_empty());
-                assert!(workspace.last_error.as_deref().unwrap().contains("oneOf"));
+                let before = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+                let error = github::publish_workspace(
+                    &mut store,
+                    &workspace.id,
+                    workspace.generation,
+                    false,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("resolution"));
+                assert_eq!(
+                    fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap(),
+                    before
+                );
+                assert!(workspace.completed.is_empty());
+                return;
             }
+            assert!(workspace.rejected_anchors.is_empty());
+            assert!(workspace.last_error.as_deref().unwrap().contains("oneOf"));
         }
         workspace =
             github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
                 .unwrap();
-        if case == "anchor_rejection" {
-            assert!(workspace.rejected_anchors.contains_key(&draft));
-            assert!(workspace.completed.is_empty());
-        } else {
-            assert!(!workspace.rejected_anchors.contains_key(&draft));
-            assert_eq!(workspace.completed.len(), 1);
-            let Event::CreateComment { comment } = &workspace.completed[0].change else {
-                panic!("original draft must be created");
-            };
-            assert_eq!(comment.content.id, draft);
-            assert_eq!(comment.content.body, "This is a test");
-            assert_eq!(comment.target, target);
-            assert_eq!(
-                workspace.pending().unwrap().operations.len(),
-                usize::from(rejected.is_some())
-            );
-            if let Some(rejected) = rejected {
-                assert_eq!(workspace.rejected_anchors.len(), 1);
-                assert!(workspace.rejected_anchors.contains_key(&rejected));
-                assert!(
-                    store
-                        .workspace_log(&workspace.id)
-                        .unwrap()
-                        .iter()
-                        .any(|entry| {
-                            entry["action"]["message"]
-                                .as_str()
-                                .is_some_and(|message| message.contains("oneOf"))
-                        })
-                );
-            }
-        }
+        assert!(!workspace.rejected_anchors.contains_key(&draft));
+        assert_eq!(workspace.completed.len(), 1);
+        let Event::CreateComment { comment } = &workspace.completed[0].change else {
+            panic!("original draft must be created")
+        };
+        assert_eq!(comment.content.id, draft);
+        assert_eq!(comment.content.body, "This is a test");
+        assert_eq!(comment.target, target);
+        assert!(workspace.pending().unwrap().operations.is_empty());
         let requests: Vec<Value> = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
             .unwrap()
             .lines()
@@ -486,10 +1118,14 @@ fn provider_child() {
             requests.len(),
             if case == "schema_rejection" { 2 } else { 1 }
         );
-        assert!(requests.iter().all(|request| {
-            request["body"]["body"] == "This is a test"
-                && request["body"].get("subject_type").is_none()
-        }));
+        assert!(
+            requests
+                .iter()
+                .all(
+                    |request| request["body"]["comments"][0]["body"] == "This is a test"
+                        && request["body"]["comments"][0].get("subject_type").is_none()
+                )
+        );
         return;
     }
     if case.starts_with("alias_") || case == "resumed_conflict" {
@@ -507,34 +1143,23 @@ fn provider_child() {
                 destination: None,
             },
         };
+        if case != "alias_reaction" {
+            let before = workspace.clone();
+            let error = store
+                .mutate_workspace(&workspace.id, workspace.generation, action)
+                .unwrap_err();
+            assert!(error.to_string().contains("immutable"));
+            assert_eq!(store.workspace(&workspace.id).unwrap().unwrap(), before);
+            assert!(!std::path::Path::new(&std::env::var("PROVIDER_LOG").unwrap()).exists());
+            return;
+        }
         workspace = store
             .mutate_workspace(&workspace.id, workspace.generation, action)
             .unwrap();
-        if case == "resumed_conflict" {
-            let operations = workspace
-                .prepare(buf_review::workspace::Destination::Standalone)
-                .unwrap()
-                .operations;
-            workspace = store
-                .mutate_workspace(
-                    &workspace.id,
-                    workspace.generation,
-                    Action::BeginPublication {
-                        destination: buf_review::workspace::Destination::Standalone,
-                        operations,
-                    },
-                )
-                .unwrap();
-        }
         let error =
             github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
                 .unwrap_err();
-        if case == "resumed_conflict" {
-            assert!(error.to_string().contains("changed"));
-            let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
-            assert!(!log.contains("\"method\":\"PATCH\""));
-            return;
-        }
+        assert!(error.to_string().contains("lost reaction response"));
         workspace = store.workspace(&workspace.id).unwrap().unwrap();
         workspace =
             github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
@@ -546,27 +1171,21 @@ fn provider_child() {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
-        let method = match case.as_str() {
-            "alias_delete" => "DELETE",
-            "alias_edit" => "PATCH",
-            _ => "POST",
-        };
-        let expected = if case == "alias_delete" { 2 } else { 1 };
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request["method"] == method
+                .filter(|request| request["method"] == "POST"
                     && request["endpoint"]
                         .as_str()
                         .unwrap()
                         .contains("issues/comments/300"))
                 .count(),
-            expected
+            1
         );
         return;
     }
     if case == "summary" {
-        workspace = store
+        let error = store
             .mutate_workspace(
                 &workspace.id,
                 workspace.generation,
@@ -577,7 +1196,8 @@ fn provider_child() {
                     destination: None,
                 },
             )
-            .unwrap();
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable"));
         workspace = store
             .mutate_workspace(
                 &workspace.id,
@@ -597,10 +1217,12 @@ fn provider_child() {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert!(requests.iter().any(|request| request["endpoint"]
-            == "repos/owner/repo/pulls/1/reviews/100"
-            && request["method"] == "PUT"
-            && request["body"]["body"] == "Summary edited"));
+        assert!(
+            !requests.iter().any(|request| matches!(
+                request["method"].as_str(),
+                Some("PUT" | "PATCH" | "DELETE")
+            ))
+        );
         assert!(
             requests
                 .iter()
@@ -669,12 +1291,18 @@ fn provider_child() {
                     },
                 )
                 .unwrap();
-            workspace =
+            let blocked =
                 github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                    .unwrap();
+                    .unwrap_err();
+            assert!(blocked.to_string().contains("uncertain"));
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
             assert_eq!(workspace.suspended_attempts.len(), 1);
-            assert!(workspace.attempt.is_none());
-            assert_eq!(workspace.pending().unwrap().operations.len(), 1);
+            assert_eq!(workspace.pending().unwrap().operations.len(), 2);
+            let after_unrelated = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+                .unwrap()
+                .matches("\"method\":\"POST\"")
+                .count();
+            assert_eq!(after_unrelated, before);
         }
         return;
     }
@@ -695,6 +1323,15 @@ fn provider_child() {
             )
             .unwrap();
         let parent = workspace.saved_comment.clone().unwrap();
+        workspace = store
+            .mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::MoveToReview {
+                    comments: vec![parent.clone()],
+                },
+            )
+            .unwrap();
         workspace =
             github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
                 .unwrap();
@@ -728,7 +1365,7 @@ fn provider_child() {
                 .unwrap();
         assert!(workspace.view().unwrap().todo.is_empty());
         let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
-        assert!(log.contains("T400"));
+        assert!(log.contains("T201"));
         assert!(log.contains("addPullRequestReviewThreadReply"));
         return;
     }
@@ -820,23 +1457,19 @@ fn provider_child() {
             .unwrap_err();
         workspace = store.workspace(&workspace.id).unwrap().unwrap();
         assert_eq!(workspace.suspended_attempts.len(), 1);
-        assert!(workspace.wip.is_some());
-        workspace =
+        let before = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+        let error =
             github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
-        assert_eq!(workspace.suspended_attempts.len(), 1);
-        assert!(workspace.wip.is_some());
-        assert!(workspace.attempt.is_none());
-        assert!(
-            workspace
-                .prepare(buf_review::workspace::Destination::Standalone)
-                .unwrap()
-                .operations
-                .is_empty()
+                .unwrap_err();
+        assert!(error.to_string().contains("uncertain"));
+        let after = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+        assert_eq!(
+            before.matches("\"method\":\"POST\"").count(),
+            after.matches("\"method\":\"POST\"").count()
         );
-        let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
-        assert!(log.contains("issues/1/comments"));
-        assert!(log.contains("markFileAsViewed"));
+        assert!(before.contains("issues/1/comments"));
+        assert!(!after.contains("markFileAsViewed"));
+        assert!(workspace.wip.is_some());
         return;
     }
     if matches!(
@@ -854,45 +1487,31 @@ fn provider_child() {
         workspace = store.workspace(&workspace.id).unwrap().unwrap();
         match case.as_str() {
             "retry" => {
-                // Existing failed submissions predate typed node mappings. The
-                // original provider response still carries the private node.
-                for prepared in workspace.preparation["prepared"].as_array_mut().unwrap() {
-                    prepared["mappings"]
-                        .as_array_mut()
-                        .unwrap()
-                        .retain(|mapping| mapping["resource"] != "review_comment_node");
-                }
-                workspace = store
-                    .save_workspace(workspace.generation, &workspace)
-                    .unwrap();
-                workspace = store
+                let error = store
                     .mutate_workspace(
                         &workspace.id,
                         workspace.generation,
                         Action::Save {
-                            comment: Some(parent),
+                            comment: Some(parent.clone()),
                             target: None,
                             body: "Root edited".into(),
                             destination: None,
                         },
                     )
-                    .unwrap();
+                    .unwrap_err();
+                assert!(error.to_string().contains("immutable"));
             }
             "drop" => {
-                workspace = store
-                    .mutate_workspace(
-                        &workspace.id,
-                        workspace.generation,
-                        Action::Delete { comment: reply_id },
-                    )
-                    .unwrap();
-                workspace = store
-                    .mutate_workspace(
-                        &workspace.id,
-                        workspace.generation,
-                        Action::Delete { comment: parent },
-                    )
-                    .unwrap();
+                for comment in [reply_id.clone(), parent.clone()] {
+                    let error = store
+                        .mutate_workspace(
+                            &workspace.id,
+                            workspace.generation,
+                            Action::Delete { comment },
+                        )
+                        .unwrap_err();
+                    assert!(error.to_string().contains("immutable"));
+                }
             }
             "relocate" | "relocate_head" => {
                 let head = if case == "relocate_head" {
@@ -900,31 +1519,31 @@ fn provider_child() {
                 } else {
                     "old-head"
                 };
-                if case == "relocate_head" {
-                    workspace.comparison.head = head.into();
-                    workspace = store
-                        .save_workspace(workspace.generation, &workspace)
-                        .unwrap();
-                }
                 let CommentTarget::Diff(mut anchor) = location(head) else {
                     unreachable!()
                 };
                 anchor.position.range.as_mut().unwrap().start.line = NonZeroU32::new(9).unwrap();
                 anchor.position.range.as_mut().unwrap().end.line = NonZeroU32::new(9).unwrap();
-                workspace = store
+                let error = store
                     .mutate_workspace(
                         &workspace.id,
                         workspace.generation,
                         Action::Relocate {
-                            comment: parent,
+                            comment: parent.clone(),
                             location: anchor,
                         },
                     )
-                    .unwrap();
+                    .unwrap_err();
+                assert!(error.to_string().contains("immutable"), "{error}");
             }
             "progress" => {
-                assert!(workspace.wip.is_none());
+                assert!(workspace.wip.is_some());
                 assert!(workspace.attempt.is_none());
+                assert!(
+                    !fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+                        .unwrap()
+                        .contains("/reviews/100/events")
+                );
                 workspace = github::publish_workspace(
                     &mut store,
                     &workspace.id,
@@ -933,13 +1552,19 @@ fn provider_child() {
                 )
                 .unwrap();
                 assert!(workspace.pending().unwrap().operations.is_empty());
+                assert!(workspace.wip.is_none());
                 let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
                 assert_eq!(log.matches("/reviews/100/events").count(), 1);
                 return;
             }
             "uncertain_progress" => {
-                assert!(workspace.wip.is_none());
+                assert!(workspace.wip.is_some());
                 assert_eq!(workspace.suspended_attempts.len(), 1);
+                assert!(
+                    !fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+                        .unwrap()
+                        .contains("/reviews/100/events")
+                );
                 workspace = github::publish_workspace(
                     &mut store,
                     &workspace.id,
@@ -956,6 +1581,7 @@ fn provider_child() {
                 .unwrap();
                 assert!(workspace.pending().unwrap().operations.is_empty());
                 assert!(workspace.suspended_attempts.is_empty());
+                assert!(workspace.wip.is_none());
                 let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
                 assert_eq!(log.matches("/reviews/100/events").count(), 1);
                 assert_eq!(log.matches("MarkFileAsViewedInput").count(), 1);
@@ -970,7 +1596,7 @@ fn provider_child() {
     assert!(workspace.attempt.is_none());
     assert_eq!(
         workspace.pending().unwrap().operations.len(),
-        if case == "concurrent" { 2 } else { 1 }
+        if case == "concurrent" { 1 } else { 0 }
     );
     if case == "concurrent" {
         assert!(workspace.pending().unwrap().operations.iter().any(|operation|matches!(&operation.change,Event::CreateComment{comment} if comment.content.body=="Concurrent")));
@@ -1003,75 +1629,29 @@ fn provider_child() {
         reply["body"]["variables"]["input"]["pullRequestReviewThreadId"],
         "T201"
     );
-    assert!(!log.contains("issues/1/comments"));
-    if matches!(case.as_str(), "retry" | "drop" | "uncertain_submit") {
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request["body"]["query"]
-                    .as_str()
-                    .is_some_and(|query| query.contains("AddPullRequestReviewThreadInput!")))
-                .count(),
-            1
-        );
-        assert_eq!(
-            requests
-                .iter()
-                .filter(
-                    |request| request["endpoint"] == "repos/owner/repo/pulls/1/reviews"
-                        && request["method"] == "POST"
-                )
-                .count(),
-            1
-        );
-    }
-    if case == "retry" {
-        let edit = requests
+    assert_eq!(
+        log.matches("\"endpoint\":\"repos/owner/repo/issues/1/comments\",\"method\":\"POST\"")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
             .iter()
-            .find(|request| {
-                request["body"]["query"]
-                    .as_str()
-                    .is_some_and(|query| query.contains("UpdatePullRequestReviewCommentInput"))
-            })
-            .unwrap();
-        assert_eq!(
-            edit["body"]["variables"]["input"]["pullRequestReviewCommentId"],
-            "C201"
-        );
-        assert_eq!(edit["body"]["variables"]["input"]["body"], "Root edited");
-        assert!(!requests.iter().any(|request| request["method"] == "PATCH"));
-    }
+            .filter(
+                |request| request["endpoint"] == "repos/owner/repo/pulls/1/reviews"
+                    && request["method"] == "POST"
+            )
+            .count(),
+        1
+    );
+    assert_eq!(prepared["body"]["comments"][0]["body"], "Root");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| matches!(request["method"].as_str(), Some("PATCH" | "DELETE")))
+    );
     if case == "uncertain_submit" {
         assert_eq!(log.matches("/reviews/100/events").count(), 1);
-    }
-    if case == "drop" {
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request["method"] == "DELETE")
-                .count(),
-            2
-        );
-    }
-    if case == "relocate" {
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request["method"] == "DELETE")
-                .count(),
-            2
-        );
-    }
-    if case == "relocate_head" {
-        let creates = requests
-            .iter()
-            .filter(|request| {
-                request["endpoint"] == "repos/owner/repo/pulls/1/reviews"
-                    && request["method"] == "POST"
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(creates.len(), 2);
-        assert_eq!(creates[1]["body"]["commit_id"], "relocated-head");
     }
     workspace =
         github::publish_workspace(&mut store, &workspace.id, workspace.generation, false).unwrap();

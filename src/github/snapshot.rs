@@ -448,6 +448,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
                 .map(|author| author.user(&mut identities))
                 .transpose()?,
             target: CommentTarget::PullRequest,
+            draft: false,
         });
     }
     for thread in threads {
@@ -459,15 +460,15 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
             "/node/comments",
             |comment| comment.comment.id.clone(),
         )? {
-            match inline.state.as_str() {
-                "PENDING" => continue,
-                "SUBMITTED" => {}
+            let draft = match inline.state.as_str() {
+                "PENDING" => true,
+                "SUBMITTED" => false,
                 other => {
                     return Err(FetchError::Response(format!(
                         "unknown inline comment state: {other}"
                     )));
                 }
-            }
+            };
             let comment = inline.comment;
             let numeric = comment.full_database_id.number()?;
             let id = CommentId(identities.id("review_comment", numeric));
@@ -591,6 +592,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
                     .map(|author| author.user(&mut identities))
                     .transpose()?,
                 target,
+                draft,
             });
         }
     }
@@ -623,6 +625,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
                     },
                     author: author.clone(),
                     target: CommentTarget::PullRequest,
+                    draft: false,
                 });
             }
             let body = Some(review.body);

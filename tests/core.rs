@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use buf_review::core::{Change, CoreError, ProjectedComment, prepare, project};
+use buf_review::core::{Change, CoreError, ProjectedComment, prepare, prepare_ordered, project};
 use buf_review::model::*;
 
 #[test]
@@ -96,6 +96,7 @@ fn review() -> Review {
             }],
             comments: vec![
                 ReadComment {
+                    draft: false,
                     content: CommentContent {
                         id: id("general"),
                         body: "general body".into(),
@@ -104,6 +105,7 @@ fn review() -> Review {
                     target: CommentTarget::PullRequest,
                 },
                 ReadComment {
+                    draft: false,
                     content: CommentContent {
                         id: id("diff"),
                         body: "diff body".into(),
@@ -605,6 +607,7 @@ fn reactions_are_scoped_to_current_reviewer_and_deleted_comments_cancel() {
 fn incomplete_fetched_reply_ancestry_is_preserved_without_restricting_existing_operations() {
     let mut read = review();
     read.read.comments.push(ReadComment {
+        draft: false,
         content: CommentContent {
             id: id("orphan"),
             body: "Retained reply".into(),
@@ -644,6 +647,7 @@ fn incomplete_fetched_reply_ancestry_is_preserved_without_restricting_existing_o
 fn deleting_fetched_root_preserves_independent_fetched_replies() {
     let mut read = review();
     read.read.comments.push(ReadComment {
+        draft: false,
         content: CommentContent {
             id: id("remote-reply"),
             body: "Keep this reply".into(),
@@ -706,4 +710,53 @@ fn internal_revision_namespace_preserves_legacy_receipts_and_separates_rewritten
         prepare(&review, &migrated, &[]).unwrap().operations[0].id,
         rewritten
     );
+}
+
+#[test]
+fn ordered_plan_preserves_surviving_event_order_and_terminal_conclusion() {
+    let review = review();
+    let batch = batch(vec![
+        Event::SetCommentReaction {
+            comment: id("general"),
+            reaction: "👍".into(),
+            present: false,
+        },
+        create("root", CommentTarget::Diff(location())),
+        Event::SetReviewConclusion {
+            conclusion: ReviewConclusion {
+                outcome: ReviewOutcome::Approve,
+                body: None,
+            },
+        },
+        Event::SetFileViewed {
+            path: "src/lib.rs".into(),
+            viewed: true,
+        },
+        Event::EditComment {
+            comment: id("root"),
+            body: "final local body".into(),
+        },
+        create("reply", CommentTarget::Reply(id("root"))),
+    ]);
+    let plan = prepare_ordered(&review, &batch, &[]).unwrap();
+    assert!(matches!(
+        &plan.operations[0].change,
+        Event::SetCommentReaction { present: false, .. }
+    ));
+    assert!(
+        matches!(&plan.operations[1].change, Event::CreateComment { comment } if comment.content.id == id("root") && comment.content.body == "final local body")
+    );
+    assert!(matches!(
+        &plan.operations[2].change,
+        Event::SetFileViewed { viewed: true, .. }
+    ));
+    assert!(
+        matches!(&plan.operations[3].change, Event::CreateComment { comment } if comment.content.id == id("reply"))
+    );
+    assert!(matches!(
+        &plan.operations[4].change,
+        Event::SetReviewConclusion { .. }
+    ));
+    let remaining = prepare_ordered(&review, &batch, &plan.operations[..2]).unwrap();
+    assert_eq!(remaining.operations, plan.operations[2..]);
 }

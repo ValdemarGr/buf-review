@@ -678,21 +678,13 @@ pub fn submit_pending_review(
     pending: &PendingReview,
     conclusion: &ReviewConclusion,
 ) -> Result<PublishResult, PublishError> {
-    let event = match conclusion.outcome {
-        ReviewOutcome::Comment => "COMMENT",
-        ReviewOutcome::Approve => "APPROVE",
-        ReviewOutcome::RequestChanges => "REQUEST_CHANGES",
-    };
+    let event = conclusion_event(conclusion);
     let response = request(
         &format!("{}/reviews/{}/events", endpoint(backend)?, pending.id),
         "POST",
         &json!({"event":event,"body":conclusion.body.clone().unwrap_or_default()}),
     )?;
-    let expected = match conclusion.outcome {
-        ReviewOutcome::Comment => "COMMENTED",
-        ReviewOutcome::Approve => "APPROVED",
-        ReviewOutcome::RequestChanges => "CHANGES_REQUESTED",
-    };
+    let expected = conclusion_state(conclusion);
     if response.get("state").and_then(Value::as_str) != Some(expected)
         || response.get("id").and_then(Value::as_u64) != Some(pending.id)
     {
@@ -729,6 +721,8 @@ struct Preparation {
     submission_response: Value,
     #[serde(default)]
     progress: Vec<Operation>,
+    #[serde(default)]
+    creating: Vec<Operation>,
     inflight: Option<String>,
 }
 
@@ -781,108 +775,6 @@ fn backend_for(
     Ok(backend)
 }
 
-/// A read-only last-moment version check protects edits/deletions made against
-/// stale snapshots. Provider validation remains authoritative for diff anchors.
-fn check_versions(
-    review: &Review,
-    completed: &[Operation],
-    backend: &ReviewBackend,
-    operations: &[Operation],
-) -> Result<(), PublishError> {
-    let pull = endpoint(backend)?;
-    let repository = pull.split("/pulls/").next().expect("pull endpoint");
-    let mut checked = BTreeSet::new();
-    for operation in operations {
-        let id = match &operation.change {
-            Change::EditComment { comment, .. } | Change::DeleteComment { comment } => {
-                Some(comment)
-            }
-            Change::CreateComment {
-                comment:
-                    DraftComment {
-                        target: CommentTarget::Reply(parent),
-                        ..
-                    },
-            } => Some(parent),
-            _ => None,
-        };
-        let Some(id) = id else {
-            continue;
-        };
-        if !checked.insert(id.clone()) {
-            continue;
-        }
-        let mut observed = review
-            .read
-            .comments
-            .iter()
-            .find(|comment| comment.content.id == *id)
-            .map(|comment| {
-                (
-                    comment.content.body.clone(),
-                    comment.author.as_ref().map(|author| author.id.clone()),
-                )
-            });
-        for delivered in completed {
-            match &delivered.change {
-                Change::CreateComment { comment } if comment.content.id == *id => {
-                    observed = Some((
-                        comment.content.body.clone(),
-                        Some(comment.author.id.clone()),
-                    ))
-                }
-                Change::EditComment { comment, body } if *comment == *id => {
-                    if let Some(observed) = &mut observed {
-                        observed.0 = body.clone();
-                    }
-                }
-                Change::DeleteComment { comment } if *comment == *id => observed = None,
-                _ => {}
-            }
-        }
-        let Some((observed_body, observed_author)) = observed else {
-            continue;
-        };
-        let owned = matches!(
-            operation.change,
-            Change::EditComment { .. } | Change::DeleteComment { .. }
-        );
-        if owned
-            && observed_author
-                .as_ref()
-                .is_none_or(|author| *author != review.reviewer.id)
-        {
-            return Err(unsupported(
-                "editing and deletion require verified ownership",
-            ));
-        }
-        let mapping = backend
-            .mappings
-            .iter()
-            .find(|mapping| {
-                mapping.core_id == id.0
-                    && matches!(
-                        mapping.resource.as_str(),
-                        "issue_comment" | "review_comment" | "review_summary"
-                    )
-            })
-            .ok_or_else(|| unsupported("comment lacks provider identity"))?;
-        let endpoint = match mapping.resource.as_str() {
-            "issue_comment" => format!("{repository}/issues/comments/{}", mapping.remote_id),
-            "review_summary" => format!("{pull}/reviews/{}", mapping.remote_id),
-            _ => format!("{repository}/pulls/comments/{}", mapping.remote_id),
-        };
-        let remote: Value = api(&endpoint, &["--method", "GET"])?;
-        if owned && remote.get("body").and_then(Value::as_str) != Some(observed_body.as_str()) {
-            return Err(unsupported(format!(
-                "remote comment {} changed; refresh and resolve before publishing",
-                id.0
-            )));
-        }
-    }
-    Ok(())
-}
-
 pub(super) fn confirmed_rejection(error: &PublishError) -> bool {
     match error {
         PublishError::Fetch(FetchError::Gh(message)) => [
@@ -919,15 +811,16 @@ fn fail_attempt(
         let rejected = workspace
             .attempt
             .as_ref()
-            .and_then(|attempt| {
-                attempt.operations.iter().find(|operation| {
-                    preparation
+            .into_iter()
+            .flat_map(|attempt| &attempt.operations)
+            .filter(|operation| {
+                preparation.creating.contains(operation)
+                    || preparation
                         .inflight
                         .as_ref()
                         .is_some_and(|inflight| inflight.ends_with(&operation.id))
-                })
             })
-            .and_then(|operation| match &operation.change {
+            .filter_map(|operation| match &operation.change {
                 Change::CreateComment {
                     comment:
                         DraftComment {
@@ -937,8 +830,9 @@ fn fail_attempt(
                         },
                 } => Some(content.id.clone()),
                 _ => None,
-            });
-        if let Some(comment) = rejected {
+            })
+            .collect::<Vec<_>>();
+        for comment in rejected {
             apply_publication(
                 store,
                 workspace,
@@ -952,6 +846,7 @@ fn fail_attempt(
     let uncertain = !confirmed_rejection(error);
     if !uncertain {
         preparation.inflight = None;
+        preparation.creating.clear();
         save_preparation(store, workspace, preparation)?;
     }
     apply_publication(
@@ -1034,10 +929,10 @@ pub fn publish_workspace(
     store: &mut Store,
     id: &str,
     generation: u64,
-    submit: bool,
+    _legacy_submit: bool,
 ) -> Result<Workspace, WorkspacePublishError> {
     let _publication_lock = store.publication_lock()?;
-    let result = publish_workspace_inner(store, id, generation, submit);
+    let result = publish_workspace_inner(store, id, generation);
     if let Err(error) = &result
         && let Ok(Some(workspace)) = store.workspace(id)
         && workspace.attempt.is_some()
@@ -1066,7 +961,6 @@ fn publish_workspace_inner(
     store: &mut Store,
     id: &str,
     generation: u64,
-    submit: bool,
 ) -> Result<Workspace, WorkspacePublishError> {
     let mut workspace = store
         .workspace(id)?
@@ -1080,8 +974,6 @@ fn publish_workspace_inner(
     }
     let project = store.project_root().to_path_buf();
     super::intent::resolve_pull_request(store, &project, &workspace)?;
-    // PR binding updates provider metadata independently from the immutable
-    // review comparison and its local operation generations.
     workspace = store
         .workspace(id)?
         .ok_or_else(|| WorkspaceError::NotFound(id.into()))?;
@@ -1092,14 +984,12 @@ fn publish_workspace_inner(
         }
         .into());
     }
+    // Old clients misclassified malformed request schemas as rejected anchors.
     if workspace
         .rejected_anchors
         .values()
         .any(|message| is_schema_rejection(message))
     {
-        // Older versions mistook malformed request schemas for rejected code
-        // locations. Restore only those confirmed failures to the pending plan;
-        // keep the saved comment, anchor and original failure history intact.
         workspace = store.update_workspace(id, workspace.generation, |workspace| {
             workspace
                 .rejected_anchors
@@ -1114,43 +1004,10 @@ fn publish_workspace_inner(
             Ok(())
         })?;
     }
-    let destination = if submit {
-        Destination::Review
-    } else {
-        Destination::Standalone
-    };
-    if let Some(attempt) = &workspace.attempt {
-        let submitted = attempt.provider.get("submitted").and_then(Value::as_bool) == Some(true);
-        if attempt.destination != destination && !submitted {
-            workspace =
-                store.mutate_workspace(id, workspace.generation, Action::SuspendPublication)?;
-        }
-    }
+    // A failed publication owns the next retry. Never bypass its uncertain tail.
     if workspace.attempt.is_none() {
-        let resume = if submit {
-            workspace
-                .suspended_attempts
-                .iter()
-                .find(|attempt| {
-                    attempt.destination == Destination::Review
-                        && (attempt.wip == workspace.wip.as_ref().map(|wip| wip.id.clone())
-                            || attempt.provider.get("submitted").and_then(Value::as_bool)
-                                == Some(true))
-                })
-                .map(|attempt| attempt.id.clone())
-        } else if workspace.prepare(destination)?.operations.is_empty() {
-            workspace
-                .suspended_attempts
-                .iter()
-                .find(|attempt| {
-                    attempt.destination == Destination::Standalone
-                        || attempt.provider.get("submitted").and_then(Value::as_bool) == Some(true)
-                })
-                .map(|attempt| attempt.id.clone())
-        } else {
-            None
-        };
-        if let Some(attempt_id) = resume {
+        if let Some(attempt) = workspace.suspended_attempts.first() {
+            let attempt_id = attempt.id.clone();
             workspace = store.mutate_workspace(
                 id,
                 workspace.generation,
@@ -1159,114 +1016,99 @@ fn publish_workspace_inner(
         }
     }
     if workspace.attempt.is_none() {
-        let plan = workspace.prepare(destination)?;
+        let plan = workspace.publication_plan()?;
         if plan.operations.is_empty() {
             return Ok(workspace);
         }
-        let saved: Preparation =
-            if destination == Destination::Standalone || workspace.preparation.is_null() {
-                Preparation::default()
-            } else {
-                serde_json::from_value(workspace.preparation.clone()).map_err(FetchError::from)?
-            };
-        let backend = backend_for(store, &workspace, &saved)?;
-        let unprepared = CommitState {
-            operations: plan
-                .operations
-                .iter()
-                .filter(|operation| !is_prepared_create(&saved, operation))
-                .cloned()
-                .collect(),
-        };
-        preflight(&workspace.review, &backend, &unprepared)?;
-        check_versions(
-            &workspace.review,
-            &workspace.completed,
-            &backend,
-            &plan.operations,
-        )?;
         workspace = store.mutate_workspace(
             id,
             workspace.generation,
             Action::BeginPublication {
-                destination,
+                destination: Destination::Review,
                 operations: plan.operations,
             },
         )?;
     }
-    let submit = workspace.attempt.as_ref().unwrap().destination == Destination::Review;
     let value = workspace.attempt.as_ref().unwrap().provider.clone();
-    let new_preparation = value.is_null();
-    let mut preparation: Preparation = if new_preparation {
+    let mut preparation: Preparation = if value.is_null() {
         Preparation::default()
     } else {
         serde_json::from_value(value).map_err(FetchError::from)?
     };
-    if new_preparation {
-        preparation.progress = workspace
-            .attempt
-            .as_ref()
-            .unwrap()
-            .operations
-            .iter()
-            .filter(|operation| {
-                matches!(
-                    operation.change,
-                    Change::SetFileViewed { .. } | Change::SetCommentReaction { .. }
-                )
-            })
-            .cloned()
-            .collect();
-        save_preparation(store, &mut workspace, &preparation)?;
-    } else {
-        // Unattempted progress may publish independently while a review remains
-        // uncertain. Explicit retry includes only its original pending versions.
-        let outstanding = workspace.pending()?.operations;
-        let deferred = preparation
-            .progress
-            .iter()
-            .filter(|operation| outstanding.contains(operation))
-            .cloned()
-            .collect::<Vec<_>>();
-        if deferred.iter().any(|operation| {
-            !workspace
-                .attempt
-                .as_ref()
-                .unwrap()
-                .operations
-                .contains(operation)
-        }) {
-            workspace = store.update_workspace(id, workspace.generation, |workspace| {
-                let attempt = workspace.attempt.as_mut().ok_or_else(|| {
-                    WorkspaceError::Invalid("publication attempt disappeared".into())
-                })?;
-                for operation in deferred {
-                    if !attempt.operations.contains(&operation) {
-                        attempt.operations.push(operation);
-                    }
-                }
-                Ok(())
-            })?;
+    let operations = workspace.attempt.as_ref().unwrap().operations.clone();
+    let mut backend = backend_for(store, &workspace, &preparation)?;
+    // Legacy private preparation already represents successful provider writes.
+    for result in preparation.prepared.clone() {
+        if !workspace.has_result(&result.operation.id) && operations.contains(&result.operation) {
+            apply_publication(store, &mut workspace, Action::RecordResult { result })?;
         }
     }
-    let mut backend = backend_for(store, &workspace, &preparation)?;
-    let operations = workspace.attempt.as_ref().unwrap().operations.clone();
-    preflight(
-        &workspace.review,
-        &backend,
-        &CommitState {
-            operations: operations
-                .iter()
-                .filter(|operation| {
-                    !workspace.has_result(&operation.id)
-                        && !is_prepared_create(&preparation, operation)
-                })
-                .cloned()
-                .collect(),
-        },
-    )?;
+    let outstanding = CommitState {
+        operations: operations
+            .iter()
+            .filter(|op| !workspace.has_result(&op.id))
+            .cloned()
+            .collect(),
+    };
+    preflight(&workspace.review, &backend, &outstanding)?;
+    for operation in &outstanding.operations {
+        if matches!(
+            operation.change,
+            Change::EditComment { .. } | Change::DeleteComment { .. }
+        ) {
+            return Err(unsupported(
+                "successfully sent comments are immutable; add a comment or reply instead",
+            )
+            .into());
+        }
+        if let Some(target) = crate::workspace::operation_comment(&operation.change) {
+            let parent = match &operation.change {
+                Change::CreateComment {
+                    comment:
+                        DraftComment {
+                            target: CommentTarget::Reply(parent),
+                            ..
+                        },
+                } => Some(parent),
+                _ => None,
+            };
+            if std::iter::once(target).chain(parent).any(|id| {
+                workspace.conflicts.contains_key(id) || workspace.rejected_anchors.contains_key(id)
+            }) {
+                return Err(unsupported(format!(
+                    "publication requires conflict/anchor resolution: {}",
+                    target.0
+                ))
+                .into());
+            }
+        }
+    }
+    let heads = outstanding
+        .operations
+        .iter()
+        .filter_map(|op| match &op.change {
+            Change::CreateComment {
+                comment:
+                    DraftComment {
+                        target: CommentTarget::Diff(location),
+                        ..
+                    },
+            } => Some(&location.revision.head),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if heads.len() > 1
+        || preparation
+            .pending
+            .as_ref()
+            .is_some_and(|pending| heads.iter().any(|head| **head != pending.head))
+    {
+        return Err(unsupported("review drafts span different head commits; explicitly relocate unsent roots before publication").into());
+    }
     if let Some(inflight) = preparation.inflight.clone() {
-        if inflight == "submit" {
+        if inflight == "review batch" && preparation.pending.is_some() {
+            record_created_review(store, &mut workspace, &mut preparation, &backend)?;
+        } else if inflight == "submit" {
             let pending = preparation.pending.as_ref().ok_or_else(|| {
                 unsupported("uncertain submission lacks prepared review identity")
             })?;
@@ -1281,17 +1123,12 @@ fn publish_workspace_inner(
             if state != "PENDING" {
                 let conclusion = operations
                     .iter()
-                    .find_map(|operation| match &operation.change {
+                    .find_map(|op| match &op.change {
                         Change::SetReviewConclusion { conclusion } => Some(conclusion),
                         _ => None,
                     })
                     .ok_or_else(|| unsupported("prepared review lacks conclusion"))?;
-                let expected = match conclusion.outcome {
-                    ReviewOutcome::Approve => "APPROVED",
-                    ReviewOutcome::Comment => "COMMENTED",
-                    ReviewOutcome::RequestChanges => "CHANGES_REQUESTED",
-                };
-                if state != expected
+                if state != conclusion_state(conclusion)
                     || response
                         .get("body")
                         .and_then(Value::as_str)
@@ -1309,14 +1146,12 @@ fn publish_workspace_inner(
         } else if let Some(operation_id) = inflight.strip_prefix("operation ") {
             let operation = operations
                 .iter()
-                .find(|operation| operation.id == operation_id)
+                .find(|op| op.id == operation_id)
                 .ok_or_else(|| unsupported("uncertain operation missing from frozen plan"))?;
             if !workspace.has_result(operation_id) {
-                if matches!(
+                if !matches!(
                     operation.change,
-                    Change::CreateComment { .. }
-                        | Change::SetReviewConclusion { .. }
-                        | Change::DismissReview { .. }
+                    Change::SetFileViewed { .. } | Change::SetCommentReaction { .. }
                 ) {
                     return Err(unsupported(format!("publication result uncertain ({inflight}); inspect provider state before retry; no duplicate write sent")).into());
                 }
@@ -1330,18 +1165,7 @@ fn publish_workspace_inner(
                     )
                     .into());
                 }
-                let matches = match &operation.change {
-                    Change::EditComment { comment, body } => fresh
-                        .read
-                        .comments
-                        .iter()
-                        .find(|item| item.content.id == *comment)
-                        .is_some_and(|item| item.content.body == *body),
-                    Change::DeleteComment { comment } => !fresh
-                        .read
-                        .comments
-                        .iter()
-                        .any(|item| item.content.id == *comment),
+                let applied = match &operation.change {
                     Change::SetFileViewed { path, viewed } => fresh
                         .read
                         .files
@@ -1360,7 +1184,7 @@ fn publish_workspace_inner(
                     }
                     _ => false,
                 };
-                if matches {
+                if applied {
                     apply_publication(
                         store,
                         &mut workspace,
@@ -1372,29 +1196,6 @@ fn publish_workspace_inner(
                             },
                         },
                     )?;
-                } else if matches!(
-                    operation.change,
-                    Change::EditComment { .. } | Change::DeleteComment { .. }
-                ) {
-                    let conflicted = crate::workspace::operation_comment(&operation.change)
-                        .is_some_and(|id| workspace.conflicts.contains_key(id));
-                    let checked = if conflicted {
-                        Err(unsupported(
-                            "remote conflict requires explicit resolution before retry",
-                        ))
-                    } else {
-                        check_versions(
-                            &workspace.review,
-                            &workspace.completed,
-                            &backend,
-                            std::slice::from_ref(operation),
-                        )
-                    };
-                    if let Err(error) = checked {
-                        preparation.inflight = None;
-                        save_preparation(store, &mut workspace, &preparation)?;
-                        return Err(error.into());
-                    }
                 }
             }
             preparation.inflight = None;
@@ -1403,101 +1204,97 @@ fn publish_workspace_inner(
             return Err(unsupported(format!("publication result uncertain ({inflight}); inspect provider state before retry; no duplicate write sent")).into());
         }
     }
-    let blocked = operations
-        .iter()
-        .filter(|operation| !workspace.has_result(&operation.id))
-        .filter_map(|operation| {
-            let target = crate::workspace::operation_comment(&operation.change)?;
-            let parent = match &operation.change {
-                Change::CreateComment {
-                    comment:
-                        DraftComment {
-                            target: CommentTarget::Reply(parent),
-                            ..
-                        },
-                } => Some(parent),
-                _ => None,
-            };
-            (workspace.conflicts.contains_key(target)
-                || workspace.rejected_anchors.contains_key(target)
-                || parent.is_some_and(|id| {
-                    workspace.conflicts.contains_key(id)
-                        || workspace.rejected_anchors.contains_key(id)
-                }))
-            .then_some(target.0.clone())
-        })
-        .collect::<Vec<_>>();
-    if !blocked.is_empty() {
-        return Err(unsupported(format!(
-            "publication requires conflict/anchor resolution: {}",
-            blocked.join(", ")
-        ))
-        .into());
-    }
-    if submit && !preparation.submitted {
-        let heads = operations
-            .iter()
-            .filter_map(|operation| match &operation.change {
-                Change::CreateComment {
-                    comment:
-                        DraftComment {
-                            target: CommentTarget::Diff(location),
-                            ..
-                        },
-                } => Some(location.revision.head.clone()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        if heads.len() > 1 {
-            let error = unsupported(
-                "review drafts span different head commits; explicitly relocate or delete affected roots before submission",
-            );
-            for operation in &operations {
-                if let Change::CreateComment {
-                    comment:
-                        DraftComment {
-                            content,
-                            target: CommentTarget::Diff(_),
-                            ..
-                        },
-                } = &operation.change
-                {
-                    apply_publication(
-                        store,
-                        &mut workspace,
-                        Action::RejectAnchor {
-                            comment: content.id.clone(),
-                            message: error.to_string(),
-                        },
-                    )?;
-                }
-            }
-            apply_publication(
-                store,
-                &mut workspace,
-                Action::FinishPublication {
-                    success: false,
-                    uncertain: false,
-                    error: Some(error.to_string()),
-                },
-            )?;
-            return Err(error.into());
+    backend = backend_for(store, &workspace, &preparation)?;
+    for (index, operation) in operations.iter().enumerate() {
+        if workspace.has_result(&operation.id) {
+            continue;
         }
-        if let Some(pending) = preparation.pending.as_ref()
-            && heads
+        let uses_review = matches!(
+            &operation.change,
+            Change::CreateComment {
+                comment: DraftComment {
+                    target: CommentTarget::Diff(_) | CommentTarget::Reply(_),
+                    ..
+                }
+            } | Change::SetReviewConclusion { .. }
+        );
+        if uses_review && preparation.pending.is_none() {
+            // Do not adopt another tool's pending review or its untracked comments.
+            let existing: Vec<Value> =
+                list(&format!("{}/reviews?per_page=100", endpoint(&backend)?))?;
+            let user = backend
+                .mappings
                 .iter()
-                .next()
-                .is_some_and(|head| *head != pending.head)
-        {
-            let endpoint = format!("{}/reviews/{}", endpoint(&backend)?, pending.id);
-            preparation.inflight = Some("replace relocated pending review".into());
+                .find(|m| m.resource == "user" && m.core_id == workspace.review.reviewer.id.0)
+                .ok_or_else(|| unsupported("reviewer mapping missing"))?;
+            if existing.iter().any(|review| {
+                review.get("state").and_then(Value::as_str) == Some("PENDING")
+                    && review
+                        .pointer("/user/id")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|id| id.to_string() == user.remote_id)
+            }) {
+                return Err(unsupported("another tool has a pending provider review; conclude it there before publishing a new local review").into());
+            }
+            let head = heads
+                .first()
+                .map(|head| (*head).clone())
+                .unwrap_or_else(|| workspace.review.read.pull_request.revision.head.clone());
+            let mut body = json!({"commit_id":head});
+            let roots = operations[index..].iter().take_while(|op| matches!(&op.change,
+                Change::CreateComment { comment: DraftComment { target: CommentTarget::Diff(location), .. } } if location.position.range.is_some() && location.revision.head == head
+            )).cloned().collect::<Vec<_>>();
+            if !roots.is_empty() {
+                body["comments"] = Value::Array(
+                    roots
+                        .iter()
+                        .map(|op| {
+                            let Change::CreateComment { comment } = &op.change else {
+                                unreachable!()
+                            };
+                            let CommentTarget::Diff(location) = &comment.target else {
+                                unreachable!()
+                            };
+                            let mut payload = super::publish::inline_payload(comment, location);
+                            payload.as_object_mut().unwrap().remove("commit_id");
+                            payload
+                        })
+                        .collect(),
+                );
+            }
+            preparation.creating = roots;
+            // Native create-review can also conclude this final contiguous group.
+            if let Some(last) = operations.get(index + preparation.creating.len())
+                && index + preparation.creating.len() + 1 == operations.len()
+                && let Change::SetReviewConclusion { conclusion } = &last.change
+            {
+                body["event"] = json!(conclusion_event(conclusion));
+                body["body"] = json!(conclusion.body.clone().unwrap_or_default());
+                preparation.creating.push(last.clone());
+            }
+            preparation.inflight = Some("review batch".into());
             save_preparation(store, &mut workspace, &preparation)?;
-            match request(&endpoint, "DELETE", &Value::Null) {
-                Ok(_) => {
-                    preparation.pending = None;
-                    preparation.prepared.clear();
-                    preparation.inflight = None;
+            match request(&format!("{}/reviews", endpoint(&backend)?), "POST", &body) {
+                Ok(response) => {
+                    // Persist provider identity before any receipt-discovery read.
+                    preparation.pending = Some(PendingReview {
+                        id: response
+                            .get("id")
+                            .and_then(Value::as_u64)
+                            .filter(|id| *id > 0)
+                            .ok_or_else(|| unsupported("created review lacks ID"))?,
+                        node_id: response
+                            .get("node_id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| unsupported("created review lacks node ID"))?
+                            .into(),
+                        head,
+                    });
+                    preparation.submission_response = response.clone();
+                    preparation.submitted = body.get("event").is_some();
                     save_preparation(store, &mut workspace, &preparation)?;
+                    record_created_review(store, &mut workspace, &mut preparation, &backend)?;
                     backend = backend_for(store, &workspace, &preparation)?;
                 }
                 Err(error) => {
@@ -1505,245 +1302,85 @@ fn publish_workspace_inner(
                     return Err(error.into());
                 }
             }
-        }
-        if preparation.pending.is_none() {
-            // An existing external pending review must never be adopted.
-            let existing: Vec<Value> =
-                list(&format!("{}/reviews?per_page=100", endpoint(&backend)?))?;
-            let user = backend
-                .mappings
-                .iter()
-                .find(|mapping| {
-                    mapping.resource == "user" && mapping.core_id == workspace.review.reviewer.id.0
-                })
-                .map(|mapping| mapping.remote_id.clone())
-                .ok_or_else(|| unsupported("reviewer mapping missing"))?;
-            if existing.iter().any(|review| {
-                review.get("state").and_then(Value::as_str) == Some("PENDING")
-                    && review
-                        .pointer("/user/id")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|id| id.to_string() == user)
-            }) {
-                let error = unsupported(
-                    "another tool has a pending provider review; submit or discard it there before retrying local review",
-                );
-                apply_publication(
-                    store,
-                    &mut workspace,
-                    Action::FinishPublication {
-                        success: false,
-                        uncertain: false,
-                        error: Some(error.to_string()),
-                    },
-                )?;
-                return Err(error.into());
-            }
-            preparation.inflight = Some("prepare review".into());
-            save_preparation(store, &mut workspace, &preparation)?;
-            let mut review = workspace.review.clone();
-            if let Some(head) = heads.into_iter().next() {
-                review.read.pull_request.revision.head = head;
-            }
-            match prepare_pending_review(&review, &backend) {
-                Ok(pending) => {
-                    preparation.pending = Some(pending);
-                    preparation.inflight = None;
-                    save_preparation(store, &mut workspace, &preparation)?;
-                }
-                Err(error) => {
-                    fail_attempt(store, &mut workspace, &mut preparation, &error)?;
-                    return Err(error.into());
-                }
-            }
-        }
-        let pending = preparation.pending.clone().unwrap();
-        // A failed confirmed preparation remains editable locally. Synchronize
-        // exactly that known pending review on retry; never create a replacement
-        // review or accidentally submit removed/relocated provider drafts.
-        let mut replace = BTreeSet::new();
-        for previous in &preparation.prepared {
-            let Change::CreateComment { comment: old } = &previous.operation.change else {
-                continue;
-            };
-            let desired = operations
-                .iter()
-                .find_map(|operation| match &operation.change {
-                    Change::CreateComment { comment } if comment.content.id == old.content.id => {
-                        Some(comment)
-                    }
-                    _ => None,
-                });
-            if desired.is_none_or(|new| new.target != old.target) {
-                replace.insert(old.content.id.clone());
-            }
-        }
-        loop {
-            let count = replace.len();
-            for previous in &preparation.prepared {
-                if let Change::CreateComment {
-                    comment:
-                        DraftComment {
-                            content,
-                            target: CommentTarget::Reply(parent),
-                            ..
-                        },
-                } = &previous.operation.change
-                    && replace.contains(parent)
-                {
-                    replace.insert(content.id.clone());
-                }
-            }
-            if count == replace.len() {
-                break;
-            }
-        }
-        for index in (0..preparation.prepared.len()).rev() {
-            let previous = &preparation.prepared[index];
-            let Change::CreateComment { comment: old } = &previous.operation.change else {
-                continue;
-            };
-            if !replace.contains(&old.content.id) {
+            if workspace.has_result(&operation.id) {
                 continue;
             }
-            let id = old.content.id.clone();
-            let remote = previous
-                .mappings
-                .iter()
-                .find(|mapping| mapping.resource == "review_comment")
-                .ok_or_else(|| unsupported("prepared comment mapping missing"))?
-                .remote_id
-                .clone();
-            let pull = endpoint(&backend)?;
-            let repository = pull.split("/pulls/").next().unwrap();
-            preparation.inflight = Some(format!("delete prepared comment {}", id.0));
-            save_preparation(store, &mut workspace, &preparation)?;
-            match request(
-                &format!("{repository}/pulls/comments/{remote}"),
-                "DELETE",
-                &Value::Null,
-            ) {
-                Ok(_) => {
-                    preparation.prepared.remove(index);
-                    preparation.inflight = None;
-                    backend.mappings.retain(|mapping| mapping.core_id != id.0);
-                    save_preparation(store, &mut workspace, &preparation)?;
-                }
-                Err(error) => {
-                    fail_attempt(store, &mut workspace, &mut preparation, &error)?;
-                    return Err(error.into());
-                }
-            }
         }
-        for operation in operations
-            .iter()
-            .filter(|operation| matches!(operation.change, Change::CreateComment { .. }))
+        if let Change::CreateComment {
+            comment:
+                DraftComment {
+                    target: CommentTarget::Reply(parent),
+                    ..
+                },
+        } = &operation.change
         {
-            if preparation
-                .prepared
-                .iter()
-                .any(|result| result.operation == *operation)
-            {
-                continue;
-            }
-            // Prepared draft edits retain their provider identity. Relocations
-            // require explicit replacement because GitHub cannot move comments.
-            if let Some(index)=preparation.prepared.iter().position(|result|matches!((&result.operation.change,&operation.change),(Change::CreateComment{comment:left},Change::CreateComment{comment:right}) if left.content.id==right.content.id)) {
-                let previous=&preparation.prepared[index];
-                let (Change::CreateComment{comment:old},Change::CreateComment{comment:new})=(&previous.operation.change,&operation.change) else {unreachable!()};
-                if old.target!=new.target {return Err(unsupported("prepared draft anchor changed; prepared provider review must be reconciled before relocation retry").into());}
-                let node=previous.mappings.iter().find(|mapping|mapping.resource=="review_comment_node").map(|mapping|mapping.remote_id.as_str()).or_else(||previous.response.pointer("/data/addPullRequestReviewThread/thread/comments/nodes/0/id").and_then(Value::as_str)).or_else(||previous.response.pointer("/data/addPullRequestReviewThreadReply/comment/id").and_then(Value::as_str)).or_else(||previous.response.pointer("/data/updatePullRequestReviewComment/pullRequestReviewComment/id").and_then(Value::as_str)).filter(|node|!node.is_empty()).ok_or_else(||unsupported("prepared review comment lacks its provider node identity"))?.to_owned();
-                let body=new.content.body.clone();
-                let id=new.content.id.0.clone();
-                if !preparation.prepared[index].mappings.iter().any(|mapping|mapping.resource=="review_comment_node") {preparation.prepared[index].mappings.push(IdMapping{resource:"review_comment_node".into(),core_id:id,remote_id:node.clone()});}
-                preparation.inflight=Some(format!("edit prepared comment {}",operation.id));save_preparation(store,&mut workspace,&preparation)?;
-                let updated=(|| {
-                    let response=request("graphql","POST",&json!({"query":"mutation($input:UpdatePullRequestReviewCommentInput!){updatePullRequestReviewComment(input:$input){pullRequestReviewComment{id body}}}","variables":{"input":{"pullRequestReviewCommentId":node,"body":body,"clientMutationId":operation.id}}}))?;
-                    if graphql_data(&response,"updatePullRequestReviewComment")?.pointer("/pullRequestReviewComment/id").and_then(Value::as_str)!=Some(node.as_str()) {return Err(unsupported("updated private review comment identity was not confirmed"));}
-                    Ok(response)
-                })();
-                match updated {
-                    Ok(response)=>{preparation.prepared[index].operation=operation.clone();preparation.prepared[index].response=response;preparation.inflight=None;save_preparation(store,&mut workspace,&preparation)?;}
-                    Err(error)=>{fail_attempt(store,&mut workspace,&mut preparation,&error)?;return Err(error.into());}
+            // Resolve read-only ancestry before marking the irreversible write.
+            let root = root_id(&workspace.review, &backend, parent)?;
+            let thread = thread_node(&workspace.review, &backend, parent)?;
+            backend
+                .mappings
+                .retain(|mapping| mapping.resource != "review_thread" || mapping.core_id != root.0);
+            backend.mappings.push(IdMapping {
+                resource: "review_thread".into(),
+                core_id: root.0,
+                remote_id: thread,
+            });
+        }
+        preparation.inflight = Some(
+            if matches!(operation.change, Change::SetReviewConclusion { .. }) {
+                "submit".into()
+            } else {
+                format!("operation {}", operation.id)
+            },
+        );
+        save_preparation(store, &mut workspace, &preparation)?;
+        let result = match &operation.change {
+            Change::CreateComment {
+                comment:
+                    DraftComment {
+                        target: CommentTarget::Diff(_) | CommentTarget::Reply(_),
+                        ..
+                    },
+            } => {
+                if preparation.submitted {
+                    return Err(
+                        unsupported("cannot append root comments to a concluded review").into(),
+                    );
                 }
-                continue;
+                add_pending_comment(
+                    &workspace.review,
+                    &backend,
+                    preparation.pending.as_ref().unwrap(),
+                    operation,
+                )
             }
-            preparation.inflight = Some(format!("create comment {}", operation.id));
-            save_preparation(store, &mut workspace, &preparation)?;
-            match add_pending_comment(&workspace.review, &backend, &pending, operation) {
-                Ok(result) => {
-                    backend.mappings.extend(result.mappings.clone());
+            Change::SetReviewConclusion { conclusion } => {
+                submit_pending_review(&backend, preparation.pending.as_ref().unwrap(), conclusion)
+            }
+            _ => publish(&workspace.review, &backend, operation),
+        };
+        match result {
+            Ok(result) => {
+                if matches!(operation.change, Change::CreateComment { .. }) && uses_review {
                     preparation.prepared.push(OperationResult {
                         operation: operation.clone(),
-                        mappings: result.mappings,
-                        response: result.response,
+                        mappings: result.mappings.clone(),
+                        response: result.response.clone(),
                     });
-                    preparation.inflight = None;
-                    save_preparation(store, &mut workspace, &preparation)?;
                 }
-                Err(error) => {
-                    fail_attempt(store, &mut workspace, &mut preparation, &error)?;
-                    return Err(error.into());
+                if matches!(operation.change, Change::SetReviewConclusion { .. }) {
+                    preparation.submitted = true;
+                    preparation.submission_response = result.response.clone();
                 }
-            }
-        }
-        let conclusion = operations
-            .iter()
-            .find_map(|operation| match &operation.change {
-                Change::SetReviewConclusion { conclusion } => Some(conclusion),
-                _ => None,
-            })
-            .ok_or_else(|| unsupported("save review conclusion before submitting"))?;
-        preparation.inflight = Some("submit".into());
-        save_preparation(store, &mut workspace, &preparation)?;
-        match submit_pending_review(&backend, &pending, conclusion) {
-            Ok(result) => {
-                preparation.submitted = true;
-                preparation.submission_response = result.response.clone();
-                preparation.inflight = None;
+                // A persisted successful write is immutable, even while review is pending.
                 save_preparation(store, &mut workspace, &preparation)?;
-                record_grouped(store, &mut workspace, &preparation, &result.response)?;
-            }
-            Err(error) => {
-                fail_attempt(store, &mut workspace, &mut preparation, &error)?;
-                return Err(error.into());
-            }
-        }
-    }
-    if submit && preparation.submitted {
-        record_grouped(
-            store,
-            &mut workspace,
-            &preparation,
-            &preparation.submission_response,
-        )?;
-    }
-    for operation in operations {
-        if workspace.has_result(&operation.id) {
-            continue;
-        }
-        if matches!(
-            operation.change,
-            Change::EditComment { .. } | Change::DeleteComment { .. }
-        ) {
-            check_versions(
-                &workspace.review,
-                &workspace.completed,
-                &backend,
-                std::slice::from_ref(&operation),
-            )?;
-        }
-        preparation.inflight = Some(format!("operation {}", operation.id));
-        save_preparation(store, &mut workspace, &preparation)?;
-        match publish(&workspace.review, &backend, &operation) {
-            Ok(result) => {
                 backend.mappings.extend(result.mappings.clone());
                 apply_publication(
                     store,
                     &mut workspace,
                     Action::RecordResult {
                         result: OperationResult {
-                            operation,
+                            operation: operation.clone(),
                             mappings: result.mappings,
                             response: result.response,
                         },
@@ -1770,8 +1407,124 @@ fn publish_workspace_inner(
     Ok(workspace)
 }
 
-fn is_prepared_create(preparation: &Preparation, operation: &Operation) -> bool {
-    preparation.prepared.iter().any(|previous| matches!((&previous.operation.change,&operation.change), (Change::CreateComment{comment:left},Change::CreateComment{comment:right}) if left.content.id==right.content.id))
+fn conclusion_event(conclusion: &ReviewConclusion) -> &'static str {
+    match conclusion.outcome {
+        ReviewOutcome::Comment => "COMMENT",
+        ReviewOutcome::Approve => "APPROVE",
+        ReviewOutcome::RequestChanges => "REQUEST_CHANGES",
+    }
+}
+
+fn conclusion_state(conclusion: &ReviewConclusion) -> &'static str {
+    match conclusion.outcome {
+        ReviewOutcome::Comment => "COMMENTED",
+        ReviewOutcome::Approve => "APPROVED",
+        ReviewOutcome::RequestChanges => "CHANGES_REQUESTED",
+    }
+}
+
+/// Recover individual identities from the native bulk operation before advancing.
+/// The frozen group and review identity survive a failed discovery read.
+fn record_created_review(
+    store: &mut Store,
+    workspace: &mut Workspace,
+    preparation: &mut Preparation,
+    backend: &ReviewBackend,
+) -> Result<(), WorkspacePublishError> {
+    let pending = preparation
+        .pending
+        .as_ref()
+        .ok_or_else(|| unsupported("created review identity unavailable"))?;
+    let mut comments: Vec<Value> = if preparation
+        .creating
+        .iter()
+        .any(|op| matches!(op.change, Change::CreateComment { .. }))
+    {
+        list(&format!(
+            "{}/reviews/{}/comments?per_page=100",
+            endpoint(backend)?,
+            pending.id
+        ))?
+    } else {
+        vec![]
+    };
+    comments.sort_by_key(|comment| comment.get("id").and_then(Value::as_u64));
+    for operation in preparation.creating.clone() {
+        let result = match &operation.change {
+            Change::CreateComment { comment } => {
+                let CommentTarget::Diff(location) = &comment.target else {
+                    return Err(unsupported("bulk review contains a non-root comment").into());
+                };
+                let payload = super::publish::inline_payload(comment, location);
+                let index = comments.iter().position(|remote| {
+                    let same = ["body", "path", "side", "start_side"].iter().all(|key| {
+                        remote.get(key).filter(|value| !value.is_null()) == payload.get(key)
+                    });
+                    let current = remote.get("commit_id").is_none_or(|commit| commit.as_str() == Some(location.revision.head.as_str()))
+                        && ["line", "start_line"].iter().all(|key| remote.get(key).filter(|value| !value.is_null()) == payload.get(key));
+                    let original = remote.get("original_commit_id").and_then(Value::as_str) == Some(location.revision.head.as_str())
+                        && [("line", "original_line"), ("start_line", "original_start_line")].iter().all(|(key, original)| remote.get(original).filter(|value| !value.is_null()) == payload.get(key));
+                    same && (current || original)
+                }).ok_or_else(|| unsupported("bulk review comment identity unconfirmed; inspect provider review before retry"))?;
+                let response = comments.remove(index);
+                let remote = response
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| unsupported("created review comment lacks ID"))?;
+                let node = response
+                    .get("node_id")
+                    .and_then(Value::as_str)
+                    .filter(|node| !node.is_empty())
+                    .ok_or_else(|| unsupported("created review comment lacks node ID"))?;
+                OperationResult {
+                    operation: operation.clone(),
+                    mappings: vec![
+                        IdMapping {
+                            resource: "review_comment".into(),
+                            core_id: comment.content.id.0.clone(),
+                            remote_id: remote.to_string(),
+                        },
+                        IdMapping {
+                            resource: "review_comment_node".into(),
+                            core_id: comment.content.id.0.clone(),
+                            remote_id: node.into(),
+                        },
+                    ],
+                    response,
+                }
+            }
+            Change::SetReviewConclusion { conclusion } => {
+                if preparation
+                    .submission_response
+                    .get("state")
+                    .and_then(Value::as_str)
+                    != Some(conclusion_state(conclusion))
+                {
+                    return Err(unsupported("provider response did not confirm the expected submitted review; reconcile before retry").into());
+                }
+                OperationResult {
+                    operation: operation.clone(),
+                    mappings: vec![IdMapping {
+                        resource: "review".into(),
+                        core_id: operation.id.clone(),
+                        remote_id: pending.id.to_string(),
+                    }],
+                    response: preparation.submission_response.clone(),
+                }
+            }
+            _ => return Err(unsupported("invalid native review batch").into()),
+        };
+        if !workspace.has_result(&operation.id) {
+            preparation.prepared.push(result.clone());
+            save_preparation(store, workspace, preparation)?;
+            apply_publication(store, workspace, Action::RecordResult { result })?;
+        }
+    }
+    preparation.creating.clear();
+    preparation.inflight = None;
+    save_preparation(store, workspace, preparation)?;
+    Ok(())
 }
 
 fn canonicalize_fetched(fetched: &mut FetchedReview, backend: &ReviewBackend) {

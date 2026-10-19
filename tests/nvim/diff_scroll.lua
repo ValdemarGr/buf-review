@@ -96,6 +96,42 @@ end
 
 vim.cmd('Review')
 wait(function() return kind() == 'home' end, 'Missing review home')
+
+-- Direct diff composers restore both code views after their split is removed.
+row('Unviewed files')
+api.nvim_win_set_cursor(0, { api.nvim_win_get_cursor(0)[1] + 1, 0 }); input('<CR>')
+wait(function() return kind() == 'diff' end, 'Missing direct comment source')
+for _, origin_side in ipairs({ 'base', 'head' }) do
+  for _, close in ipairs({ 'save', 'discard' }) do
+    local panes = pair()
+    for _, side in ipairs({ 'base', 'head' }) do
+      api.nvim_win_call(panes[side], function()
+        vim.fn.winrestview({ lnum = side == 'base' and 195 or head_line(195), col = 4,
+          topline = side == 'base' and 150 or head_line(150), leftcol = 0 })
+      end)
+    end
+    api.nvim_set_current_win(panes[origin_side]); vim.cmd('redraw!')
+    input('Vj'); vim.cmd('redraw!')
+    local views = {}
+    for _, side in ipairs({ 'base', 'head' }) do views[side] = api.nvim_win_call(panes[side], vim.fn.winsaveview) end
+    input('a')
+    assert(kind() == 'composer', 'Visual direct comment did not open composer')
+    if close == 'save' then
+      api.nvim_buf_set_lines(0, 0, -1, false, { 'Direct ' .. origin_side .. ' range comment' })
+      input(':wq<CR>')
+    else input(':q!<CR>') end
+    wait(function() return kind() == 'diff' end, 'Direct composer did not return to code')
+    vim.cmd('redraw!')
+    assert(api.nvim_get_current_win() == panes[origin_side], origin_side .. ' ' .. close .. ' returned to wrong code pane')
+    for _, side in ipairs({ 'base', 'head' }) do
+      local restored = api.nvim_win_call(panes[side], vim.fn.winsaveview)
+      assert(vim.deep_equal(restored, views[side]), origin_side .. ' ' .. close .. ' changed ' .. side .. ' code view: '
+        .. vim.inspect(views[side]) .. ' -> ' .. vim.inspect(restored))
+    end
+  end
+end
+vim.cmd('Review')
+wait(function() return kind() == 'home' end, 'Missing home after direct composers')
 row('Feedback first-head')
 input('<CR>')
 aligned('first-head', 80, head_line(80), 'first discussion split')
@@ -103,8 +139,9 @@ vim.cmd('Review next comment')
 aligned('later-base', 180, head_line(180), 'next base-side comment, reused discussion', 'base')
 vim.cmd('Review previous comment')
 aligned('first-head', 80, head_line(80), 'previous head-side comment')
-input(']R')
-aligned('later-base', 180, head_line(180), 'mark-and-next comment', 'base')
+input('s')
+input(']r')
+aligned('later-base', 180, head_line(180), 'stage then next comment', 'base')
 vim.cmd('Review next comment')
 aligned('historical', 140, head_line(140), 'historical referenced source', 'base')
 

@@ -113,18 +113,22 @@ if mode == 'preservation' then
   input('[R')
   assert(hits['[R'] == 2, 'Ordinary source lost preserved global user mapping')
 else
-  for _, key in ipairs({ ']C', '[C', ']c', '[c' }) do assert(vim.fn.maparg(key, 'n') == '', 'Unexpected mapping ' .. key) end
-  for _, key in ipairs({ ']r', '[r', ']f', '[f', ']R', '[R', ']F', '[F' }) do
+  for _, key in ipairs({ ']C', '[C', ']c', '[c', ']R', '[R', ']F', '[F',
+    '<Plug>(ReviewViewedNext)', '<Plug>(ReviewViewedPrevious)', '<Plug>(ReviewDoneNext)', '<Plug>(ReviewDonePrevious)' }) do
+    assert(vim.fn.maparg(key, 'n') == '', 'Unexpected mapping ' .. key)
+  end
+  assert(require('buf_review').mark_move == nil, 'Removed combined navigation API remains available')
+  for _, key in ipairs({ ']r', '[r', ']f', '[f' }) do
     assert(vim.fn.maparg(key, 'v') == '' and vim.fn.maparg(key, 'i') == '', 'Navigation mapped outside Normal mode: ' .. key)
   end
   open('a')
   local before = state().generation
-  for _, step in ipairs({ { ']r', 'b' }, { ']r', 'c' }, { '[r', 'b' }, { '[r', 'a' } }) do
+  for _, step in ipairs({ { ']r', 'c' }, { ']r', 'a' }, { '[r', 'c' }, { '[r', 'a' } }) do
     input(step[1])
     wait(function() return kind() == 'thread' and vim.b.buf_review.object == step[2] end, 'Pure comment navigation skipped ' .. step[2])
   end
   code()
-  for _, step in ipairs({ { ']f', 'src/c.rs' }, { ']f', 'src/b.rs' }, { '[f', 'src/c.rs' }, { '[f', 'src/a.rs' } }) do
+  for _, step in ipairs({ { ']f', 'src/c.rs' }, { ']f', 'src/a.rs' }, { '[f', 'src/c.rs' }, { '[f', 'src/a.rs' } }) do
     input(step[1]); wait(function() return file(step[2]) end, 'Pure file navigation skipped ' .. step[2])
   end
   assert(state().generation == before and #requests('actions') == 0, 'Pure bracket navigation wrote progress')
@@ -134,16 +138,31 @@ else
   input('[c')
   assert(#requests('actions') == 0, 'Native hunk navigation invoked review actions')
 
-  open('a'); input(']R')
-  wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'c' and state().comments[1].done end, 'Capital comment key did not mark and skip Done')
-  input('[R')
-  wait(function() return state().comments[3].done and #requests('actions') == 2 end, 'Reverse capital comment key did not mark')
+  open('a')
+  local current_buffer, current_view = api.nvim_get_current_buf(), vim.fn.winsaveview()
+  input('s')
+  wait(function() return state().comments[1].done and #requests('actions') == 1 end, 'Comment staging did not save progress')
+  assert(api.nvim_get_current_buf() == current_buffer and vim.deep_equal(vim.fn.winsaveview(), current_view), 'Comment staging moved cursor or viewport')
+  input(']r')
+  wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'c' end, 'Comment navigation did not skip staged and Done comments')
+  assert(#requests('actions') == 1, 'Comment navigation staged progress')
+  input('s')
+  wait(function() return state().comments[3].done and #requests('actions') == 2 end, 'Second comment staging did not save progress')
+  input('[r')
+  assert(kind() == 'thread' and vim.b.buf_review.object == 'c' and #requests('actions') == 2, 'Navigation moved or wrote progress with no remaining Todo')
   home()
   row('src/a.rs'); require('buf_review').enter(); wait(function() return file('src/a.rs') end, 'First file missing')
-  input(']F')
-  wait(function() return file('src/c.rs') and state().files[1].viewed end, 'Capital file key did not mark and skip viewed')
-  input('[F')
-  wait(function() return state().files[3].viewed and #requests('actions') == 4 end, 'Reverse capital file key did not mark')
+  current_buffer, current_view = api.nvim_get_current_buf(), vim.fn.winsaveview()
+  input('s')
+  wait(function() return state().files[1].viewed and #requests('actions') == 3 end, 'File staging did not save progress')
+  assert(api.nvim_get_current_buf() == current_buffer and vim.deep_equal(vim.fn.winsaveview(), current_view), 'File staging moved cursor or viewport')
+  input(']f')
+  wait(function() return file('src/c.rs') end, 'File navigation did not skip staged and viewed files')
+  assert(#requests('actions') == 3, 'File navigation staged progress')
+  input('s')
+  wait(function() return state().files[3].viewed and #requests('actions') == 4 end, 'Second file staging did not save progress')
+  input('[f')
+  assert(file('src/c.rs') and #requests('actions') == 4, 'Navigation moved or wrote progress with no unviewed files')
 
   -- Leaders remain available from ordinary buffers and route existing commands.
   home()
@@ -163,6 +182,26 @@ else
   assert(kind() == 'composer', 'Inline composer missing')
   input(' rcs')
   assert(text():find('```suggestion\nchanged\n```', 1, true), 'Suggestion leader did not use current composer anchor')
+  input(':q!<CR>')
+
+  -- Real input must not wait for a longer global Visual mapping to time out.
+  code()
+  local timeoutlen, previous_af = vim.o.timeoutlen, vim.fn.maparg('af', 'x', false, true)
+  vim.o.timeoutlen = 2000
+  vim.keymap.set('x', 'af', function() hits.af = (hits.af or 0) + 1 end)
+  local before_visual = #records('requests.jsonl')
+  local started = vim.uv.hrtime()
+  api.nvim_input('ggVja')
+  local opened = ReviewTest.wait(500, function() return kind() == 'composer' end, 10)
+  assert(opened and (vim.uv.hrtime() - started) / 1e6 < 500, 'Visual a waited for longer global mapping timeout')
+  local editor = require('buf_review.editor').get()
+  local target = editor.target
+  assert(target.kind == 'diff' and target.target.range.start.line == 1 and target.target.range['end'].line == 2
+    and target.target.range.start.side == 'head' and target.target.range['end'].side == 'head', 'Immediate Visual a lost selected range')
+  assert(not hits.af and #records('requests.jsonl') == before_visual, 'Visual composer invoked longer mapping or backend request')
+  vim.o.timeoutlen = timeoutlen
+  vim.keymap.del('x', 'af')
+  if next(previous_af) then vim.fn.mapset('x', false, previous_af) end
   input(':q!<CR>')
 end
 print('Mapping ' .. mode .. ' passed')

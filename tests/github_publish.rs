@@ -88,6 +88,7 @@ fn fixture() -> TempDir {
         }],
         comments: vec![
             ReadComment {
+                draft: false,
                 content: CommentContent {
                     id: CommentId("issue".into()),
                     body: "issue body".into(),
@@ -96,6 +97,7 @@ fn fixture() -> TempDir {
                 target: CommentTarget::PullRequest,
             },
             ReadComment {
+                draft: false,
                 content: CommentContent {
                     id: CommentId("root".into()),
                     body: "root body".into(),
@@ -115,6 +117,7 @@ fn fixture() -> TempDir {
                 }),
             },
             ReadComment {
+                draft: false,
                 content: CommentContent {
                     id: CommentId("reply".into()),
                     body: "reply body".into(),
@@ -269,7 +272,7 @@ fn command(project: &Path, fail: Option<&str>, executable: &Path) -> Command {
     command
 }
 
-fn publish(project: &Path, fail: Option<&str>) -> Output {
+fn publish_workspace(project: &Path, fail: Option<&str>) -> Output {
     let workspace = Store::open(project)
         .unwrap()
         .workspace("batch")
@@ -290,6 +293,20 @@ fn publish(project: &Path, fail: Option<&str>) -> Output {
     )
     .unwrap();
     child.wait_with_output().unwrap()
+}
+
+// Endpoint adapter coverage also exercises legacy edit/delete events. The
+// workspace runner's immutable-comment and review-queue contracts have their own gates.
+fn publish(project: &Path, fail: Option<&str>) -> Output {
+    let mut output = command(project, fail, &std::env::current_exe().unwrap())
+        .args(["--exact", "provider_adapter_worker", "--ignored"])
+        .env("ADAPTER_MODE", "pipeline")
+        .output()
+        .unwrap();
+    if output.status.success() {
+        output.stdout = fs::read(project.join("adapter-result.json")).unwrap();
+    }
+    output
 }
 
 fn publication_error(output: &Output) -> String {
@@ -332,18 +349,34 @@ fn provider_adapter_worker() {
     let project = std::env::current_dir().unwrap();
     let mut store = Store::open(&project).unwrap();
     let workspace = store.workspace("batch").unwrap().unwrap();
-    let backend = store.review_backend(&workspace.review.id).unwrap().unwrap();
+    let mut backend = store.review_backend(&workspace.review.id).unwrap().unwrap();
     let plan = workspace.pending().unwrap();
     let result = github::preflight(&workspace.review, &backend, &plan).and_then(|()| {
-        if std::env::var("ADAPTER_MODE").unwrap() == "publish" {
-            assert_eq!(
-                plan.operations.len(),
-                1,
-                "adapter tests publish one operation only"
-            );
-            github::publish(&workspace.review, &backend, &plan.operations[0]).map(|_| ())
-        } else {
-            Ok(())
+        match std::env::var("ADAPTER_MODE").unwrap().as_str() {
+            "publish" => {
+                assert_eq!(
+                    plan.operations.len(),
+                    1,
+                    "single-operation adapter contract"
+                );
+                github::publish(&workspace.review, &backend, &plan.operations[0]).map(|_| ())
+            }
+            "pipeline" => {
+                for operation in &plan.operations {
+                    let result = github::publish(&workspace.review, &backend, operation)?;
+                    store
+                        .record_operation_result(
+                            &workspace.batch.id,
+                            operation,
+                            &result.mappings,
+                            &result.response,
+                        )
+                        .unwrap();
+                    backend = store.review_backend(&workspace.review.id).unwrap().unwrap();
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     });
     fs::write(
@@ -365,7 +398,7 @@ fn requests(project: &Path) -> Vec<Value> {
 }
 
 #[test]
-fn publishes_native_endpoints_exact_anchors_and_persisted_mappings() {
+fn legacy_adapters_publish_native_endpoints_exact_anchors_and_persisted_mappings() {
     let project = fixture();
     seed_events(
         project.path(),
@@ -554,7 +587,7 @@ fn validation_failure_keeps_provider_reason_and_structured_error_context() {
 }
 
 #[test]
-fn removal_selects_only_authenticated_reviewers_reaction_and_handles_empty_delete_response() {
+fn legacy_adapter_removal_selects_authenticated_reviewer_and_handles_empty_delete_response() {
     let project = fixture();
     seed_events(
         project.path(),
@@ -678,7 +711,7 @@ fn authenticated_user_lookup_failure_leaves_plan_unpublished() {
 }
 
 #[test]
-fn retry_uses_completed_create_mapping_after_late_failure_and_accepts_new_draft_reply() {
+fn legacy_adapter_retry_uses_create_receipts_and_accepts_new_reply() {
     let project = fixture();
     seed_events(
         project.path(),
@@ -984,7 +1017,7 @@ fn concurrent_publication_rejects_second_writer_and_retry_uses_saved_receipt() {
         calls.iter().filter(|call| call["method"] == "POST").count(),
         1
     );
-    let retry = publish(project.path(), None);
+    let retry = publish_workspace(project.path(), None);
     assert!(succeeded(&retry), "{}", publication_error(&retry));
     assert_eq!(requests(project.path()), calls);
     assert_eq!(

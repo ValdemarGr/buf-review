@@ -27,6 +27,11 @@ def write_json(path, value):
 
 
 def canonical_pr(view):
+    for row in view["comments"]:
+        if row["comment"]["origin"] == "draft":
+            row["draft"] = bool(row.get("destination"))
+        else:
+            row["draft"] = row.get("draft", row["comment"]["comment"].get("draft", False))
     pull = view["review"]["read"]["pull_request"]
     view.setdefault("pr", {
         "id": pull["id"], "revision": 0,
@@ -119,6 +124,8 @@ def mutate(request):
                     return {"workspace": view, "error": "editing and deletion require verified ownership"}
                 if row.get("summary"):
                     return {"workspace": view, "error": "Review summaries cannot be deleted"}
+            if op == "delete_comments" and not (row["comment"]["origin"] == "draft" and row.get("destination")):
+                return {"workspace": view, "error": "published comments are immutable"}
             if op == "delete_comments" and row.get("pending_delete"):
                 continue
             if op == "undo" and row.get("pending_delete"):
@@ -154,6 +161,10 @@ def mutate(request):
             if response.get("error"):
                 return response
         return {"workspace": view}
+    if op in {"save", "delete"} and request.get("comment"):
+        row = row_for(request["comment"])
+        if not (row["comment"]["origin"] == "draft" and row.get("destination")):
+            return {"workspace": view, "error": "published comments are immutable"}
     if op == "save" and (directory / "race_save").exists():
         view["generation"] += 1
         write_json(state_path, view)
@@ -206,12 +217,18 @@ def mutate(request):
             response["comment"] = request["comment"] if response.get("error") or request["body"].strip() else None
         elif request["body"].strip():
             identity = "draft-" + str(view["generation"])
-            row = {"comment": {"origin": "draft", "comment": {"id": identity, "body": request["body"], "author": view["review"]["reviewer"], "target": request["target"]}}, "fetched": False, "done": False, "destination": request["destination"], "pending_delete": False, "conflict": False, "summary": False}
+            target = request["target"]
+            destination = "standalone" if target["kind"] == "pull_request" else "review"
+            if target["kind"] == "reply":
+                destination = row_for(target["target"]).get("destination", "review")
+            if destination == "review" and not view.get("wip"):
+                view["wip"] = {"id": "wip-1", "active": False, "conclusion": None}
+            row = {"comment": {"origin": "draft", "comment": {"id": identity, "body": request["body"], "author": view["review"]["reviewer"], "target": target}}, "fetched": False, "draft": True, "done": False, "destination": destination, "pending_delete": False, "conflict": False, "summary": False}
             view["comments"].append(row)
             response["comment"] = identity
     elif op == "reaction":
         row = row_for(request["comment"])
-        if not row["fetched"]:
+        if not row["fetched"] or row.get("draft"):
             response["error"] = "progress is available only for fetched comments"
         elif row.get("pending_delete"):
             response["error"] = "comment does not exist in the current projection"
@@ -225,8 +242,35 @@ def mutate(request):
             response["error"] = "Fixture viewed conflict"
         else:
             next(file for file in view["files"] if file["path"] == request["path"])["viewed"] = request["viewed"]
-    elif op == "summary":
+    elif op in {"summary", "publish_review"}:
+        if not view.get("wip"):
+            view["wip"] = {"id": "wip-1", "active": False}
         view["wip"]["conclusion"] = request["conclusion"]
+        view["pending"] = [item for item in view["pending"] if item["change"]["kind"] != "set_review_conclusion"]
+        if request["conclusion"] is not None:
+            view["pending"].append({"id": "review-conclusion", "change": {"kind": "set_review_conclusion", "conclusion": request["conclusion"]}})
+    elif op == "move":
+        selected = set(request["comments"])
+        if not selected:
+            response["error"] = "select unsent local inline drafts to move"
+        for identity in selected:
+            row = row_for(identity)
+            if not (row["comment"]["origin"] == "draft" and row.get("destination") and comment(row)["target"]["kind"] in {"diff", "reply"}):
+                response["error"] = "only unsent local inline drafts can move into the review"
+            elif comment(row)["author"]["id"] != view["review"]["reviewer"]["id"]:
+                response["error"] = "editing and deletion require verified ownership"
+        for row in view["comments"]:
+            target = comment(row)["target"]
+            if target["kind"] != "reply":
+                continue
+            parent = row_for(target["target"])
+            if (comment(row)["id"] in selected and target["target"] not in selected and parent.get("destination") not in {None, "review"}) or (target["target"] in selected and comment(row)["id"] not in selected and row.get("destination") not in {None, "review"}):
+                response["error"] = "move unpublished parents and replies together"
+        if not response.get("error"):
+            if not view.get("wip"):
+                view["wip"] = {"id": "wip-1", "active": False}
+            for identity in selected:
+                row_for(identity)["destination"] = "review"
     elif op == "pr_details":
         if view["pr"]["source"]["kind"] != "local_intent":
             response["error"] = "Remote PR title and body are read-only"
@@ -235,11 +279,7 @@ def mutate(request):
         else:
             view["pr"].update(title=request["title"], body=request["body"], revision=view["pr"]["revision"] + 1)
     elif op == "submit":
-        if (directory / "fail_submit").exists():
-            response["error"] = "Fixture submission failed"
-        else:
-            view["wip"] = None
-            view["comments"] = [row for row in view["comments"] if row.get("destination") != "review"]
+        response["error"] = "use publish to execute the queued review"
     elif op == "delete":
         row = row_for(request["comment"])
         if (directory / "fail_delete").exists() and (directory / "fail_delete").read_text().strip() == request["comment"]:
@@ -263,10 +303,23 @@ def mutate(request):
         row["conflict"] = False
         view["conflicts"] = [item for item in view["conflicts"] if item["comment"] != request["comment"]]
     elif op == "publish":
-        published = directory / "published_pr.json"
-        if published.exists():
-            view["pr"] = json.loads(published.read_text())
-            view["locator"] = view["pr"]["source"]["locator"]
+        conclusion = (view.get("wip") or {}).get("conclusion")
+        if conclusion and (directory / "fail_submit").exists():
+            response["error"] = "Fixture submission failed"
+        elif conclusion and conclusion["outcome"] != "approve" and not (conclusion.get("body") or "").strip():
+            response["error"] = "Comment and Request changes require a nonblank summary"
+        else:
+            published = directory / "published_pr.json"
+            if published.exists():
+                view["pr"] = json.loads(published.read_text())
+                view["locator"] = view["pr"]["source"]["locator"]
+            for row in view["comments"]:
+                if row.get("destination"):
+                    row.pop("destination")
+                    row["draft"] = False
+            view["pending"] = []
+            if conclusion:
+                view["wip"] = None
     elif op == "compare_latest" and (directory / "defer_compare").exists():
         response["refresh_deferred"] = True
     elif op == "compare_latest" and (directory / "latest_comparison.json").exists():
@@ -288,14 +341,14 @@ def mutate(request):
             elif (directory / "latest_comparison.json").exists():
                 view["comparison"] = json.loads((directory / "latest_comparison.json").read_text())
                 view["review"]["read"]["pull_request"]["revision"] = view["comparison"]
-    if response.get("error") and op in {"start", "leave", "save", "delete", "restore", "viewed", "reaction", "summary", "relocate", "resolve", "pr_details"}:
+    if response.get("error") and op in {"start", "leave", "save", "delete", "restore", "viewed", "reaction", "summary", "publish_review", "move", "relocate", "resolve", "pr_details"}:
         view = previous
     elif op not in {"active", "open"}:
         view["generation"] += 1
     if op == "save" and not response.get("error"):
         view["saved_comment"] = response.get("comment")
-    view["todo"] = [comment(row)["id"] for row in view["comments"] if row["fetched"] and not row["done"]]
-    view["done"] = [comment(row)["id"] for row in view["comments"] if row["fetched"] and row["done"]]
+    view["todo"] = [comment(row)["id"] for row in view["comments"] if row["fetched"] and not row.get("draft") and not row["done"]]
+    view["done"] = [comment(row)["id"] for row in view["comments"] if row["fetched"] and not row.get("draft") and row["done"]]
     response["workspace"] = view
     return response
 

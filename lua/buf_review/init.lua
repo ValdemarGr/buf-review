@@ -12,12 +12,8 @@ local sequence = 0
 local first_load = true
 local commands = {
   'prs', 'pr', 'start', 'leave', 'conclude', 'publish', 'refresh', 'comment', 'reply',
-  'edit', 'delete', 'restore', 'suggest', 'done', 'todo', 'viewed', 'unviewed',
+  'edit', 'delete', 'restore', 'move', 'suggest', 'done', 'todo', 'viewed', 'unviewed',
   'next', 'previous', 'compare', 'context', 'relocate', 'resolve', 'log', 'sessions', 'checkout',
-}
-local mark_move_bindings = {
-  { ']F', 'ViewedNext', 'file', 1 }, { '[F', 'ViewedPrevious', 'file', -1 },
-  { ']R', 'DoneNext', 'comment', 1 }, { '[R', 'DonePrevious', 'comment', -1 },
 }
 local dispatch, home, open_file, open_comment, compose, refresh, show_conflict, thread, thread_list
 local navigate, publication, navigate_items
@@ -169,11 +165,11 @@ local function comment_metadata(view, row)
   local at = location_text(location) or 'PR'
   local author = comment.author and (comment.author.name or comment.author.id) or 'unknown author'
   local flags = {}
-  if row.fetched then flags[#flags + 1] = row.done and 'Done 👍' or 'Todo' end
+  if row.draft or unpublished(row) then flags[#flags + 1] = 'draft'
+  elseif row.fetched then flags[#flags + 1] = row.done and 'Done 👍' or 'Todo' end
   if row.conflict then flags[#flags + 1] = 'CONFLICT' end
   if row.pending_delete then flags[#flags + 1] = 'pending deletion' end
   if row.anchor_error then flags[#flags + 1] = 'REJECTED ANCHOR: ' .. row.anchor_error .. '; :Review relocate/delete' end
-  if row.destination then flags[#flags + 1] = row.destination == 'review' and 'Review' or 'Standalone' end
   return at, author, flags, location
 end
 
@@ -234,10 +230,6 @@ local function activate(buf)
   if api.nvim_get_current_buf() ~= buf then return end
   local meta, edit = buffers[buf], editor.get(buf)
   if not meta then return end
-  if meta.kind == 'diff' then
-    meta.state.repository.active_file = { id = meta.path, revision = meta.revision, state = meta.state }
-    return
-  end
   if not (meta.kind == 'thread' or meta.kind == 'conflict' or (edit and edit.kind == 'comment')) then return end
   local object = meta.rows[api.nvim_win_get_cursor(0)[1]]
   local id = (object and object.comment) or (edit and edit.comment) or meta.comment or meta.object
@@ -276,7 +268,7 @@ local function protected(state)
   for _, win in ipairs(api.nvim_tabpage_list_wins(state.tab)) do
     local buf = api.nvim_win_get_buf(win)
     local composer = editor.get(buf)
-    if composer and (vim.bo[buf].modified or composer.saving or composer.submitting) then
+    if composer and (vim.bo[buf].modified or composer.saving) then
       return true
     end
   end
@@ -399,10 +391,10 @@ local function scratch(state, kind, object, lines, writable, role)
     api.nvim_create_autocmd({ 'BufEnter', 'WinEnter' }, { buffer = buf, callback = function() refresh_checkout(state) end })
   end
   local mappings = vim.list_extend(api.nvim_get_keymap('n'), api.nvim_buf_get_keymap(buf, 'n'))
-  for _, binding in ipairs(vim.list_extend({
+  for _, binding in ipairs({
     { ']r', 'NextComment' }, { '[r', 'PreviousComment' },
     { ']f', 'NextFile' }, { '[f', 'PreviousFile' },
-  }, mark_move_bindings)) do
+  }) do
     if not vim.tbl_contains(mappings, function(mapping) return mapping.lhsraw == binding[1] end, { predicate = true }) then
       vim.keymap.set('n', binding[1], '<Plug>(Review' .. binding[2] .. ')', { buffer = buf, silent = true })
     end
@@ -472,17 +464,21 @@ local function selected(meta)
   return meta and (meta.rows[api.nvim_win_get_cursor(0)[1]] or (meta.kind == 'composer' and { comment = meta.object }) or nil)
 end
 
-local function at_continuation(state, win)
-  local continuation = state.continuation
-  local position = continuation and continuation.position
-  return position and continuation.id == state.selected and position.window == win and valid(win)
-    and api.nvim_win_get_buf(win) == position.buffer
-    and vim.deep_equal(api.nvim_win_get_cursor(win), position.cursor)
-end
-
 local function require_view(state)
   if not state.view then error('No active review workspace; use :Review first') end
   return state.view
+end
+
+local function render_file_winbar(buf, meta, view)
+  if meta.historical then return end
+  local progress = ''
+  if vim.deep_equal(meta.revision, view.comparison) then
+    for _, file in ipairs(view.files) do
+      if file.path == meta.path then progress = file.viewed and ' [viewed]' or ' [unviewed]'; break end
+    end
+  end
+  local title = ('%s %s  %s%s'):format(meta.side == 'base' and 'Base' or 'Head', meta.revision[meta.side], meta.source_path, progress):gsub('%%', '%%%%')
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do vim.wo[win].winbar = title end
 end
 
 local function annotate(buf, meta, view)
@@ -493,7 +489,7 @@ local function annotate(buf, meta, view)
     if location and location.path == meta.path and location.range and location.range.start.side == meta.side then
       local line = location.range.start.line
       local count = counts[line] or { fetched = 0, done = 0, local_comments = 0 }
-      if row.fetched then
+      if row.fetched and not row.draft then
         count.fetched = count.fetched + 1
         if row.done then count.done = count.done + 1 end
       else count.local_comments = count.local_comments + 1 end
@@ -516,6 +512,7 @@ local function annotate(buf, meta, view)
       api.nvim_buf_set_extmark(buf, namespace, line - 1, 0, { virt_text = text })
     end
   end
+  render_file_winbar(buf, meta, view)
 end
 
 local render_home
@@ -540,6 +537,14 @@ render_reader = function(buf, cursor, safe)
     end
     thread_list(state, roots, buf, cursor)
   elseif meta.kind == 'diff' then annotate(buf, meta, state.view) end
+  if (meta.kind == 'thread' or meta.kind == 'threads') and not next(meta.rows)
+    and valid(state.discussion) and api.nvim_win_get_buf(state.discussion) == buf then
+    local focused = api.nvim_get_current_win() == state.discussion
+    leave_diff(state.discussion)
+    api.nvim_win_close(state.discussion, false)
+    state.discussion = nil
+    if focused and valid(state.discussion_origin) then api.nvim_set_current_win(state.discussion_origin) end
+  end
 end
 
 local function apply(state, response, cursor)
@@ -564,7 +569,7 @@ end
 local function request(state, operation, fields, callback, generation)
   local origin = callback and { window = api.nvim_get_current_win(), buffer = api.nvim_get_current_buf(), cursor = api.nvim_win_get_cursor(0) }
   local payload = vim.tbl_extend('force', { op = operation }, fields or {})
-  if vim.tbl_contains({ 'start', 'leave', 'save', 'delete', 'restore', 'undo', 'viewed', 'reaction', 'summary', 'relocate', 'resolve', 'pr_details' }, operation) then
+  if vim.tbl_contains({ 'start', 'leave', 'save', 'delete', 'restore', 'undo', 'viewed', 'reaction', 'summary', 'publish_review', 'move', 'relocate', 'resolve', 'pr_details' }, operation) then
     payload = { op = 'actions', actions = { vim.tbl_extend('force', { action = operation }, fields or {}) } }
   end
   payload.workspace = require_view(state).id
@@ -575,16 +580,9 @@ local function request(state, operation, fields, callback, generation)
     -- Check before rendering: applying a projection may clamp the cursor.
     local stationary = origin and api.nvim_get_current_win() == origin.window
       and api.nvim_get_current_buf() == origin.buffer and vim.deep_equal(api.nvim_win_get_cursor(0), origin.cursor)
-    local position = state.continuation and state.continuation.position
-    local continuing = position and at_continuation(state, position.window)
     local cursor = (operation == 'actions' or operation == 'reaction' or operation == 'viewed' or operation == 'delete' or operation == 'restore') and 'position' or ((operation == 'refresh' or operation == 'apply_refresh') and 'object' or nil)
-    if continuing and not cursor then cursor = 'object' end
     local current = response and operation ~= 'refresh' and operation ~= 'apply_refresh' and apply(state, response, cursor) or state
     if callback then callback(response, err, current, stationary) elseif err and report ~= false then notify(err, vim.log.levels.ERROR) end
-    if continuing and current.continuation and current.continuation.position == position and valid(position.window)
-      and api.nvim_win_get_buf(position.window) == position.buffer then
-      position.cursor = api.nvim_win_get_cursor(position.window)
-    end
   end
   if payload.op == 'actions' or payload.op == 'apply_refresh' then
     if not state.writer then
@@ -978,7 +976,7 @@ render_home = function(state, cursor)
   local pending, included = {}, {}
   for _, row in ipairs(view.comments) do
     local id = content(row).id
-    if unpublished(row) or row.pending_delete or row.conflict then
+    if unpublished(row) or row.draft or row.pending_delete or row.conflict then
       included[id] = true
       pending[#pending + 1] = comment_entry(row, { comment = id, draft = unpublished(row), conflict = row.conflict })
     end
@@ -1215,17 +1213,14 @@ refresh = function(state, callback)
   end)
 end
 
-local function publish(state, operation, callback)
+local function publish(state)
   local ok, err
   if state.publishing then ok, err = false, 'Publication is still running; wait before retrying'
   else ok, err = pcall(settle, state) end
-  if not ok then
-    if callback then callback(nil, err) else error(err) end
-    return
-  end
+  if not ok then error(err) end
   state.publishing = true
   local finished = false
-  local function published(response, publication_error)
+  local function published(_, publication_error)
     local function complete(latest, refresh_error)
       local rendered, problem = pcall(function()
         render_pending(true)
@@ -1234,8 +1229,7 @@ local function publish(state, operation, callback)
       if not rendered then refresh_error = refresh_error or ('Could not redraw review: ' .. tostring(problem)) end
       state.publishing = nil
       finished = true
-      if callback then callback(response, publication_error)
-      elseif publication_error then notify(publication_error, vim.log.levels.ERROR) end
+      if publication_error then notify(publication_error, vim.log.levels.ERROR) end
       if refresh_error then
         notify('Publication finished; refresh failed: ' .. refresh_error, vim.log.levels.WARN)
       elseif latest and latest.refresh_deferred then
@@ -1250,7 +1244,7 @@ local function publish(state, operation, callback)
     if state.refreshing then refresh(state, fetch) else fetch() end
   end
   local function send()
-    local ok, err = pcall(request, state, operation, {}, published)
+    local ok, err = pcall(request, state, 'publish', {}, published)
     if not ok then published(nil, err) end
   end
   if state.refreshing then refresh(state, send) else send() end
@@ -1362,7 +1356,7 @@ local function immutable(state, path, side, revision, text, code)
   vim.keymap.set('x', 'a', function()
     local ok, err = pcall(M.new_comment, nil, true)
     if not ok then notify(err, vim.log.levels.ERROR) end
-  end, { buffer = buf, silent = true })
+  end, { buffer = buf, silent = true, nowait = true })
   annotate(buf, meta, state.view)
   return buf
 end
@@ -1410,8 +1404,8 @@ local function show_code(state, code)
     vim.wo[state.left].winbar = ('%s %s  %s'):format(label, code.revision.base, code.base_path or path):gsub('%%', '%%%%')
     vim.wo[state.right].winbar = ('PR head %s  %s%s'):format(code.revision.head, path, code.head_missing and ' [file absent]' or ''):gsub('%%', '%%%%')
   else
-    vim.wo[state.left].winbar = ('Base %s  %s'):format(code.revision.base, code.base_path or path):gsub('%%', '%%%%')
-    vim.wo[state.right].winbar = ('Head %s  %s'):format(code.revision.head, path):gsub('%%', '%%%%')
+    render_file_winbar(base, buffers[base], state.view)
+    render_file_winbar(head, buffers[head], state.view)
   end
   state.top = state.left
   state.path = path
@@ -1557,9 +1551,6 @@ thread_list = function(state, roots, existing, cursor, location)
     highlights[#highlights + 1] = { line = #lines, group = 'BufReviewPreview', start = 4 }
   end
   lines[#lines + 1] = ''
-  lines[#lines + 1] = divider
-  highlights[#highlights + 1] = { line = #lines, group = 'BufReviewLabel' }
-  lines[#lines + 1] = ''
   local buf, meta
   if existing then buf, meta = existing, buffers[existing]; replace(buf, lines)
   else
@@ -1652,11 +1643,6 @@ thread = function(state, row, existing, cursor)
       lines[#lines + 1] = ''
     end
   end
-  if root and content(root).target.kind == 'diff' and not root.summary then
-    lines[#lines + 1] = divider
-    highlights[#highlights + 1] = { line = #lines, group = 'BufReviewLabel' }
-    lines[#lines + 1] = ''
-  end
   local buf, meta
   if existing then buf, meta = existing, buffers[existing]; replace(buf, lines)
   else buf, meta = scratch(state, 'thread', root_id, lines) end
@@ -1731,6 +1717,7 @@ compose = function(state, options)
   if row then
     row = find(view, content(row).id)
     if not row then error('Comment no longer present in this workspace') end
+    if not unpublished(row) then error('Published comments are immutable; reply or create a new comment') end
     if row.pending_delete then error('Comment has pending deletion; restore it before editing') end
   end
   local comment = row and content(row)
@@ -1744,19 +1731,29 @@ compose = function(state, options)
   if not row and target and target.kind == 'diff' and not vim.deep_equal(target.target.revision, view.comparison) then
     error('Comparison changed; reopen this code location before composing')
   end
-  local destination = options.destination or (row and row.destination) or (row and 'standalone') or (view.wip and view.wip.active and 'review' or 'standalone')
+  local parent = target and target.kind == 'reply' and find(view, target.target)
+  local destination = (row and row.destination) or (parent and parent.destination) or (target and target.kind == 'pull_request' and 'standalone' or 'review')
+  local origin, origin_win = api.nvim_get_current_buf(), api.nvim_get_current_win()
+  local origin_meta = buffers[origin]
+  local return_views
+  if kind == 'comment' and origin_meta and origin_meta.kind == 'diff' then
+    return_views = {}
+    for _, win in ipairs({ origin_win, state.left, state.right }) do
+      if valid(win) then
+        return_views[win] = { buffer = api.nvim_win_get_buf(win), view = api.nvim_win_call(win, vim.fn.winsaveview) }
+      end
+    end
+  end
   local buf, meta = scratch(state, 'composer', comment and comment.id, vim.split(text, '\n', { plain = true }), true)
   local captured = view.generation
-  local edit = { kind = kind, comment = comment and comment.id, target = target, destination = destination, state = state, relocation = options.relocation }
+  local edit = { kind = kind, comment = comment and comment.id, target = target, destination = destination, state = state, relocation = options.relocation, return_views = return_views }
   edit.before_write = function() settle(state) end
   edit.return_buf, edit.return_view = options.return_buf, options.return_view
-  local origin = api.nvim_get_current_buf()
-  local origin_meta = buffers[origin]
-  if kind ~= 'conclusion' and not edit.return_buf and api.nvim_get_current_win() == state.discussion
+  if kind ~= 'conclusion' and not edit.return_buf and origin_win == state.discussion
     and origin_meta and (origin_meta.kind == 'thread' or origin_meta.kind == 'threads') then
     edit.return_buf, edit.return_view = origin, vim.fn.winsaveview()
   end
-  edit.return_win = api.nvim_get_current_win() == state.discussion and state.discussion_origin or api.nvim_get_current_win()
+  edit.return_win = origin_win == state.discussion and state.discussion_origin or origin_win
   local function saved_row(snapshot, id)
     local saved = id and find(snapshot, id)
     if not saved then return false end
@@ -1788,7 +1785,7 @@ compose = function(state, options)
       message = 'Local PR: ' .. branches.source.branch .. ' → ' .. branches.sink.branch
     else
       local location = target.kind == 'diff' and target.target or (target.kind == 'reply' and anchor(view, find(view, target.target)))
-      message = (target.kind == 'reply' and 'Reply: ' or 'Comment: ') .. (location_text(location) or 'PR discussion') .. ' [' .. destination .. ']'
+      message = (target.kind == 'reply' and 'Reply: ' or 'Comment: ') .. (location_text(location) or 'PR discussion') .. ' [draft]'
     end
   end
   if row and row.anchor_error then message = message .. '\nRejected anchor: ' .. row.anchor_error .. ' — :Review relocate/delete' end
@@ -1804,7 +1801,7 @@ compose = function(state, options)
     end
     local fields, operation
     if kind == 'conclusion' then
-      operation, fields = 'summary', { conclusion = { outcome = options.outcome, body = body } }
+      operation, fields = 'publish_review', { conclusion = { outcome = options.outcome, body = body } }
     elseif kind == 'pr' then
       local lines = vim.split(body, '\n', { plain = true })
       local title = table.remove(lines, 1)
@@ -1870,18 +1867,6 @@ compose = function(state, options)
     end
     save_body()
   end
-  edit.submit = function(callback)
-    if options.outcome ~= 'approve' and vim.trim(edit.saved_body or '') == '' then
-      callback('Comment and Request changes require a nonblank summary')
-      return
-    end
-    publish(state, 'submit', function(response, err)
-      if err and response and response.workspace and not response.workspace.wip then
-        notify('Review submitted; progress remains queued: ' .. err, vim.log.levels.WARN)
-        callback()
-      else callback(err) end
-    end)
-  end
   editor.attach(buf, edit)
   vim.bo[buf].modified = false
   discussion(state, buf)
@@ -1946,6 +1931,7 @@ local function edit_comment(state, row)
   settle(state)
   row = find(require_view(state), content(row).id)
   if not row then error('Comment no longer present in this workspace') end
+  if not unpublished(row) then error('Published comments are immutable; reply or create a new comment') end
   if not owned(state, row) then error('Editing requires verified ownership of this comment') end
   if row.pending_delete then error('Comment has pending deletion; restore it before editing') end
   if row.conflict then show_conflict(state, row); return end
@@ -2065,7 +2051,7 @@ function M.enter()
       if object.conflict or row.conflict then show_conflict(state, row)
       elseif object.draft then edit_comment(state, row)
       elseif meta.kind == 'thread' then
-        if owned(state, row) then edit_comment(state, row) end
+        if unpublished(row) and owned(state, row) then edit_comment(state, row) end
       elseif meta.kind == 'threads' then thread(state, row)
       else open_comment(state, object.comment) end
     end
@@ -2124,10 +2110,9 @@ publication = function(state, id)
   end, false)
 end
 
-function M.progress(present, visual, mode, selection, callback)
+function M.progress(present, visual, mode, selection)
   local ok, err = pcall(function()
     local state, meta = get_state()
-    if selection and selection.state then state = selection.state end
     ready(state)
     local view = require_view(state)
     local objects, seen = {}, {}
@@ -2165,14 +2150,6 @@ function M.progress(present, visual, mode, selection, callback)
           undo[#undo + 1] = object.comment
         else
           queue[#queue + 1] = { 'reaction', { comment = object.comment, present = present } }
-          for index, id in ipairs(view.todo) do
-            if id == object.comment then
-              state.continuation = {
-                id = id, index = index, order = vim.deepcopy(view.todo),
-                position = { window = api.nvim_get_current_win(), buffer = api.nvim_get_current_buf(), cursor = api.nvim_win_get_cursor(0) },
-              }
-            end
-          end
         end
         seen[object.comment] = true
         state.selected = object.comment
@@ -2185,111 +2162,7 @@ function M.progress(present, visual, mode, selection, callback)
       else error(mode == 'file' and 'Select a file or review diff' or 'Select a fetched comment') end
     end
     if #undo > 0 then table.insert(queue, 1, { 'undo', { comments = undo } }) end
-    actions(state, queue, callback)
-  end)
-  if not ok then notify(err, vim.log.levels.ERROR) end
-end
-
-local function visible_target(state, kind)
-  local pane = state.repository['active_' .. kind]
-  if not pane then return end
-  if kind == 'file' and not vim.deep_equal(pane.revision, pane.state.view.comparison) then return end
-  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
-    local buf = api.nvim_win_get_buf(win)
-    if kind == 'comment' then
-      if buf == pane.buffer then return pane end
-    else
-      local meta = buffers[buf]
-      if meta and meta.kind == 'diff' and meta.state == pane.state and meta.path == pane.id
-        and vim.deep_equal(meta.revision, pane.revision) then return pane end
-    end
-  end
-end
-
-function M.mark_move(kind, direction)
-  local ok, err = pcall(function()
-    local state, meta = get_state()
-    guard(state)
-    local pane = visible_target(state, kind)
-    if pane then state = pane.state end
-    ready(state)
-    guard(state)
-    local view = require_view(state)
-    if kind == 'comment' and not pane then
-      state.repository.opening = {}
-      settle(state)
-      view = require_view(state)
-      local roots = {}
-      if meta and meta.kind == 'diff' then
-        local line = api.nvim_win_get_cursor(0)[1]
-        for _, root in ipairs(roots_at(view, range(meta, line, line), meta)) do
-          roots[content(root).id] = true
-        end
-      elseif meta and meta.kind == 'threads' then
-        for _, id in ipairs(meta.root_ids) do roots[id] = true end
-      end
-      if next(roots) then
-        for at = direction > 0 and 1 or #view.todo, direction > 0 and #view.todo or 1, direction do
-          local id = view.todo[at]
-          local root = root_row(view, find(view, id))
-          if root and roots[content(root).id] then
-            open_comment(state, id)
-            return
-          end
-        end
-      end
-      navigate_items(state, meta, direction, 'todo')
-      return
-    end
-    local object = selected(meta)
-    local id = pane and pane.id or (kind == 'file' and ((object and object.file) or (meta and meta.kind == 'diff' and meta.path) or state.path))
-    if kind == 'file' and not pane
-      and not vim.tbl_contains(view.files, function(file) return file.path == id end, { predicate = true }) then id = nil end
-    if not id and kind == 'comment' then
-      navigate_items(state, nil, direction, 'todo')
-      return
-    end
-    local repository, navigation = state.repository.current, state.repository.navigation
-    local opening = {}
-    state.repository.opening = opening
-    local comparison = vim.deepcopy(view.comparison)
-    local function advance(_, problem, current, stationary)
-      if problem then notify(problem, vim.log.levels.ERROR) end
-      if not stationary or state.repository.opening ~= opening or state.repository.current ~= repository or state.repository.navigation ~= navigation
-        or not vim.deep_equal(current.view.comparison, comparison) or protected(state) then return end
-      if pane then
-        local present = visible_target(state, kind)
-        if not present or present.state ~= pane.state or present.buffer ~= pane.buffer or present.id ~= id then return end
-      end
-      local items = kind == 'file' and current.view.files or current.view.comments
-      local index
-      for at, item in ipairs(items) do
-        if (kind == 'file' and item.path or content(item).id) == id then index = at; break end
-      end
-      if not id and kind == 'file' then index = direction > 0 and 0 or #items + 1 end
-      if index then
-        for at = index + direction, direction > 0 and #items or 1, direction do
-          local item = items[at]
-          if kind == 'file' then
-            if not item.viewed then open_file(state, item.path); return end
-          elseif vim.tbl_contains(current.view.todo, content(item).id) then
-            open_comment(state, content(item).id)
-            return
-          end
-        end
-      end
-      notify('End of ' .. (kind == 'file' and 'unviewed file' or 'todo') .. ' list')
-    end
-    local row = kind == 'comment' and find(view, id)
-    if kind == 'file' then
-      for _, file in ipairs(view.files) do if file.path == id then row = file; break end end
-    end
-    if not pane or (kind == 'file' and (not row or row.viewed))
-      or (kind == 'comment' and (not row or not row.fetched or row.done or row.pending_delete)) then
-      advance(nil, nil, state, true)
-    else
-      M.progress(true, false, kind, { [kind] = id, state = pane.state }, advance)
-    end
+    actions(state, queue)
   end)
   if not ok then notify(err, vim.log.levels.ERROR) end
 end
@@ -2307,54 +2180,50 @@ show_conflict = function(state, row)
   discussion(state, buf)
 end
 
-navigate_items = function(state, meta, direction, kind)
+local function next_item(items, marked, current, direction)
+  local index = direction > 0 and 0 or #items + 1
+  for at, id in ipairs(items) do
+    if id == current then index = at; break end
+  end
+  for offset = 1, #items do
+    local id = items[(index + direction * offset - 1) % #items + 1]
+    if id ~= current and not marked[id] then return id end
+  end
+end
+
+navigate_items = function(state, meta, direction, kind, count)
+  guard(state)
   state.repository.opening = {}
   settle(state)
   local view = require_view(state)
-  local ids = {}
-  if kind == 'todo' then ids = view.todo
-  elseif kind == 'comment' then for _, row in ipairs(view.comments) do ids[#ids + 1] = content(row).id end
-  elseif kind == 'file' then
-    for _, viewed in ipairs({ false, true }) do for _, file in ipairs(view.files) do if file.viewed == viewed then ids[#ids + 1] = file.path end end end
-  else error('Navigation expects todo, comment, or file') end
-  if #ids == 0 then notify('No ' .. kind .. ' items'); return end
+  if not vim.tbl_contains({ 'todo', 'comment', 'file' }, kind) then error('Navigation expects todo, comment, or file') end
+  local file = kind == 'file'
   local object = selected(meta)
-  local current = kind == 'file' and ((object and object.file) or (meta and meta.path)) or ((object and object.comment) or state.selected)
-  if kind == 'todo' and at_continuation(state, api.nvim_get_current_win()) then current = state.continuation.id end
-  local index
-  for at, id in ipairs(ids) do if id == current then index = at + direction; break end end
-  if not index and kind == 'todo' and state.continuation then
-    local ranks, selected_rank = {}, nil
-    for at, row in ipairs(view.comments) do
-      ranks[content(row).id] = at
-      if content(row).id == state.continuation.id then selected_rank = at end
-    end
-    if selected_rank then
-      if direction > 0 then
-        for at, id in ipairs(ids) do if ranks[id] > selected_rank then index = at; break end end
-        index = index or #ids + 1
-      else
-        for at = #ids, 1, -1 do if ranks[ids[at]] < selected_rank then index = at; break end end
-        index = index or 0
-      end
+  local edit = editor.get(api.nvim_get_current_buf())
+  local discussion = meta and (meta.kind == 'thread' or meta.kind == 'conflict' or (edit and edit.kind == 'comment'))
+  local current
+  if file then current = (object and object.file) or (meta and meta.kind == 'diff' and meta.path)
+  else current = (object and object.comment) or (discussion and meta.object) end
+  local roots = {}
+  if not file and not current and meta and meta.kind == 'diff' then
+    local line = api.nvim_win_get_cursor(0)[1]
+    for _, root in ipairs(roots_at(view, range(meta, line, line), meta)) do roots[content(root).id] = true end
+  end
+  local ids, marked, todo, local_ids = {}, {}, {}, {}
+  if not file then for _, id in ipairs(view.todo) do todo[id] = true end end
+  for _, row in ipairs(file and view.files or view.comments) do
+    local id = file and row.path or content(row).id
+    ids[#ids + 1] = id
+    marked[id] = file and row.viewed or (not file and not todo[id])
+    if next(roots) then
+      local root = root_row(view, row)
+      if root and roots[content(root).id] then local_ids[#local_ids + 1] = id end
     end
   end
-  if not index and kind == 'todo' and state.continuation then
-    local old = state.continuation.order
-    local old_index = state.continuation.index
-    local candidates = {}
-    for at, id in ipairs(old) do candidates[id] = at end
-    if direction > 0 then
-      for at, id in ipairs(ids) do if (candidates[id] or math.huge) > old_index then index = at; break end end
-      index = index or #ids + 1
-    else
-      for at = #ids, 1, -1 do if (candidates[ids[at]] or math.huge) < old_index then index = at; break end end
-      index = index or 0
-    end
-  end
-  index = index or (direction > 0 and 1 or #ids)
-  if index < 1 or index > #ids then notify('End of ' .. kind .. ' list'); return end
-  if kind == 'file' then open_file(state, ids[index]) else open_comment(state, ids[index]) end
+  local id = next_item(local_ids, marked, nil, direction) or next_item(ids, marked, current, direction)
+  if not id then notify('No other ' .. (file and 'unviewed file' or 'todo') .. ' items'); return end
+  for _ = 2, count do id = next_item(ids, marked, id, direction) or id end
+  if file then open_file(state, id) else open_comment(state, id) end
 end
 
 local function conclude(state)
@@ -2364,23 +2233,19 @@ local function conclude(state)
   local selection = state.repository.current
   local view = require_view(state)
   local outcome = view.wip and view.wip.conclusion and view.wip.conclusion.outcome
-  local choices = { 'comment', 'approve', 'request_changes' }
+  local choices = { 'draft', 'comment', 'approve', 'request_changes' }
   if outcome then
     choices = vim.tbl_filter(function(choice) return choice ~= outcome end, choices)
     table.insert(choices, 1, outcome)
   end
-  vim.ui.select(choices, { prompt = 'Review outcome', format_item = function(value) return ({ comment = 'Comment', approve = 'Approve', request_changes = 'Request changes' })[value] end }, function(choice)
+  vim.ui.select(choices, { prompt = 'Review outcome', format_item = function(value) return ({ draft = 'Draft', comment = 'Comment', approve = 'Approve', request_changes = 'Request changes' })[value] end }, function(choice)
     if not choice then return end
     if state.repository.current ~= selection then return end
     if protected(state) then notify('Unsaved composer; conclusion cancelled', vim.log.levels.ERROR); return end
-    request(state, 'start', {}, function(_, err)
-      if err then notify(err, vim.log.levels.ERROR); return end
-      if state.repository.current ~= selection then return end
-      local wip = state.view.wip
-      local count = 0
-      for _, row in ipairs(state.view.comments) do if row.destination == 'review' and row.comment.origin == 'draft' then count = count + 1 end end
-      compose(state, { kind = 'conclusion', outcome = choice, body = wip and wip.conclusion and wip.conclusion.body or '', message = ('Conclusion: %s | %d saved comments'):format(choice, count) })
-    end)
+    if choice == 'draft' then request(state, 'publish_review', { conclusion = vim.NIL }); return end
+    local count = 0
+    for _, row in ipairs(view.comments) do if row.destination == 'review' and unpublished(row) then count = count + 1 end end
+    compose(state, { kind = 'conclusion', outcome = choice, body = view.wip and view.wip.conclusion and view.wip.conclusion.body or '', message = ('Conclusion: %s | %d saved comments'):format(choice, count) })
   end)
 end
 
@@ -2482,6 +2347,7 @@ local function context(state, row)
 end
 
 dispatch = function(command, arguments, opts)
+  local count = vim.v.count1
   local state, meta = get_state()
   local selection = state.repository.current
   if state.repository.navigating and (not command or command == 'prs' or command == 'sessions') then return end
@@ -2529,7 +2395,7 @@ dispatch = function(command, arguments, opts)
   end
   require_view(state)
   if command == 'start' or command == 'leave' then request(state, command)
-  elseif command == 'publish' then publish(state, command)
+  elseif command == 'publish' then publish(state)
   elseif command == 'checkout' then
     if #arguments > 0 then error('Use :Review checkout') end
     checkout_current(state)
@@ -2538,9 +2404,24 @@ dispatch = function(command, arguments, opts)
   elseif command == 'comment' then M.new_comment(arguments[1], false, opts)
   elseif command == 'reply' then reply(state, picked(state, meta), arguments[1])
   elseif command == 'edit' then edit_comment(state, picked(state, meta))
+  elseif command == 'move' then
+    guard(state)
+    local comments, seen = {}, {}
+    local first = opts and opts.range > 0 and opts.line1 or api.nvim_win_get_cursor(0)[1]
+    local last = opts and opts.range > 0 and opts.line2 or first
+    for line = first, last do
+      local object = meta and meta.rows[line]
+      if object and object.comment and not seen[object.comment] then
+        seen[object.comment] = true
+        comments[#comments + 1] = object.comment
+      end
+    end
+    if #comments == 0 then error('Select unsent inline comments to move into this Review') end
+    actions(state, { { 'move', { comments = comments } } })
   elseif command == 'delete' or command == 'restore' then
     guard(state)
     local row = picked(state, meta)
+    if command == 'delete' and not unpublished(row) then error('Published comments are immutable; reply or create a new comment') end
     if not owned(state, row) then error('Deletion/restoration requires verified ownership') end
     if row.summary and command == 'delete' then error('Submitted review summaries cannot be deleted') end
     state.selected = content(row).id
@@ -2548,7 +2429,7 @@ dispatch = function(command, arguments, opts)
     request(state, command, { comment = content(row).id })
   elseif command == 'done' or command == 'todo' then M.progress(command == 'done', false, 'comment', opts)
   elseif command == 'viewed' or command == 'unviewed' then M.progress(command == 'viewed', false, 'file', opts)
-  elseif command == 'next' or command == 'previous' then navigate_items(state, meta, command == 'next' and 1 or -1, arguments[1] or 'todo')
+  elseif command == 'next' or command == 'previous' then navigate_items(state, meta, command == 'next' and 1 or -1, arguments[1] or 'todo', count)
   elseif command == 'suggest' then suggestion()
   elseif command == 'log' then
     guard(state)
@@ -2634,7 +2515,7 @@ local function complete(lead, line)
   local candidates = commands
   if #parts > 2 or (#parts == 2 and lead == '') then
     local command = parts[2]
-    candidates = ({ prs = { 'assignee=', 'assignee=@me', 'assignee=all', 'state=open', 'state=closed', 'state=merged', 'state=all' }, sessions = { 'new' }, comment = { 'review', 'standalone' }, reply = { 'review', 'standalone' }, next = { 'todo', 'comment', 'file' }, previous = { 'todo', 'comment', 'file' }, compare = { 'latest' }, resolve = { 'local', 'remote', 'edit' } })[command] or {}
+    candidates = ({ prs = { 'assignee=', 'assignee=@me', 'assignee=all', 'state=open', 'state=closed', 'state=merged', 'state=all' }, sessions = { 'new' }, next = { 'todo', 'comment', 'file' }, previous = { 'todo', 'comment', 'file' }, compare = { 'latest' }, resolve = { 'local', 'remote', 'edit' } })[command] or {}
     if command == 'relocate' then
       local ok, state = pcall(get_state)
       if ok and state.view then for _, row in ipairs(state.view.comments) do if unpublished(row) and content(row).target.kind == 'diff' then candidates[#candidates + 1] = content(row).id end end end
@@ -2688,9 +2569,6 @@ function M.register()
     { 'NextFile', 'next file' }, { 'PreviousFile', 'previous file' },
   }) do
     vim.keymap.set('n', '<Plug>(Review' .. item[1] .. ')', '<Cmd>Review ' .. item[2] .. '<CR>', { silent = true })
-  end
-  for _, binding in ipairs(mark_move_bindings) do
-    vim.keymap.set('n', '<Plug>(Review' .. binding[2] .. ')', function() M.mark_move(binding[3], binding[4]) end, { silent = true })
   end
 end
 

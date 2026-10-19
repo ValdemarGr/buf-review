@@ -89,8 +89,14 @@ impl Workspace {
             || preparation;
         let status = if self.attempt.is_some() {
             PublicationStatus::Publishing
-        } else if !self.suspended_attempts.is_empty() {
+        } else if self
+            .suspended_attempts
+            .iter()
+            .any(|attempt| attempt.uncertain)
+        {
             PublicationStatus::Uncertain
+        } else if !self.suspended_attempts.is_empty() && published.total == 0 {
+            PublicationStatus::Failed
         } else if published.total == 0 {
             PublicationStatus::Draft
         } else if unfinished {
@@ -191,7 +197,7 @@ impl Attempt {
         } else if current
             .suspended_attempts
             .iter()
-            .any(|attempt| attempt.id == self.id)
+            .any(|attempt| attempt.id == self.id && attempt.uncertain)
         {
             PublicationStatus::Uncertain
         } else if submitted && published.total < planned.total {

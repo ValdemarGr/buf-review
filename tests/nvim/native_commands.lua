@@ -162,8 +162,10 @@ row('Delete-alpha')
 before = #requests('actions')
 vim.cmd('normal ddu')
 sent = batch_since(before, 2)
-wait(function() return state().generation >= sent.generation + 2 end, 'delete then undo did not finish')
-assert(sent.actions[1].action == 'delete_comments' and sent.actions[2].action == 'undo' and not state().comments[1].pending_delete, 'undo missed queued deletion')
+wait(function() return notices[#notices]:find('immutable', 1, true) end, 'published deletion was not rejected')
+assert(sent.actions[1].action == 'delete_comments' and sent.actions[2].action == 'undo'
+  and not state().comments[1].pending_delete and #state().comments == 2,
+  'immutable comment deletion changed saved state')
 reset({ 'Undo-twice' })
 local twice = state()
 twice.comments[1].done, twice.todo, twice.done = true, {}, { 'Undo-twice' }
@@ -172,10 +174,10 @@ vim.cmd('Review')
 wait(function() return text():find('Done (1)', 1, true) end, 'undo fixture did not load Done state')
 row('Undo-twice')
 before = #requests('actions')
-vim.cmd('normal dduu')
-sent = batch_since(before, 3)
-wait(function() return state().generation >= sent.generation + 3 end, 'repeated undo did not finish')
-assert(sent.actions[2].action == 'undo' and sent.actions[3].action == 'undo' and not state().comments[1].pending_delete and not state().comments[1].done, 'undo intents coalesced across contextual state change')
+vim.cmd('normal uu')
+sent = batch_since(before, 2)
+wait(function() return state().generation >= sent.generation + 2 end, 'repeated undo did not finish')
+assert(sent.actions[1].action == 'undo' and sent.actions[2].action == 'undo' and not state().comments[1].done, 'undo intents coalesced across contextual state change')
 
 -- Later actions validate against restored state, rather than the stale reader.
 for _, keys in ipairs({ 'us', 'udd' }) do
@@ -190,10 +192,10 @@ for _, keys in ipairs({ 'us', 'udd' }) do
   before = #requests('actions')
   vim.cmd('normal ' .. keys)
   sent = batch_since(before, 2)
-  wait(function() return state().generation >= sent.generation + 2 end, 'restore followed by action did not finish')
+  wait(function() return not state().comments[1].pending_delete end, 'restore followed by action did not finish')
   assert(sent.actions[1].action == 'undo', 'restore was resolved outside Rust')
   if keys == 'us' then assert(state().comments[1].done and not state().comments[1].pending_delete, 'mark used stale deletion flag')
-  else assert(state().comments[1].pending_delete, 'delete ignored restored comment') end
+  else assert(not state().comments[1].pending_delete and #state().comments == 1, 'immutable restored comment was deleted') end
 end
 
 -- A queued cancellation removes a local child before the later parent delete.
@@ -214,25 +216,25 @@ wait(function() return #state().comments == 0 end, 'parent delete read stale loc
 assert(sent.actions[1].action == 'undo' and sent.actions[2].action == 'delete_comments', 'dependent actions reordered')
 
 -- Motions/counts/dot remain native; object identity deduplicates repeated targets.
-reset({ 'Motion-alpha', 'Motion-beta', 'Motion-gamma' })
+reset({ 'Motion-alpha', 'Motion-beta', 'Motion-gamma' }, { drafts = true })
 api.nvim_win_set_cursor(0, { row('Motion-alpha') - 1, 0 })
 before = #requests('actions')
 vim.cmd('normal 2dd2j.')
 sent = batch_since(before, 2)
-wait(function() return state().comments[1].pending_delete and state().comments[2].pending_delete end, 'count/dot lost delete')
-assert(vim.deep_equal(unique_comments(sent), { 'Motion-alpha', 'Motion-beta' }) and not state().comments[3].pending_delete, 'dot/count changed selected objects')
-reset({ 'Duplicate-alpha', 'Duplicate-beta' })
+wait(function() return #state().comments == 1 end, 'count/dot lost delete')
+assert(vim.deep_equal(unique_comments(sent), { 'Motion-alpha', 'Motion-beta' }) and state().comments[1].comment.comment.id == 'Motion-gamma', 'dot/count changed selected objects')
+reset({ 'Duplicate-alpha', 'Duplicate-beta' }, { drafts = true })
 before = #requests('actions')
 vim.cmd('global/Duplicate-/normal dd')
 sent = batch_since(before, 2)
-wait(function() return state().comments[2].pending_delete end, 'global dd did not complete')
+wait(function() return #state().comments == 0 end, 'global dd did not complete')
 assert(vim.deep_equal(unique_comments(sent), { 'Duplicate-alpha', 'Duplicate-beta' }), 'global delete retargeted')
-reset({ 'Header-alpha', 'Header-beta' })
+reset({ 'Header-alpha', 'Header-beta' }, { drafts = true })
 first, last = row('Header-alpha') - 1, row('Header-beta')
 before = #requests('actions')
 vim.cmd(('%d,%dnormal x'):format(first, last))
 sent = batch_since(before)
-wait(function() return state().comments[2].pending_delete end, 'ranged x did not complete')
+wait(function() return #state().comments == 0 end, 'ranged x did not complete')
 assert(vim.deep_equal(unique_comments(sent), { 'Header-alpha', 'Header-beta' }), 'ranged x lost/reordered selected objects')
 
 -- Mixed ranged actions ignore headings and apply each comment/file once.

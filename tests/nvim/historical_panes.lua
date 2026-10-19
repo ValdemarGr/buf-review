@@ -168,7 +168,7 @@ end
 
 -- File checklist remains pinned: a historical code pane never marks a current file viewed.
 before = #requests('actions')
-input(']F')
+input(']f')
 wait(function() return kind() == 'diff' and not vim.b.buf_review.historical end, 'file navigation did not restore pinned code')
 assert(#requests('actions') == before, 'historical code incorrectly marked current file viewed')
 pair('src/next.rs', current, false)

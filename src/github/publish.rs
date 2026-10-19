@@ -192,19 +192,7 @@ pub fn publish(
                     "issue_comment",
                 ),
                 CommentTarget::Diff(location) => {
-                    let mut body = json!({"body": comment.content.body,
-                        "commit_id": location.revision.head, "path": location.position.path});
-                    match &location.position.range {
-                        Some(range) => {
-                            body["line"] = json!(range.end.line);
-                            body["side"] = json!(side(range.end.side));
-                            if range.start != range.end {
-                                body["start_line"] = json!(range.start.line);
-                                body["start_side"] = json!(side(range.start.side));
-                            }
-                        }
-                        None => body["subject_type"] = json!("file"),
-                    }
+                    let body = inline_payload(comment, location);
                     (format!("{pull}/comments"), body, "review_comment")
                 }
                 CommentTarget::Reply(parent) => {
@@ -398,6 +386,23 @@ pub fn publish(
         }
     };
     Ok(PublishResult { mappings, response })
+}
+
+pub(super) fn inline_payload(comment: &DraftComment, location: &DiffLocation) -> Value {
+    let mut body = json!({"body": comment.content.body,
+        "commit_id": location.revision.head, "path": location.position.path});
+    match &location.position.range {
+        Some(range) => {
+            body["line"] = json!(range.end.line);
+            body["side"] = json!(side(range.end.side));
+            if range.start != range.end {
+                body["start_line"] = json!(range.start.line);
+                body["start_side"] = json!(side(range.start.side));
+            }
+        }
+        None => body["subject_type"] = json!("file"),
+    }
+    body
 }
 
 fn address(backend: &ReviewBackend) -> Result<Address, PublishError> {

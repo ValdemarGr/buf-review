@@ -306,13 +306,13 @@ pub fn run(directory: &Path, request: Value) -> Result<Value> {
                 op == "compare_latest",
             )
         }
-        "publish" | "submit" => {
-            let result = github::publish_workspace(
-                &mut store,
-                &bound.workspace,
-                generation(&bound)?,
-                op == "submit",
-            );
+        "submit" => Err(io::Error::other(
+            "only publish may write to the provider; stage publish_review first",
+        )
+        .into()),
+        "publish" => {
+            let result =
+                github::publish_workspace(&mut store, &bound.workspace, generation(&bound)?, false);
             match result {
                 Ok(_) => Ok(json!({"workspace":store.workspace_view(&bound.workspace)?})),
                 Err(error) => Ok(

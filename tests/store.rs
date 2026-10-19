@@ -34,6 +34,7 @@ fn baseline() -> ReadState {
             viewed: false,
         }],
         comments: vec![ReadComment {
+            draft: false,
             content: CommentContent {
                 id: CommentId("fetched-comment".into()),
                 body: "Original text".into(),
@@ -669,6 +670,7 @@ fn refresh_keeps_batch_identity_and_historical_receipts_out_of_delivered_delta()
     let delivered = store.workspace(&batch.0).unwrap().unwrap();
     let mut fresh = baseline();
     fresh.comments.push(ReadComment {
+        draft: false,
         content: CommentContent {
             id: CommentId("draft".into()),
             body: "body".into(),

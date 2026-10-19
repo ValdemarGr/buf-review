@@ -46,6 +46,7 @@ fn baseline(padding: usize) -> ReadState {
         ]
         .into_iter()
         .map(|(id, body)| ReadComment {
+            draft: false,
             content: CommentContent {
                 id: CommentId(id.into()),
                 body,
@@ -160,7 +161,7 @@ fn local_history_does_not_repeat_remote_snapshots_events_or_receipts() {
             )),
         );
     }
-    let plan = workspace.prepare(Destination::Standalone).unwrap();
+    let plan = workspace.publication_plan().unwrap();
     assert_eq!(plan.operations.len(), 32);
     apply(
         &mut store,
@@ -322,7 +323,7 @@ fn migration_preserves_authoritative_refresh_local_intent_and_every_historical_g
         save("Published before refresh".into()),
     );
     let published = workspace.saved_comment.clone().unwrap();
-    let plan = workspace.prepare(Destination::Standalone).unwrap();
+    let plan = workspace.publication_plan().unwrap();
     apply(
         &mut store,
         &mut workspace,
@@ -355,23 +356,23 @@ fn migration_preserves_authoritative_refresh_local_intent_and_every_historical_g
             error: None,
         },
     );
-    apply(
-        &mut store,
-        &mut workspace,
-        Action::Save {
-            comment: Some(CommentId("remote".into())),
-            target: None,
-            body: "Local edit against old remote text".into(),
-            destination: None,
-        },
-    );
+    // Retain an edit staged by an older version; current fetched comments are immutable.
+    workspace = store
+        .update_workspace(&workspace.id, workspace.generation, |workspace| {
+            workspace.batch.write.events.push(Event::EditComment {
+                comment: CommentId("remote".into()),
+                body: "Local edit against old remote text".into(),
+            });
+            Ok(())
+        })
+        .unwrap();
     apply(
         &mut store,
         &mut workspace,
         save("Uncertain new draft".into()),
     );
     let draft = workspace.saved_comment.clone().unwrap();
-    let plan = workspace.prepare(Destination::Standalone).unwrap();
+    let plan = workspace.publication_plan().unwrap();
     apply(
         &mut store,
         &mut workspace,

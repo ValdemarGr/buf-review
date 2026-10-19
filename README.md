@@ -5,6 +5,22 @@ local Git diffs and GitHub reading/writing through the `gh` CLI. Its Neovim
 frontend uses immutable code buffers, local Markdown drafts and an individual
 comment checklist.
 
+## Releases
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, builds the `pr` CLI with
+the committed Cargo lockfile, checks `pr --version`, then immediately publishes a
+GitHub release with generated notes. The release asset
+`pr-<tag>-x86_64-unknown-linux-gnu.tar.gz` contains the `pr` executable, built on
+Ubuntu 24.04 for Linux x86_64 with glibc.
+
+Commit the workflow and desired package version in `Cargo.toml` and `Cargo.lock`
+before tagging. For example:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Neovim
 
 Install the CLI with `cargo install --path .`. Add this repository to Neovim's
@@ -54,8 +70,8 @@ file opens the immutable base/head diff; Enter on code opens its existing-thread
 list, including a single thread, and does nothing when there are no threads.
 Enter on a list entry opens its discussion. `a` on code or in the location's
 thread list starts a new thread; `a` in a discussion replies to its root,
-including your own thread. Enter on your own comment edits it; other comments
-stay read-only. Visual `a` starts a range comment. `:w` saves the Markdown
+including your own thread. Enter edits an unsent local comment. Successfully sent comments, including
+pending review comments, are read-only. Visual `a` starts a range comment. `:w` saves the Markdown
 composer locally; `:wq` returns to its originating reader or code context.
 Existing source editing and navigation remain ordinary Neovim.
 
@@ -64,52 +80,64 @@ Review, `<leader>rr` refreshes, `<leader>rp` publishes, `<leader>rcc` concludes 
 review, and `<leader>rcs` inserts a suggestion in its comment composer. Set
 `mapleader` before loading the plugin. Existing user mappings take precedence.
 
-In the home buffer, `cc` chooses Comment, Approve or Request changes and opens
-the conclusion composer. `:wq` saves and submits; `:x`/`ZZ` submit only after a
-write during that opening. `:q` stays local, even after a save; `:q!` discards
-unsaved text while preserving previous saves. `:Review leave` preserves the
-WIP and returns new comments to standalone defaults. `:Review publish` sends
-standalone changes and progress independently.
+In the home buffer, `cc` or `:Review conclude` chooses Comment, Approve or
+Request changes and opens the conclusion composer. Choose Draft to remove an
+unsent conclusion and keep publication pending. Saving queues one
+`publish_review` event; saving again replaces its unsent value. `:wq`, `:x` and
+`ZZ` save locally and return. Closing any composer never writes to GitHub.
 
-Publishing and conclusion submission wait for writes, then fetch and apply
-fresh PR state before completing. A preceding background refresh finishes first;
-the post-publication fetch starts after the writes. Refresh failure is reported
-separately and keeps confirmed publication results intact.
+Only `:Review publish` sends saved operations. Inline comments share one review
+per publication. Without a queued conclusion the review stays pending/draft;
+with one, publication concludes after its comments and other ordered changes.
+To move legacy unpublished standalone inline comments into that review, select
+them and run `:Review move` (current comment, Ex range or visual selection).
+Sent comments cannot move. Include unpublished parents and replies together.
+
+Publication waits for writes, then fetches fresh PR state. Refresh failure is
+reported separately and keeps confirmed publication results intact.
 
 Todo includes fetched remote comments without **your** thumbs-up, including
 individual replies and nonblank review summaries. `s` marks the selected fetched
 comment Done; `u` reopens it. On a file, the same keys mark viewed/unviewed.
 Marking keeps cursor and scroll position; `:Review next` and `:Review previous`
-navigate Todo separately. Local drafts are excluded until published and fetched.
+navigate Todo separately. Local drafts and fetched pending review comments are excluded until submitted
+and fetched. Pending comments remain visible with a `[draft]` label.
 Your own fetched comments enter the same checklist.
+
+Current-comparison Base/Head winbars show `[viewed]` or `[unviewed]` beside the
+file path. Both panes update after `s`/`u` from staged local progress without
+publishing, preserving their revision/path labels. Historical winbars retain
+their existing labels.
 
 Overview file rows show `M +12 -3  path`: modified, added (`A`) or deleted (`D`),
 with added/removed line counts. Renames, copies and type changes use `M`.
 Status and counts use theme colors. Stats describe the pinned comparison;
 unavailable cached counts show `?`.
 
-In Review buffers, `]f`/`[f` navigate files, including viewed files, and `]r`/`[r`
-navigate comments, including Done comments. These motions never mark progress.
-`]F`/`[F` try marking the active file viewed, then open the next/previous unviewed
-file. `]R`/`[R` try marking the active comment Done, then open the next/previous
-Todo with its code. All four work throughout Review buffers. Opening or focusing
-a diff selects its file; opening or focusing a discussion selects its comment.
-Moving between code and discussion keeps the other selection. Mark only while
-the target is visible in the current tab; either diff side counts for a file.
-Without a visible active conversation, `]R` opens the first unfinished comment
-at the current diff line or picker location directly; `[R` opens the last.
-Replies count individually, including replies to Done roots. Later presses
-mark and advance in global Todo order, across threads on the same line.
-If the location has no Todo, ordinary Todo navigation supplies the next item.
-Hidden or closed means navigation only, even if another inactive target is
-visible. Already viewed/Done, local drafts and pending deletions advance without
-marking; mark failures are reported and still advance. Both skip finished items
-and stop at the ends. Unsaved composers block navigation. `s` continues marking
-without moving; lowercase `[c`/`]c` retain native diff navigation.
+In Review buffers, `]f`/`[f` navigate unviewed files and `]r`/`[r` navigate Todo
+comments. They skip viewed/Done objects, including locally staged progress that
+has not been published, and never change progress themselves.
+Navigation uses the backend's stable order and the object under the current
+buffer's cursor. Each step starts strictly after/before that object, wraps, and
+never returns the current object. Counts such as `4]f` take four eligible steps,
+loading only the final destination. With no current object, start at the first/last
+eligible object; with no destination, stay put. Home rows supply current objects;
+previously opened files, discussions and other visible panes supply no context.
+`:Review next`/`:Review previous` use the same filtered search for Todo;
+`comment` also skips Done, and `file` skips viewed files.
 
-Newer navigation wins over pending loads or automatic jumps. Pending marks still
-save. Opening another file closes its predecessor's managed discussion; same-file
-and PR-wide discussions remain, as do additional windows opened manually.
+Use `]f`, inspect, `s`, then `]f` to review files; use `]r`, inspect, `s`, then
+`]r` for comments. `s` stages viewed/Done without navigation, keeping cursor and
+scroll position. Each reply is separate, including replies to Done roots. From
+code without a current comment, `]r` opens the first eligible comment at the
+current line if available; `[r` opens the last. Otherwise use the first/last
+global Todo. Unsaved composers block navigation. Each search uses the object
+then under the cursor, with no remembered continuation. `[c`/`]c` retain native
+diff navigation.
+
+Newer navigation wins over pending loads. Opening another file closes its
+predecessor's managed discussion; same-file and PR-wide discussions remain, as
+do additional windows opened manually.
 Internal pane changes preserve the jumplist; ordinary user motions still record
 jumps normally.
 
@@ -201,8 +229,8 @@ Save intent metadata through the ordinary action list using
 `{"action":"pr_details","revision":0,"title":"Title","body":"Body"}`.
 Its revision is the PR object's revision, alongside the request's workspace
 generation. Metadata and its history commit together; stale or already-remote
-PR edits fail without replacing newer text. `publish`/`submit` resolve local
-PR intent before publishing their selected comment/progress plans.
+PR edits fail without replacing newer text. `publish` resolves local PR intent before sending the ordered saved queue.
+`submit` is rejected; queue a `publish_review` action instead.
 These CLI operations return local state with publication receipts. The Neovim
 plugin explicitly chains a subsequent fetch and reconciliation.
 
@@ -324,9 +352,12 @@ pr workspace <<JSON
 JSON
 ```
 
-`publish` sends eligible standalone changes and progress. `submit` publishes the
-saved WIP review and conclusion. Both use the same recorded-attempt workflow as
-Neovim.
+`publish` is the sole provider-write operation. It sends the ordered saved queue;
+an optional `{"action":"publish_review","conclusion":{"outcome":"comment","body":"Summary"}}`
+action concludes the review. Setting `conclusion` to `null` cancels the unsent
+conclusion. Without that action, comments publish as a draft
+review. `{"action":"move","comments":["local-id"]}` moves selected unsent
+legacy inline comments into the review. `submit` is rejected.
 
 | Command | Output |
 | --- | --- |
@@ -415,42 +446,35 @@ The resulting `CommitState` contains only net operations. A create followed by a
 delete produces no server write; toggles back to their baseline cancel too.
 The original events remain inspectable.
 
-After each successful server operation, its processed payload, returned IDs and
-response metadata are saved in one SQLite transaction before the next operation.
-Returned IDs are also installed in the separate provider mapping table. New
-comments retain their logical IDs, so later edits, replies, reactions and deletes
-can target the published resources.
+After every successful provider write, its operation, returned identities and
+response are saved before advancing. Successfully sent content is immutable,
+including pending review comments. Corrections are new comments or replies.
+Unsent create/edit/delete changes coalesce; deleting an unsent comment cancels
+its creation. Provider mappings preserve local identities across refreshes.
 
-A failure stops publication. Read the returned workspace or run
-`pr plan <batch-id>` to inspect remaining changes, then repeat `publish` or
-`submit` with the latest generation. Recorded effects are accounted for, so a
-successful creation is not repeated. Save new actions to a batch and publish
-again. A later delete removes an already published draft even though
-its original create/delete pair would have cancelled before publication. A
-successful conclusion is not repeated unless the intended conclusion changes.
+Publication preserves queue order and stops at the first error, blocked anchor
+or uncertain result. Retry retains the publication ID and confirmed receipts,
+then sends only its remaining operations. New unrelated work waits for another
+publication. Completed publications remain immutable.
 
-GitHub publishing validates known constraints for the whole plan before writing.
-Before publishing a nonempty plan, it also checks that the authenticated GitHub
-account matches the fetched reviewer. Empty plans make no GitHub requests.
-It supports PR-wide and diff comments, native diff replies, edits/deletes,
-viewed/unviewed files, thumbs-up progress and review conclusions. GitHub requires
-nonempty bodies for comment-only and request-changes conclusions; the core keeps
-optional text for all outcomes.
-Draft diff anchors retain their base/head pair, but GitHub accepts a reviewed
-head, path and location rather than an arbitrary comparison base. The adapter
-does not substitute a different anchor; GitHub validates whether the location
-exists in its diff. Permissions are also enforced by GitHub.
+Adjacent compatible inline roots use GitHub's native bulk create-review API.
+A terminal conclusion can join that write. Existing pending reviews, replies
+and progress may require separate writes; arbitrary GraphQL aliases do not
+provide atomicity or stop-on-error guarantees. One publication uses at most one
+provider review. A later publication may extend or conclude its saved pending
+review without recreating confirmed comments.
 
-Publication processes hold an OS lock on `.review/publish.lock` while preparing,
-publishing and recording results; the OS releases it when the process exits.
-Local saves remain available during publication, subject to the frozen
-attempt's scope.
+Publishing verifies the reviewer/account and known constraints before writing.
+Only unsent comments can be edited, deleted, moved or relocated. GitHub validates
+exact saved head/path/range anchors; the adapter never substitutes a location.
+Nonblank text is required for Comment and Request changes conclusions; Approve
+may omit it. A provider-side pending review belonging to another tool is never
+silently adopted or deleted.
 
-Remote writes and SQLite commits cannot form a single transaction. If a remote
-write succeeds but its local result cannot be saved, the CLI reports that
-explicitly. The API records attempts before writing, reconciles uncertain results
-before retry, and keeps inconclusive operations blocked while unrelated changes
-can publish.
+Publication holds `.review/publish.lock`; local saves remain available outside
+the frozen scope. Remote writes and SQLite cannot form one transaction. Lost
+responses remain explicitly uncertain: retry reconciles known identities and
+blocks blind duplicate creation or later writes when the result is unknown.
 
 ## Model
 
@@ -499,8 +523,8 @@ The GitHub adapter uses `gh` for API access and authentication. Dismissal is a
 standard core operation; no backend capability framework has been added.
 
 The CLI selects an existing batch ID or creates a new batch. Batches have no
-completed status: users can append to an old batch and submit it again. Submission
-does not exhaust the ID or make the log immutable.
+completed status: users can append new local intent to the same batch. Each
+completed publication remains immutable; later publication gets a new ID.
 
 ## Storage
 

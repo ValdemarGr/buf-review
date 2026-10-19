@@ -15,8 +15,8 @@ vim.cmd('runtime plugin/buf_review.lua')
 local messages = {}
 vim.notify = function(message) messages[#messages + 1] = tostring(message) end
 local revision = { base = string.rep('a', 40), head = string.rep('b', 40) }
-local function read_comment(id, author, line)
-  return { comment = { origin = 'read', comment = { id = id, body = 'Feedback ' .. id, author = { id = author, name = author }, target = { kind = 'diff', target = { revision = revision, path = 'src/file.rs', range = { start = { side = 'head', line = line }, ['end'] = { side = 'head', line = line } } } } } }, fetched = true, done = false, pending_delete = false, conflict = false, summary = false }
+local function read_comment(id, author, line, draft)
+  return { comment = { origin = draft and 'draft' or 'read', comment = { id = id, body = 'Feedback ' .. id, author = { id = author, name = author }, target = { kind = 'diff', target = { revision = revision, path = 'src/file.rs', range = { start = { side = 'head', line = line }, ['end'] = { side = 'head', line = line } } } } } }, fetched = not draft, draft = draft or false, destination = draft and 'review' or nil, done = false, pending_delete = false, conflict = false, summary = false }
 end
 local initial = {
   id = 'workspace-1', generation = 0,
@@ -65,6 +65,17 @@ end
 local function home_row(pattern)
   for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do if text:find(pattern, 1, true) then api.nvim_win_set_cursor(0, { line, 0 }); return line end end
   error('Missing row: ' .. pattern)
+end
+local function local_discussion(body, line)
+  for row, value in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
+    if value:match('%s%ssrc/file%.rs$') then api.nvim_win_set_cursor(0, { row, 0 }); break end
+  end
+  require('buf_review').enter()
+  wait(function() return kind() == 'diff' end)
+  api.nvim_win_set_cursor(0, { line, 0 })
+  require('buf_review').enter()
+  home_row(body); require('buf_review').enter()
+  assert(kind() == 'thread', 'local discussion did not open')
 end
 
 local function object_text()
@@ -250,11 +261,17 @@ require('buf_review').progress(true)
 wait(function() return #state().done == 1 end)
 stationary_view(before_progress, 'home preview s')
 assert(requests('reaction')[#requests('reaction')].comment == 'first', 'preview progress targeted another comment')
-local continuation_refresh = refresh_completions()
+local progress_refresh = refresh_completions()
 command('refresh')
-wait(function() return refresh_completions() > continuation_refresh end)
+wait(function() return refresh_completions() > progress_refresh end)
+local current_position, before_next = vim.fn.winsaveview(), #messages
 command('next')
-wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'second' end, 'background refresh lost marked-item Todo continuation')
+assert(kind() == 'home' and #messages > before_next and messages[#messages]:find('No other todo items', 1, true),
+  'next used remembered progress instead of the current cursor item')
+stationary_view(current_position, 'no other Todo after refresh')
+home_row('Feedback first')
+command('next')
+wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'second' end, 'next did not advance after highlighted Done item')
 command('')
 wait(function() return kind() == 'home' end)
 
@@ -345,6 +362,8 @@ home_row('Feedback first')
 require('buf_review').enter()
 wait(function() return kind() == 'thread' end)
 discussion_body_preserved()
+assert(#vim.tbl_filter(function(line) return line == '-----------------------------' end, api.nvim_buf_get_lines(0, 0, -1, false)) == 1,
+  'root/reply discussion has a trailing divider instead of one inter-comment separator')
 local divider = home_row('---')
 assert(api.nvim_get_current_line() == '-----------------------------', 'discussion divider changed Markdown separator')
 local before_divider_save = #requests('save')
@@ -365,6 +384,7 @@ input('dd')
 wait(function() return #requests('delete') == before_divider_delete + 1 end)
 for _, row in ipairs(state().comments) do assert(row.comment.comment.id ~= removed_reply, 'thread body dd did not cancel local draft') end
 assert(not table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Review reply', 1, true), 'cancelled local reply remained in discussion')
+assert(not vim.tbl_contains(api.nvim_buf_get_lines(0, 0, -1, false), '-----------------------------'), 'single-comment discussion retained a divider')
 
 command('')
 wait(function() return kind() == 'home' end)
@@ -384,7 +404,7 @@ wait(function() return kind() ~= 'composer' end)
 command('')
 wait(function() return kind() == 'home' end)
 
--- Review completion requires explicit write-and-close; q stays local after w.
+-- Conclusion writes queue a local publication intent; only publish sends it.
 vim.ui.select = function(_, _, callback) callback('comment') end
 command('conclude')
 wait(function() return kind() == 'composer' end)
@@ -410,13 +430,16 @@ edit('Summary ready')
 input(':w<CR>')
 vim.fn.writefile({ '' }, fixture .. '/fail_submit')
 input(':wq<CR>')
-wait(function() return #requests('submit') == 1 and not require('buf_review.editor').get().submitting end)
-assert(kind() == 'composer' and not vim.bo.modified, 'failed submission lost composer')
+wait(function() return kind() ~= 'composer' end)
+assert(#requests('submit') == 0 and #requests('publish') == 0 and state().wip.conclusion.body == 'Summary ready', 'conclusion close published instead of queuing')
+command('publish')
+wait(function() return #requests('publish') == 1 end)
+assert(state().wip and state().wip.conclusion.body == 'Summary ready', 'failed publication lost queued conclusion')
 vim.fn.delete(fixture .. '/fail_submit')
-input(':wq<CR>')
-wait(function() return #requests('submit') == 2 and not state().wip and kind() ~= 'composer' end)
+command('publish')
+wait(function() return #requests('publish') == 2 and not state().wip end)
 
--- Fix-feedback workflow: per-item progress, continuation, ordinary source untouched.
+-- Fix-feedback workflow: per-item progress, cursor-based navigation, ordinary source untouched.
 command('')
 wait(function() return kind() == 'home' end)
 home_row('Feedback first')
@@ -424,9 +447,10 @@ before_progress = vim.fn.winsaveview()
 require('buf_review').progress(true)
 wait(function() return #state().done == 1 end)
 stationary_view(before_progress, 'fix-feedback s')
+home_row('Feedback first')
 command('next')
 wait(function() return kind() == 'thread' end)
-assert(vim.b.buf_review.object == 'second', 'Todo continuation skipped next item')
+assert(vim.b.buf_review.object == 'second', 'Todo navigation skipped item after current')
 command('')
 wait(function() return kind() == 'home' end)
 local second_preview = home_row('Feedback second')
@@ -435,19 +459,17 @@ ReviewTest.wait(30)
 local before_boundary = vim.fn.winsaveview()
 local before_boundary_notice = #messages
 command('next')
-assert(kind() == 'home' and #messages > before_boundary_notice and messages[#messages]:find('End of todo list', 1, true), 'manual cursor motion kept previous marked-item continuation')
-stationary_view(before_boundary, 'Todo boundary after manual motion')
+assert(kind() == 'home' and #messages > before_boundary_notice and messages[#messages]:find('No other todo items', 1, true), 'next used previous marked item instead of current cursor')
+stationary_view(before_boundary, 'no other Todo after manual motion')
 require('buf_review').enter()
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'second' end)
 
+local immutable_saves = #requests('save')
 command('edit')
-assert(kind() == 'composer')
-edit('Own comment edited')
-input(':wq<CR>')
-wait(function() return kind() ~= 'composer' end)
+assert(kind() == 'thread' and #requests('save') == immutable_saves and messages[#messages]:find('immutable', 1, true), 'own fetched comment became editable')
 command('publish')
-wait(function() return #requests('publish') == 1 end)
-assert(#requests('submit') == 2)
+wait(function() return #requests('publish') == 3 end)
+assert(#requests('submit') == 0)
 
 -- Suggestions capture immutable selected source and remain Markdown text.
 command('')
@@ -493,7 +515,7 @@ api.nvim_win_set_cursor(0, { 1, 0 })
 require('buf_review').enter()
 assert(kind() == 'threads', 'multiple threads did not open chooser')
 local chooser = api.nvim_buf_get_lines(0, 0, -1, false)
-assert(#chooser == 8 and chooser[1] == '' and chooser[2]:find('src/file.rs', 1, true) and chooser[2]:find('@alice', 1, true) and chooser[3]:match('^    '), 'thread chooser lost safe margin or styled object rows')
+assert(#chooser == 6 and chooser[1] == '' and chooser[2]:find('src/file.rs', 1, true) and chooser[2]:find('@alice', 1, true) and chooser[3]:match('^    '), 'thread chooser lost safe margin or styled object rows')
 assert(api.nvim_win_get_cursor(0)[1] == 2, 'chooser did not start on first actionable row')
 assert(vim.fn.maparg('X', 'n') == '' and vim.fn.maparg('X', 'x') == '', 'chooser replaced native visual X')
 local before_chooser_delete = #requests('delete')
@@ -528,14 +550,9 @@ require('buf_review').enter()
 assert(kind() == 'threads', 'line-two thread chooser missing')
 for _, line in ipairs({ 2, 3 }) do
   api.nvim_win_set_cursor(0, { line, 0 })
+  local before_immutable_delete = #requests('delete')
   input('dd')
-  wait(function() return state().comments[2].pending_delete end)
-  assert(requests('delete')[#requests('delete')].comment == 'second', 'chooser dd targeted wrong comment')
-  assert(object_text():find('pending deletion', 1, true), 'chooser did not render staged deletion status')
-  api.nvim_win_set_cursor(0, { line, 0 })
-  input('u')
-  wait(function() return not state().comments[2].pending_delete end)
-  assert(not object_text():find('pending deletion', 1, true), 'chooser retained restored deletion status')
+  assert(#requests('delete') == before_immutable_delete and not state().comments[2].pending_delete and messages[#messages]:find('immutable', 1, true), 'chooser deleted fetched comment')
   local restored, reversed = #requests('restore'), #requests('reaction')
   input('u')
   wait(function() return #requests('reaction') == reversed + 1 end)
@@ -666,14 +683,13 @@ for _, resolution in ipairs({ 'local', 'remote', 'edit' }) do
   assert(conflict_text:find('## Local', 1, true) and conflict_text:find('## Remote', 1, true) and conflict_text:find('## Previously observed', 1, true))
   command('resolve ' .. resolution)
   if resolution == 'edit' then
-    assert(kind() == 'composer')
-    edit('Merged body')
-    input(':wq<CR>')
+    assert(kind() == 'conflict' and messages[#messages]:find('immutable', 1, true), 'legacy fetched conflict became editable')
+    command('resolve remote')
   end
   wait(function() return #state().conflicts == 0 end)
 end
 
--- Empty Approve summary is valid; typed :wq explicitly writes and submits.
+-- Empty Approve summary is valid and remains queued until explicit publication.
 command('')
 wait(function() return kind() == 'home' end)
 vim.ui.select = function(_, _, callback) callback('approve') end
@@ -682,7 +698,10 @@ wait(function() return kind() == 'composer' end)
 edit('')
 local before_summary_submit = #requests('submit')
 input(':wq<CR>')
-wait(function() return kind() ~= 'composer' and #requests('submit') == before_summary_submit + 1 and not state().wip end)
+wait(function() return kind() ~= 'composer' and state().wip and state().wip.conclusion.outcome == 'approve' end)
+assert(#requests('submit') == before_summary_submit, 'Approve close submitted immediately')
+command('publish')
+wait(function() return not state().wip end)
 
 -- Real editor shutdown and last-window :q never complete saved conclusions.
 for _, operation in ipairs({ 'qa', 'wqa', 'last' }) do
@@ -807,13 +826,19 @@ assert(#requests('save') == before_race_save + 2 and #requests('get') == before_
 vim.fn.delete(fixture .. '/race_save')
 input(':q!<CR>')
 
--- An affected remote body change must continue refusing the retained local edit.
+-- A saved local body change must continue refusing the retained composer edit.
+external = state()
+external.generation = external.generation + 1
+external.comments[2] = read_comment('stale-local', 'me', 2, true)
+external.comments[2].comment.comment.body = 'Saved local body'
+external.todo = vim.tbl_filter(function(id) return id ~= 'second' end, external.todo)
+external.done = vim.tbl_filter(function(id) return id ~= 'second' end, external.done)
+write('state.json', external)
 command('')
-wait(function() return kind() == 'home' end)
-home_row('Merged body')
+wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Saved local body', 1, true) end)
+home_row('Saved local body')
 require('buf_review').enter()
-wait(function() return kind() == 'thread' end)
-command('edit')
+assert(kind() == 'composer', 'unsent local comment did not open editor')
 edit('Unsaved edit must not overwrite external changes')
 external = state()
 external.comments[2].comment.comment.body = 'External changed body'
@@ -848,7 +873,7 @@ assert(api.nvim_buf_is_valid(shared) and #api.nvim_tabpage_list_wins(0) == windo
 api.nvim_set_current_win(vim.fn.win_findbuf(shared)[1])
 input(':q<CR>')
 
--- A submitted conclusion can remain visible in another split without resending.
+-- A queued conclusion can remain visible in another split without publishing.
 vim.ui.select = function(_, _, callback) callback('approve') end
 command('conclude')
 wait(function() return kind() == 'composer' end)
@@ -859,11 +884,11 @@ vim.cmd('split')
 windows = #api.nvim_tabpage_list_wins(0)
 local before_shared_submit = #requests('submit')
 input(':wq<CR>')
-wait(function() return #requests('submit') == before_shared_submit + 1 and not state().wip end)
+wait(function() return state().wip and state().wip.conclusion.body == 'Shared conclusion' end)
 assert(api.nvim_buf_is_valid(shared) and #api.nvim_tabpage_list_wins(0) == windows - 1 and #vim.fn.win_findbuf(shared) == 1)
 api.nvim_set_current_win(vim.fn.win_findbuf(shared)[1])
 input(':q<CR>')
-assert(#requests('submit') == before_shared_submit + 1)
+assert(#requests('submit') == before_shared_submit)
 
 -- A confirmed published root can retain draft origin until its first refetch.
 local receipt_baseline = state()
@@ -899,31 +924,28 @@ local function open_receipt()
   home_row('Published root before first refetch')
 end
 open_receipt()
-command('reply standalone')
-assert(kind() == 'composer', 'published receipt root incorrectly forced an unpublished destination')
-edit('Standalone reply before parent refetch')
+command('reply')
+assert(kind() == 'composer', 'published receipt root rejected a new reply')
+edit('Review reply before parent refetch')
 input(':wq<CR>')
 local receipt_reply = requests('save')[#requests('save')]
-assert(receipt_reply.destination == 'standalone' and receipt_reply.target.target == 'receipt-root')
+assert(receipt_reply.destination == 'review' and receipt_reply.target.target == 'receipt-root')
 open_receipt()
 command('reply review')
 assert(kind() == 'composer', 'published receipt root rejected explicit Review reply')
 input(':q!<CR>')
 for _, id in ipairs(state().todo) do assert(id ~= 'receipt-root', 'publication receipt entered checklist before refetch') end
 
--- Receipt edits stay standalone during WIP; actual pending edits still appear.
+-- Confirmed receipt comments remain immutable during an active review.
 open_receipt()
 command('start')
 wait(function() return state().wip and state().wip.active end)
+local before_receipt_saves = #requests('save')
 command('edit')
-assert(kind() == 'composer' and require('buf_review.editor').get().destination == 'standalone', 'published receipt edit joined active WIP')
-edit('Published receipt with saved pending edit')
-input(':wq<CR>')
-assert(requests('save')[#requests('save')].destination == 'standalone')
+assert(kind() == 'thread' and messages[#messages]:find('immutable', 1, true) and #requests('save') == before_receipt_saves,
+  'published receipt became editable before refetch')
 command('')
 wait(function() return kind() == 'home' end)
-home_row('Published receipt with saved pending edit')
-assert(object_text():find('edit staged', 1, true), 'receipt pending edit disappeared from Unpublished changes')
 home_row('Unviewed files')
 api.nvim_win_set_cursor(0, { api.nvim_win_get_cursor(0)[1] + 1, 0 })
 require('buf_review').enter()
@@ -946,76 +968,56 @@ assert(retained_marker, 'published receipt disappeared from diff annotations')
 command('')
 wait(function() return kind() == 'home' end)
 
--- Cursor motions can select another item without Enter before delete/restore.
+-- Cursor motions select the local draft to cancel, never a remembered comment.
 home_row('Feedback first')
 require('buf_review').enter()
 wait(function() return kind() == 'thread' end)
 command('')
 wait(function() return kind() == 'home' end)
 home_row('External changed body')
+local before_cursor_delete = #requests('delete')
 input('dd')
-wait(function() return state().comments[2].pending_delete end)
-assert(object_text():find('External changed body', 1, true), 'delete restored a previously opened comment selection')
-home_row('External changed body')
-api.nvim_win_set_cursor(0, { api.nvim_win_get_cursor(0)[1], 0 })
-input('u')
-wait(function() return not state().comments[2].pending_delete end)
-assert(requests('restore')[#requests('restore')].comment == 'second' and object_text():find('External changed body', 1, true), 'immediate restore targeted another comment')
-local restored_home, reversed_home = #requests('restore'), #requests('reaction')
-input('u')
-wait(function() return #requests('reaction') == reversed_home + 1 end)
-assert(#requests('restore') == restored_home and requests('reaction')[reversed_home + 1].present == false, 'nonpending home u did not reverse progress')
+wait(function()
+  for _, row in ipairs(state().comments) do if row.comment.comment.id == 'stale-local' then return false end end
+  return true
+end)
+assert(#requests('delete') == before_cursor_delete + 1 and requests('delete')[#requests('delete')].comment == 'stale-local',
+  'cursor cancellation targeted previously opened comment')
 assert(vim.fn.maparg('X', 'n') == '' and vim.fn.maparg('X', 'x') == '', 'home replaced native visual X')
-home_row('External changed body')
-api.nvim_win_set_cursor(0, { api.nvim_win_get_cursor(0)[1] - 1, 0 })
-input('dd')
-wait(function() return state().comments[2].pending_delete end)
-home_row('External changed body')
-api.nvim_win_set_cursor(0, { api.nvim_win_get_cursor(0)[1] - 1, 0 })
-input('u')
-wait(function() return not state().comments[2].pending_delete end)
 local before_unbound_delete, before_unbound_notice = #requests('delete'), #messages
 local before_unbound_restore = #requests('restore')
 for _, line in ipairs({ 1, home_row('Todo (') - 1, home_row('Unviewed files') + 1 }) do
   api.nvim_win_set_cursor(0, { line, 0 })
   input('dd')
 end
-assert(#requests('delete') == before_unbound_delete and #requests('restore') == before_unbound_restore and #messages == before_unbound_notice, 'home header/gap/file deletion or restore targeted selected comment')
+assert(#requests('delete') == before_unbound_delete and #requests('restore') == before_unbound_restore and #messages == before_unbound_notice,
+  'home header/gap/file deletion targeted remembered comment')
 home_row('Feedback first')
 input('dd')
 assert(#requests('delete') == before_unbound_delete and messages[#messages]:find('verified ownership', 1, true), 'home dd bypassed ownership')
-home_row('External changed body')
 require('buf_review').enter()
 wait(function() return kind() == 'thread' end)
-home_row('External changed body')
+home_row('Feedback first')
 assert(vim.fn.maparg('X', 'n') == '' and vim.fn.maparg('X', 'x') == '', 'discussion replaced native visual X')
 local body_line = api.nvim_win_get_cursor(0)[1]
 api.nvim_win_set_cursor(0, { body_line - 1, 0 })
 before_unbound_notice = #messages
 input('dd')
-assert(#requests('delete') == before_unbound_delete and #messages == before_unbound_notice, 'discussion blank dd deleted root')
+assert(#requests('delete') == before_unbound_delete and #messages == before_unbound_notice, 'discussion blank dd targeted root')
 api.nvim_win_set_cursor(0, { body_line, 0 })
 input('dd')
-wait(function() return state().comments[2].pending_delete end)
-local before_gap_restore = #requests('restore')
-body_line = home_row('External changed body')
+assert(#requests('delete') == before_unbound_delete and not state().comments[1].pending_delete, 'fetched discussion deletion changed saved state')
+local before_gap_restore, before_gap_reaction = #requests('restore'), #requests('reaction')
 for _, line in ipairs({ 1, body_line - 1 }) do
   api.nvim_win_set_cursor(0, { line, 0 })
   input('u')
 end
-assert(#requests('restore') == before_gap_restore and state().comments[2].pending_delete, 'thread margin/gap u restored root fallback')
+assert(#requests('restore') == before_gap_restore and #requests('reaction') == before_gap_reaction, 'thread margin/gap u targeted root fallback')
 api.nvim_win_set_cursor(0, { body_line, 0 })
 input('u')
-wait(function() return not state().comments[2].pending_delete end)
-api.nvim_win_set_cursor(0, { home_row('External changed body') - 2, 0 })
-input('dd')
-wait(function() return state().comments[2].pending_delete end)
-input('u')
-wait(function() return not state().comments[2].pending_delete end)
-local before_nonpending_restore, before_nonpending_reaction = #requests('restore'), #requests('reaction')
-input('u')
-wait(function() return #requests('reaction') == before_nonpending_reaction + 1 end)
-assert(#requests('restore') == before_nonpending_restore and requests('reaction')[before_nonpending_reaction + 1].present == false, 'nonpending thread u did not reverse progress')
+wait(function() return #requests('reaction') == before_gap_reaction + 1 end)
+assert(requests('reaction')[before_gap_reaction + 1].comment == 'first' and requests('reaction')[before_gap_reaction + 1].present == false,
+  'nonpending thread u did not reverse current comment progress')
 
 -- Closing returns to the originating code pane; empty sides cannot anchor lines.
 command('')
@@ -1159,30 +1161,17 @@ wait(function() return kind() == 'home' end)
 home_row('Feedback blank-owned')
 require('buf_review').enter()
 wait(function() return kind() == 'thread' end)
+local immutable_before = vim.deepcopy(state().comments[1])
+local immutable_save_count, immutable_delete_count = #requests('save'), #requests('delete')
 command('edit')
-input('cc <Tab> <Esc>')
-vim.cmd('write')
-assert(kind() == 'composer' and not vim.bo.modified, 'staged fetched deletion did not save locally')
-assert(state().comments[1].pending_delete and state().comments[1].comment.comment.body == 'Feedback blank-owned', 'fetched blank write changed body instead of staging deletion')
-local before_repeat_delete = #requests('save')
-vim.cmd('write')
-assert(#requests('save') == before_repeat_delete and #state().pending == 1, 'repeat fetched blank write duplicated deletion')
-input('u')
-assert(api.nvim_get_current_line() == 'Feedback blank-owned', 'undo did not recover fetched body')
-vim.cmd('write')
-assert(not state().comments[1].pending_delete and #state().pending == 0 and state().comments[1].comment.comment.id == 'blank-owned', 'undo write failed to restore same fetched comment')
-edit('Typed fetched body after deletion')
-vim.cmd('write')
-assert(state().comments[1].comment.comment.body == 'Typed fetched body after deletion', 'fetched restoration lost typed body')
-edit(' \t ')
-input(':wq<CR>')
-wait(function() return kind() ~= 'composer' end)
-command('')
-wait(function() return kind() == 'home' end)
-local pending_heading = home_row('Unpublished changes')
-api.nvim_win_set_cursor(0, { pending_heading + 1, 0 })
-assert(object_text():find('pending deletion', 1, true) and object_text():find('Typed fetched body after deletion', 1, true), 'fetched deletion missing from pending home UI')
-assert(#requests('publish') == before_blank_publish and #requests('submit') == before_blank_submit, 'blank comment write published remote deletion')
+assert(kind() == 'thread' and messages[#messages]:find('immutable', 1, true), 'fetched comment opened an editable composer')
+input('<CR>')
+assert(kind() == 'thread' and vim.bo.readonly and not vim.bo.modifiable, 'fetched Enter opened an editor')
+command('delete')
+assert(messages[#messages]:find('immutable', 1, true), 'fetched deletion did not explain immutability')
+assert(#requests('save') == immutable_save_count and #requests('delete') == immutable_delete_count
+  and vim.deep_equal(state().comments[1], immutable_before), 'immutable comment changed through edit/delete')
+assert(#requests('publish') == before_blank_publish and #requests('submit') == before_blank_submit, 'local comment actions published remote changes')
 
 -- Delete restrictions must fail without discarding the typed whitespace.
 local restricted = state()
@@ -1224,10 +1213,10 @@ for _, case in ipairs({
 }) do
   local operated = state()
   operated.generation = operated.generation + 1
-  operated.comments = { read_comment('operator-a', 'me', 1), read_comment('operator-b', 'me', 2), read_comment('operator-c', 'me', 3) }
+  operated.comments = { read_comment('operator-a', 'me', 1, true), read_comment('operator-b', 'me', 2, true), read_comment('operator-c', 'me', 3, true) }
   operated.pending, operated.conflicts, operated.done = {}, {}, {}
-  if case.duplicate then operated.pending = { { id = 'duplicate-a', change = { kind = 'edit_comment', comment = 'operator-a', body = 'Feedback operator-a' } } } end
-  operated.todo, operated.wip = { 'operator-a', 'operator-b', 'operator-c' }, nil
+  if case.duplicate then operated.pending = { { id = 'duplicate-a', change = { kind = 'create_comment', comment = operated.comments[1].comment.comment } } } end
+  operated.todo, operated.wip = {}, nil
   write('state.json', operated)
   command('')
   wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Feedback operator-a', 1, true) end)
@@ -1246,13 +1235,9 @@ for _, case in ipairs({
     assert(sent[before + offset].comment == identity, case.keys .. ' targeted wrong object: ' .. vim.inspect(sent))
   end
   for _, row in ipairs(state().comments) do
-    assert(row.pending_delete == vim.tbl_contains(case.expected, row.comment.comment.id), case.keys .. ' changed unselected object')
+    assert(not vim.tbl_contains(case.expected, row.comment.comment.id), case.keys .. ' retained selected draft')
   end
-  if #case.expected > 0 then
-    home_row('Feedback operator-a')
-    input('dd')
-    assert(#requests('delete') == before + #case.expected, 'already staged deletion resent backend request')
-  end
+  assert(#state().comments == 3 - #case.expected, case.keys .. ' changed unselected object count')
 end
 
 -- Preflight the whole selection; explicitly selected children delete before parents.
@@ -1291,8 +1276,8 @@ end
 
 local failed_delete = state()
 failed_delete.generation = failed_delete.generation + 1
-failed_delete.comments = { read_comment('failure-a', 'me', 1), read_comment('failure-b', 'me', 2), read_comment('failure-c', 'me', 3) }
-failed_delete.todo, failed_delete.pending = { 'failure-a', 'failure-b', 'failure-c' }, {}
+failed_delete.comments = { read_comment('failure-a', 'me', 1, true), read_comment('failure-b', 'me', 2, true), read_comment('failure-c', 'me', 3, true) }
+failed_delete.todo, failed_delete.pending = {}, {}
 write('state.json', failed_delete)
 vim.fn.writefile({ 'failure-b' }, fixture .. '/fail_delete')
 command('')
@@ -1302,58 +1287,84 @@ local before_failed_delete = #requests('delete')
 input('V4jd')
 wait(function() return #requests('delete') >= before_failed_delete + 2 and messages[#messages]:find('Fixture deletion conflict', 1, true) end)
 assert(#requests('delete') == before_failed_delete + 2, 'range deletion continued after backend failure')
-assert(state().comments[1].pending_delete and not state().comments[2].pending_delete and not state().comments[3].pending_delete, 'failed range deletion changed later objects')
+assert(#state().comments == 2 and state().comments[1].comment.comment.id == 'failure-b' and state().comments[2].comment.comment.id == 'failure-c', 'failed range deletion changed later objects')
 vim.fn.delete(fixture .. '/fail_delete')
 
--- Cancelling local roots removes chooser rows and clears their open discussion.
+-- Cancelling the last local root closes its managed selector or discussion.
 local cancelled_roots = state()
-cancelled_roots.generation = cancelled_roots.generation + 1
 local local_root = vim.deepcopy(parent)
 local_root.comment.comment.id, local_root.comment.comment.body = 'local-root-a', 'Local root A'
 local_root.comment.comment.target = { kind = 'diff', target = { revision = revision, path = 'src/file.rs', range = { start = { side = 'head', line = 1 }, ['end'] = { side = 'head', line = 1 } } } }
 local other_root = vim.deepcopy(local_root)
 other_root.comment.comment.id, other_root.comment.comment.body = 'local-root-b', 'Local root B'
-cancelled_roots.comments, cancelled_roots.todo, cancelled_roots.pending = { local_root, other_root }, {}, {}
-cancelled_roots.files[1].viewed = false
 vim.fn.delete(fixture .. '/empty_head')
+for _, reader in ipairs({ 'selector', 'thread' }) do
+  cancelled_roots.generation = state().generation + 1
+  cancelled_roots.comments = reader == 'selector' and { local_root, other_root } or { other_root }
+  cancelled_roots.todo, cancelled_roots.done, cancelled_roots.pending = {}, {}, {}
+  cancelled_roots.files[1].viewed = false
+  write('state.json', cancelled_roots)
+  command('')
+  wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Local root B', 1, true) end)
+  api.nvim_win_set_cursor(0, { home_row('Unviewed files') + 1, 0 })
+  require('buf_review').enter()
+  wait(function() return kind() == 'diff' end)
+  local source_window, source_buffer = api.nvim_get_current_win(), api.nvim_get_current_buf()
+  api.nvim_win_set_cursor(0, { 1, 0 })
+  require('buf_review').enter()
+  assert(kind() == 'threads')
+  if reader == 'selector' then
+    local picker = api.nvim_buf_get_lines(0, 0, -1, false)
+    assert(#picker == 6 and not vim.tbl_contains(picker, '-----------------------------'), 'two-root selector has a trailing divider')
+    api.nvim_win_set_cursor(0, { 3, 0 }); input('dd')
+    wait(function() return #state().comments == 1 end)
+    local remaining_picker = api.nvim_buf_get_lines(0, 0, -1, false)
+    assert(kind() == 'threads' and #remaining_picker == 4 and remaining_picker[1] == ''
+      and remaining_picker[3]:find('Local root B', 1, true) and remaining_picker[4] == '',
+      'single-root selector retained deleted root or divider footer')
+  else
+    home_row('Local root B'); require('buf_review').enter()
+    assert(kind() == 'thread' and not vim.tbl_contains(api.nvim_buf_get_lines(0, 0, -1, false), '-----------------------------'),
+      'single-root discussion retained a divider')
+  end
+  local discussion_window = api.nvim_get_current_win()
+  home_row('Local root B'); input('dd')
+  wait(function() return #state().comments == 0 and kind() == 'diff' end)
+  assert(not api.nvim_win_is_valid(discussion_window) and api.nvim_get_current_win() == source_window
+    and api.nvim_get_current_buf() == source_buffer, 'empty ' .. reader .. ' did not close back to source code')
+end
+
+-- A fetched pending deletion remains in its reader so u can restore it.
+cancelled_roots.generation = state().generation + 1
+cancelled_roots.comments = { read_comment('pending-visible', 'me', 1) }
+cancelled_roots.comments[1].pending_delete = true
+cancelled_roots.todo, cancelled_roots.done, cancelled_roots.pending = { 'pending-visible' }, {}, {}
 write('state.json', cancelled_roots)
 command('')
-wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Local root A', 1, true) end)
-api.nvim_win_set_cursor(0, { home_row('Unviewed files') + 1, 0 })
-require('buf_review').enter()
-wait(function() return kind() == 'diff' end)
-api.nvim_win_set_cursor(0, { 1, 0 })
-require('buf_review').enter()
-assert(kind() == 'threads')
-api.nvim_win_set_cursor(0, { 3, 0 })
-input('dd')
-wait(function() return #state().comments == 1 end)
-local remaining_picker = api.nvim_buf_get_lines(0, 0, -1, false)
-assert(#remaining_picker == 6 and remaining_picker[1] == '' and remaining_picker[3]:find('Local root B', 1, true), 'cancelled local root remained in chooser')
-api.nvim_win_set_cursor(0, { 3, 0 })
-require('buf_review').enter()
-assert(kind() == 'thread', 'remaining chooser preview lost comment action')
-home_row('Local root B')
-input('dd')
-wait(function() return #state().comments == 0 end)
-assert(vim.bo.readonly and not vim.bo.modifiable and api.nvim_buf_line_count(0) == 1 and api.nvim_get_current_line() == '', 'cancelled local root left stale discussion text')
-local after_cancel_delete, after_cancel_notice = #requests('delete'), #messages
-input('dd')
-assert(#requests('delete') == after_cancel_delete and #messages == after_cancel_notice, 'empty discussion dd fell back to deleted root')
+wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Feedback pending-visible', 1, true) end)
+home_row('Feedback pending-visible'); require('buf_review').enter()
+wait(function() return kind() == 'thread' end)
+local pending_window, pending_buffer = api.nvim_get_current_win(), api.nvim_get_current_buf()
+assert(state().comments[1].pending_delete, 'legacy deletion fixture lost pending state')
+assert(kind() == 'thread' and api.nvim_win_is_valid(pending_window) and api.nvim_get_current_buf() == pending_buffer,
+  'fetched pending deletion closed its undoable discussion')
+home_row('Feedback pending-visible')
+assert(not vim.tbl_contains(api.nvim_buf_get_lines(0, 0, -1, false), '-----------------------------'), 'pending single-comment discussion retained a divider')
+input('u')
+wait(function() return not state().comments[1].pending_delete end)
+assert(kind() == 'thread' and api.nvim_get_current_buf() == pending_buffer, 'pending deletion restore replaced its discussion')
 
 -- Empty body newlines are objects only for linewise or explicit visual deletion.
 for _, case in ipairs({ { keys = 'D', deleted = false }, { keys = 'd$', deleted = false }, { keys = 'dd', deleted = true }, { keys = 'vd', deleted = true }, { keys = 'vx', deleted = true } }) do
   local empty_body = state()
   empty_body.generation = empty_body.generation + 1
-  empty_body.comments = { read_comment('empty-body', 'me', 1) }
+  empty_body.comments = { read_comment('empty-body', 'me', 1, true) }
   empty_body.comments[1].comment.comment.body = 'Body before empty line\n\nBody after empty line'
-  empty_body.todo, empty_body.pending, empty_body.done = { 'empty-body' }, {}, {}
+  empty_body.todo, empty_body.pending, empty_body.done = {}, {}, {}
   write('state.json', empty_body)
   command('')
   wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Body before empty line', 1, true) end)
-  home_row('Body before empty line')
-  require('buf_review').enter()
-  wait(function() return kind() == 'thread' end, 'empty-body discussion did not open')
+  local_discussion('Body before empty line', 1)
   assert(api.nvim_buf_get_lines(0, 0, 1, false)[1] == '', 'discussion lacks safe top margin')
   local before, notices = #requests('delete'), #messages
   for _, line in ipairs({ 1, 2 }) do
@@ -1369,24 +1380,26 @@ for _, case in ipairs({ { keys = 'D', deleted = false }, { keys = 'd$', deleted 
   assert(api.nvim_get_current_line() == '', 'empty body line missing')
   input(case.keys)
   if case.deleted then wait(function() return #requests('delete') == before + 1 end) end
-  assert(#requests('delete') == before + (case.deleted and 1 or 0) and state().comments[1].pending_delete == case.deleted, case.keys .. ' misclassified empty body newline')
+  assert(#requests('delete') == before + (case.deleted and 1 or 0) and #state().comments == (case.deleted and 0 or 1), case.keys .. ' misclassified empty body newline')
 end
 
 -- Cancelling a new normal operator must not replace the last completed visual redo.
 local visual_repeat = state()
 visual_repeat.generation = visual_repeat.generation + 1
-visual_repeat.comments = { read_comment('visual-root', 'me', 1), read_comment('visual-reply', 'me', 1) }
+visual_repeat.comments = { read_comment('visual-root', 'me', 1), read_comment('visual-first', 'me', 1, true), read_comment('visual-reply', 'me', 1, true) }
 visual_repeat.comments[1].comment.comment.body = 'Visual root source'
 visual_repeat.comments[2].comment.comment.target = { kind = 'reply', target = 'visual-root' }
-visual_repeat.comments[2].comment.comment.body = 'Visual reply before blank\n\nVisual reply after blank'
-visual_repeat.todo, visual_repeat.pending, visual_repeat.done = { 'visual-root', 'visual-reply' }, {}, {}
+visual_repeat.comments[2].comment.comment.body = 'First visual reply'
+visual_repeat.comments[3].comment.comment.target = { kind = 'reply', target = 'visual-root' }
+visual_repeat.comments[3].comment.comment.body = 'Visual reply before blank\n\nVisual reply after blank'
+visual_repeat.todo, visual_repeat.pending, visual_repeat.done = { 'visual-root' }, {}, {}
 write('state.json', visual_repeat)
 command('')
 wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Visual root source', 1, true) end)
 home_row('Visual root source')
 require('buf_review').enter()
 wait(function() return kind() == 'thread' end, 'visual-repeat discussion did not open')
-home_row('Visual root source')
+home_row('First visual reply')
 local before_visual_repeat = #requests('delete')
 input('vd')
 wait(function() return #requests('delete') == before_visual_repeat + 1 end)
@@ -1400,8 +1413,8 @@ assert(requests('delete')[before_visual_repeat + 2].comment == 'visual-reply', '
 -- Native operator redo follows the current object and never consumes text registers.
 local repeat_view = state()
 repeat_view.generation = repeat_view.generation + 1
-repeat_view.comments = { read_comment('repeat-a', 'me', 1), read_comment('repeat-b', 'me', 2) }
-repeat_view.todo, repeat_view.pending, repeat_view.done = { 'repeat-a', 'repeat-b' }, {}, {}
+repeat_view.comments = { read_comment('repeat-a', 'me', 1, true), read_comment('repeat-b', 'me', 2, true) }
+repeat_view.todo, repeat_view.pending, repeat_view.done = {}, {}, {}
 write('state.json', repeat_view)
 command('')
 wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Feedback repeat-a', 1, true) end)
@@ -1627,7 +1640,7 @@ end
 
 local first_failure = run('workflows', { BUF_REVIEW_FIRST_FAILURE = '1' })
 assert(first_failure.code == 0, first_failure.stderr)
-for _, name in ipairs({ 'sessions', 'append', 'performance', 'object_fetch', 'historical_panes', 'mark_move', 'diff_lifecycle', 'annotations', 'navigation', 'log', 'native_commands', 'composer_native', 'append_native', 'action_queue', 'overview_stats', 'diff_scroll', 'checkout_git', 'checkout_ui', 'local_pr', 'local_pr_cli', 'post_publish', 'mappings', 'jumplist', 'reader_reuse' }) do
+for _, name in ipairs({ 'sessions', 'append', 'performance', 'object_fetch', 'historical_panes', 'mark_move', 'diff_lifecycle', 'annotations', 'navigation', 'log', 'native_commands', 'composer_native', 'append_native', 'action_queue', 'overview_stats', 'diff_scroll', 'checkout_git', 'checkout_ui', 'local_pr', 'local_pr_cli', 'post_publish', 'mappings', 'jumplist', 'reader_reuse', 'review_queue' }) do
   local child = run(name)
   assert(child.code == 0, name .. ': ' .. child.stderr)
 end

@@ -118,7 +118,7 @@ before = #saves
 normal('ZQ')
 assert(api.nvim_get_current_buf() == origin and #saves == before, 'ZQ wrote discarded text')
 
--- Conclusion write/quit remains local; explicit write-and-close submits.
+-- Every conclusion close remains local, including explicit write-and-close.
 buf = composer('conclusion')
 api.nvim_buf_set_lines(buf, 0, -1, false, { 'Conclusion' })
 vim.cmd.write()
@@ -127,7 +127,7 @@ assert(submitting == 0 and api.nvim_get_current_buf() == origin, 'saved conclusi
 buf = composer('conclusion')
 api.nvim_buf_set_lines(buf, 0, -1, false, { 'Ready' })
 input(':wq<CR>')
-assert(submitting == 1 and api.nvim_get_current_buf() == origin, 'explicit conclusion completion failed')
+assert(submitting == 0 and api.nvim_get_current_buf() == origin and saves[#saves].text == 'Ready', 'conclusion write-and-close submitted or lost local save')
 assert(barriers == #saves + 1, 'save barrier was bypassed')
 assert(vim.deep_equal(api.nvim_buf_get_lines(origin, 0, -1, false), { 'first', 'second', 'third' }), 'composer commands mutated source')
 for _, closed in ipairs(opened) do

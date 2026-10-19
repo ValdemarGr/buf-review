@@ -74,6 +74,7 @@ fn fixture() -> (TempDir, String) {
             viewed: false,
         }],
         comments: vec![ReadComment {
+            draft: false,
             content: CommentContent {
                 id: CommentId("root".into()),
                 body: "Please fix this".into(),
@@ -298,10 +299,7 @@ fn branch_entry_routes_cached_batches_without_selecting_until_explicit_selection
             },
         )
         .unwrap();
-    let operations = workspace
-        .prepare(Destination::Standalone)
-        .unwrap()
-        .operations;
+    let operations = workspace.publication_plan().unwrap().operations;
     workspace = store
         .mutate_workspace(
             &first,
@@ -641,6 +639,7 @@ fn historical_base_diff_compares_recorded_source_to_latest_head_without_mutating
         range.end.side = DiffSide::Base;
     }
     read.comments.push(ReadComment {
+        draft: false,
         content: CommentContent {
             id: CommentId("reply".into()),
             body: "Same original code".into(),
@@ -739,6 +738,7 @@ fn historical_head_diff_follows_rename_to_fetched_head_and_preserves_original_an
         location.outdated = Some(true);
     }
     read.comments.push(ReadComment {
+        draft: false,
         content: CommentContent {
             id: CommentId("reply".into()),
             body: "Check the same code".into(),
@@ -1081,7 +1081,7 @@ fn real_cli_preserves_destinations_checklist_and_generation_across_processes() {
     );
     let standalone = api(
         root.path(),
-        json!({"op":"actions","workspace":id,"generation":left["workspace"]["generation"],"actions":[{"action":"save","body":"Standalone reply","target":{"kind":"reply","target":"root"}}]}),
+        json!({"op":"actions","workspace":id,"generation":left["workspace"]["generation"],"actions":[{"action":"save","body":"Review reply after leave","target":{"kind":"reply","target":"root"}}]}),
     );
     let comments = standalone["workspace"]["comments"].as_array().unwrap();
     assert_eq!(
@@ -1091,10 +1091,13 @@ fn real_cli_preserves_destinations_checklist_and_generation_across_processes() {
             .unwrap()["destination"],
         "review"
     );
-    assert!(
+    let second = standalone["comment"].as_str().unwrap();
+    assert_eq!(
         comments
             .iter()
-            .any(|row| row["destination"] == "standalone")
+            .find(|row| row["comment"]["comment"]["id"] == second)
+            .unwrap()["destination"],
+        "review"
     );
     let done = api(
         root.path(),
@@ -1289,11 +1292,7 @@ fn prepared_refresh_cannot_cross_pr_or_reviewer_identity_or_new_receipts() {
             },
         )
         .unwrap();
-    let operation = latest
-        .prepare(Destination::Standalone)
-        .unwrap()
-        .operations
-        .remove(0);
+    let operation = latest.publication_plan().unwrap().operations.remove(0);
     store
         .record_operation_result(
             &latest.batch.id,
@@ -1804,7 +1803,7 @@ fn headless_neovim_uses_real_cached_cli_without_network_or_source_mutation() {
             .any(|row| row.destination == Some(buf_review::workspace::Destination::Review))
     );
     assert!(workspace.wip.as_ref().is_some_and(|wip| {
-        wip.active
+        !wip.active
             && wip.conclusion.as_ref().is_some_and(|conclusion| {
                 conclusion.body.as_deref() == Some("Saved summary, cancelled submission")
             })
@@ -1822,14 +1821,14 @@ fn headless_neovim_uses_real_cached_cli_without_network_or_source_mutation() {
     assert!(
         view.comments
             .iter()
-            .any(|row| row.comment.content().id.0 == "own-root" && row.pending_delete),
-        "blank fetched comment must remain staged until publication"
+            .any(|row| row.comment.content().id.0 == "own-root" && !row.pending_delete),
+        "fetched comments remain immutable"
     );
     assert!(
         view.comments
             .iter()
             .any(|row| row.comment.content().id == receipt_comment
-                && row.pending_delete
+                && !row.pending_delete
                 && !row.fetched)
     );
     assert!(!view.todo.contains(&receipt_comment) && !view.done.contains(&receipt_comment));
@@ -1908,10 +1907,7 @@ fn publication_history_attributes_retried_operations_to_their_actual_attempt() {
             .mutate_workspace(&id, workspace.generation, action)
             .unwrap();
     }
-    let plan = workspace
-        .prepare(Destination::Standalone)
-        .unwrap()
-        .operations;
+    let plan = workspace.publication_plan().unwrap().operations;
     assert_eq!(plan.len(), 2);
     workspace = store
         .mutate_workspace(
@@ -1939,9 +1935,8 @@ fn publication_history_attributes_retried_operations_to_their_actual_attempt() {
         .mutate_workspace(
             &id,
             workspace.generation,
-            Action::BeginPublication {
-                destination: Destination::Standalone,
-                operations: plan.clone(),
+            Action::ResumePublication {
+                attempt_id: failed.clone(),
             },
         )
         .unwrap();
@@ -1975,18 +1970,14 @@ fn publication_history_attributes_retried_operations_to_their_actual_attempt() {
             },
         )
         .unwrap();
-    let remaining = workspace
-        .prepare(Destination::Standalone)
-        .unwrap()
-        .operations;
+    let remaining = workspace.publication_plan().unwrap().operations;
     assert_eq!(remaining.len(), 1);
     workspace = store
         .mutate_workspace(
             &id,
             workspace.generation,
-            Action::BeginPublication {
-                destination: Destination::Standalone,
-                operations: remaining.clone(),
+            Action::ResumePublication {
+                attempt_id: partial.clone(),
             },
         )
         .unwrap();
@@ -2023,16 +2014,14 @@ fn publication_history_attributes_retried_operations_to_their_actual_attempt() {
     assert_eq!(response["workspace"]["stats"]["unfinished"], false);
     assert!(!response["workspace"]["todo"].as_array().unwrap().is_empty());
     let publications = response["workspace"]["publications"].as_array().unwrap();
-    assert_eq!(publications.len(), 3);
-    let failed_row = publications.iter().find(|row| row["id"] == failed).unwrap();
-    assert_eq!(failed_row["status"], "failed");
-    assert_eq!(failed_row["published"]["total"], 0);
-    let partial_row = publications
+    assert_eq!(publications.len(), 1);
+    assert_eq!(failed, partial, "retries preserve publication identity");
+    let row = publications
         .iter()
         .find(|row| row["id"] == partial)
         .unwrap();
-    assert_eq!(partial_row["status"], "partial");
-    assert_eq!(partial_row["published"]["total"], 1);
+    assert_eq!(row["status"], "published");
+    assert_eq!(row["published"]["total"], 2);
     let details = api(
         root.path(),
         json!({"op":"history","workspace":id,"publication":partial}),
@@ -2044,12 +2033,12 @@ fn publication_history_attributes_retried_operations_to_their_actual_attempt() {
             .iter()
             .filter(|row| row["published"] == true)
             .count(),
-        1
+        2
     );
 }
 
 #[test]
-fn submitted_review_with_failed_progress_remains_submitted_and_unfinished() {
+fn failed_progress_keeps_terminal_conclusion_queued_and_unfinished() {
     let (root, id) = fixture();
     let mut store = Store::open(root.path()).unwrap();
     let mut workspace = store.workspace(&id).unwrap().unwrap();
@@ -2070,7 +2059,7 @@ fn submitted_review_with_failed_progress_remains_submitted_and_unfinished() {
             .mutate_workspace(&id, workspace.generation, action)
             .unwrap();
     }
-    let plan = workspace.prepare(Destination::Review).unwrap().operations;
+    let plan = workspace.publication_plan().unwrap().operations;
     workspace = store
         .mutate_workspace(
             &id,
@@ -2081,24 +2070,8 @@ fn submitted_review_with_failed_progress_remains_submitted_and_unfinished() {
             },
         )
         .unwrap();
-    for operation in plan
-        .into_iter()
-        .filter(|operation| matches!(operation.change, Event::SetReviewConclusion { .. }))
-    {
-        workspace = store
-            .mutate_workspace(
-                &id,
-                workspace.generation,
-                Action::RecordResult {
-                    result: OperationResult {
-                        operation,
-                        mappings: vec![],
-                        response: json!({"submitted":true}),
-                    },
-                },
-            )
-            .unwrap();
-    }
+    assert!(matches!(plan[0].change, Event::SetFileViewed { .. }));
+    assert!(matches!(plan[1].change, Event::SetReviewConclusion { .. }));
     store
         .mutate_workspace(
             &id,
@@ -2114,13 +2087,10 @@ fn submitted_review_with_failed_progress_remains_submitted_and_unfinished() {
     let response = api(root.path(), json!({"op":"get","workspace":id}));
     assert_eq!(response["workspace"]["stats"]["unfinished"], true);
     assert_eq!(response["workspace"]["stats"]["pending"]["files"], 1);
-    assert_eq!(
-        response["workspace"]["publications"][0]["status"],
-        "submitted_progress_pending"
-    );
+    assert_eq!(response["workspace"]["publications"][0]["status"], "failed");
     assert_eq!(
         response["workspace"]["publications"][0]["published"]["conclusions"],
-        1
+        0
     );
 }
 
@@ -2384,10 +2354,7 @@ fn publication_projection_matches_full_history_through_uncertainty_and_provider_
             .mutate_workspace(&id, workspace.generation, action)
             .unwrap();
     }
-    let plan = workspace
-        .prepare(Destination::Standalone)
-        .unwrap()
-        .operations;
+    let plan = workspace.publication_plan().unwrap().operations;
     workspace = store
         .mutate_workspace(
             &id,
@@ -2655,4 +2622,66 @@ cat "$fixture_dir/$fixture.json"
     assert_ne!(cached["workspace"]["id"], created["workspace"]["id"]);
     let calls = fs::read_to_string(bin.join("calls")).unwrap();
     assert_eq!(calls.lines().filter(|line| *line == "graphql").count(), 2);
+}
+
+#[test]
+fn queued_conclusion_is_local_and_legacy_submit_cannot_write() {
+    let (root, id) = fixture();
+    let response = api(
+        root.path(),
+        json!({
+            "op":"actions", "workspace":id, "generation":0,
+            "actions":[
+                {"action":"save", "target":{"kind":"reply","target":"root"}, "body":"Review reply"},
+                {"action":"publish_review", "conclusion":{"outcome":"approve","body":null}}
+            ]
+        }),
+    );
+    assert!(response["error"].is_null(), "{response}");
+    let workspace = Store::open(root.path())
+        .unwrap()
+        .workspace(&id)
+        .unwrap()
+        .unwrap();
+    let plan = workspace.publication_plan().unwrap();
+    assert_eq!(plan.operations.len(), 2);
+    assert!(matches!(
+        plan.operations[0].change,
+        Event::CreateComment { .. }
+    ));
+    assert!(matches!(
+        plan.operations[1].change,
+        Event::SetReviewConclusion { .. }
+    ));
+    assert!(workspace.results.is_empty() && workspace.attempt.is_none());
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.path().join("no-provider");
+    fs::create_dir(&bin).unwrap();
+    fs::write(
+        bin.join("gh"),
+        "#!/bin/sh\nprintf 'unexpected provider invocation' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let rejected = command_with_path(
+        root.path(),
+        &json!({
+            "op":"submit", "workspace":id, "generation":workspace.generation
+        }),
+        Some(&path),
+    );
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("only publish may write"));
+    assert_eq!(
+        Store::open(root.path())
+            .unwrap()
+            .workspace(&id)
+            .unwrap()
+            .unwrap(),
+        workspace
+    );
 }

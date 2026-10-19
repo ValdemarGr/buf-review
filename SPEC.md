@@ -224,6 +224,11 @@ read-only in every window; ordinary source buffers are separate. Show comment
 counts on relevant lines on either side. Local source edits do not change
 compared code or saved comment anchors.
 
+Current-comparison Base/Head diff winbars show `[viewed]` or `[unviewed]` beside
+the file path, preserving their revision/path labels. Derive this marker from
+projected local progress: both panes update after `s`/`u` without publishing.
+Historical winbars retain their existing labels.
+
 Opening a discussion uses one reusable split below both code panes:
 
 ```text
@@ -249,10 +254,14 @@ closing or replacing their editor.
 
 Thread lists contain styled entries without usage banners. Thread discussions
 use themed location, author and status headers, original Markdown bodies, and
-dividers between comments. Spacing and dividers carry no comment action.
-Both readers end with `-----------------------------` and a blank line as a
-visual append boundary, not a comment object or editable footer. `a` works
-anywhere in either reader. Usage belongs in the help page.
+dividers only between comments, never after the last comment. Spacing and
+dividers carry no comment action. Both readers retain final blank spacing,
+without a trailing append divider. `a` works anywhere in either reader,
+including the end. Usage belongs in the help page.
+
+When no comments remain, close the managed thread selector or discussion and
+return focus to its origin. Pending-deletion comments remain visible for undo
+and do not make the reader empty.
 
 ### Contextual Enter
 
@@ -311,7 +320,7 @@ activity does not move existing drafts.
 | Save unchanged body | No new body event |
 | Save blank new draft | Create nothing |
 | Save blank saved pending comment | Delete the local draft; no provider creation remains |
-| Save blank existing fetched comment | Stage deletion; publication sends it |
+| Edit/delete a successfully sent or fetched comment | Reject; published content is immutable |
 | Undo or type nonblank text, then `:w`, while deletion is unsent | Restore the same comment identity and save its body |
 | `:wq` | Save locally, then return to the originating reader or context if save succeeds |
 | `:q` | Ordinary modified-buffer rules; no publication |
@@ -321,16 +330,16 @@ All ordinary comment composers, including explicit edit/reply commands, return
 to their originating reader or context after `:wq`. Reused reader panes restore
 their immutable list/thread. From home or diff, the ordinary discussion composer
 keeps that context visible and closes back to it.
+Direct diff comments restore the originating pane and both diff panes' saved
+cursor and scroll positions when the composer closes.
 
 A successful save persists body and associated draft metadata atomically.
 Whitespace-only text counts as blank. Blank saves use the same ownership,
 dependency, conflict and publication restrictions as explicit deletion.
-Submitted review summaries cannot be deleted this way; review conclusions
-retain their existing blank-body validation.
-Repeated blank writes after saving deletion add no events. Published comments
-whose creation is confirmed but not yet refetched remain visible under
-Unpublished changes while their deletion is pending. Once deletion has been
-sent, writing text cannot restore that remote resource.
+Successfully sent comments and conclusions are immutable, including pending
+provider drafts and creations confirmed before refetch. Corrections use new
+comments or replies. An unsent conclusion retains its blank-body validation.
+Repeated blank writes after canceling an unsent comment add no events.
 Errors keep the buffer modified and visible. No comment-editor close action
 publishes. Saved event history is append-only and inspectable through
 `:Review log`; editing changes the projection, not prior event records.
@@ -363,13 +372,10 @@ Replies, PR-wide comments and unavailable source receive a clear unsupported
 context message. Suggestions are ordinary comment body text, with the same
 save and publication lifecycle; no separate suggestion editor or domain subtype.
 
-`:Review delete` explicitly deletes the selected owned comment. An unsaved draft
-is abandoned using normal buffer rules; a saved local draft stages deletion and
-nets out before publication. A fetched comment gets a pending-deletion label
-until refresh confirms its absence. Reject deleting a parent with unpublished
-replies and list those dependents; the user must address them first. Do not
-silently cascade deletion or erase unsaved text. Progress/reply actions on a
-pending-deletion target are unavailable until that deletion is resolved.
+`:Review delete` cancels the selected unsent local comment. Sent or fetched
+comments cannot be edited or deleted. Reject deleting a parent with unpublished
+replies; list those dependents without silently cascading deletion. Unsent
+create/edit/delete changes coalesce within the publication boundary.
 
 In home, thread lists and discussions, `dd`, `d{motion}`, `D`, `x`, and
 visual `d`/`x` delete every touched comment once. Native Vim motions and visual
@@ -394,163 +400,80 @@ selected draft replies are canceled before selected parents. Restoration keeps
 the publication restrictions of `:Review restore`. Explicit `:Review todo` and
 `:Review unviewed` retain their progress-only behavior.
 
-`:Review restore` cancels a selected fetched comment's staged deletion before
-it has been sent, retaining the fetched item and recording the cancellation in
-local history. It does not recreate a remotely deleted comment. If deletion is
-already confirmed or its result uncertain, explain that state instead of
-pretending it can be undone. Submitted review-summary bodies may be edited but
-cannot be deleted: GitHub's [review deletion endpoint is for pending reviews](https://docs.github.com/en/rest/pulls/reviews#delete-a-pending-review-for-a-pull-request).
+`:Review restore` remains available for legacy unsent deletion intent; it does
+not recreate a remotely deleted comment or change successfully sent content.
 
-## Review and standalone destinations
+## Publication membership and conclusion
 
-Inline roots, file comments and replies can be grouped with the saved WIP or
-published standalone. Both styles save locally; neither publishes on `:w`.
+All new inline roots, file comments and replies join the publication's review.
+No separate local review identity is needed: the publication identifies the
+attempt, while receipts retain GitHub's provider review identity. Immutable
+fetched snapshot `ReviewId` values are a separate concept.
 
-| Context | New comment/reply destination |
-| --- | --- |
-| Active WIP | That review by default |
-| No active WIP | Standalone by default |
-| Explicit `review` argument | Saved WIP; create/reuse it without changing activity |
-| Explicit `standalone` argument | Standalone without changing activity |
-| Reply to unpublished draft | Parent's destination, regardless of activity |
+Legacy unsent standalone inline comments are detected by their destination.
+`:Review move` explicitly moves the current comment or a range/visual selection
+into the review, preserving identities, text and anchors. Reject sent content
+and selections missing dependent unpublished parents or replies. Never move
+comments implicitly. New replies to unpublished legacy parents retain their
+parent's destination until that selection is explicitly moved.
 
-`:Review comment [review|standalone]` and `:Review reply [review|standalone]`
-choose the style explicitly. Omission uses the table. Reject an explicit style
-that conflicts with an unpublished parent's destination rather than silently
-changing either draft. Replies to published comments use normal defaults.
+`:Review start` and `:Review leave` remain compatibility commands; activity does
+not change new inline membership. Legacy PR-wide issue comments retain their
+saved target. Review-wide prose uses the conclusion composer.
 
-PR-wide discussion comments are standalone issue comments. `:Review comment`
-from the home header creates one, defaulting to Standalone even during WIP;
-an explicit Review request there explains that review-wide prose belongs in
-the conclusion composer. Do not quietly turn it into an issue comment or a
-review summary. GitHub exposes [diff comments separately from issue comments](https://docs.github.com/en/rest/pulls/comments#about-pull-request-review-comments),
-while the [review body is part of the review resource](https://docs.github.com/en/rest/pulls/reviews#create-a-review-for-a-pull-request).
+Home `cc` and `:Review conclude` select Comment, Approve or Request changes and
+open the saved Markdown summary. Draft removes the unsent conclusion
+(`publish_review` with `conclusion: null`), keeping prior local history. The
+picker changes no provider state. Saving
+queues the unique optional `PublishReview` event (`publish_review` in JSON),
+containing outcome and summary. Later unsent saves replace its projected value;
+local history remains append-only. The conclusion is ordinary unpublished intent.
 
-Edits/deletes of already-published comments are always standalone changes,
-regardless of their original review. Editing an unpublished draft preserves
-its destination. Historical-context edits target the same live PR resource by
-stable provider identity; they never edit an old snapshot or implicitly choose
-an old batch. If current remote content differs, use conflict resolution.
-
-## WIP lifecycle and conclusion
-
-`:Review start` starts or resumes the one local WIP and makes it active.
-`:Review leave` preserves it and makes new ordinary comments default standalone.
-Explicit Review-style comments can populate a left WIP without activating it.
-A successfully submitted WIP ends; the next review gets a fresh identity.
-A provider-side pending review created by another tool is not silently adopted,
-merged or deleted. If it prevents submission, report it and preserve local work.
-
-In home, `cc` equals `:Review conclude`. Use `vim.ui.select` for Comment, Approve
-or Request changes; put Comment first initially and the saved outcome first on
-later openings. Cancelling the picker changes nothing. Once an outcome is
-accepted, start/resume and activate the WIP if necessary, then open its saved
-Markdown summary.
-This supports reviews containing a conclusion without inline comments.
-
-The composer visibly shows the outcome and included saved-comment count.
-Opening `:Review conclude` again permits changing the outcome while preserving
-saved summary text; modified text must be handled before replacing its buffer.
-`:w` saves summary and outcome locally and stays open. It never submits alone.
-
-Explicit write-and-close submits: `:wq`. `:x`/`ZZ` submit if a successful write
-occurred during this composer opening, including a write performed by that close
-action. An unchanged
-`:x`/`ZZ` immediately after reopening cancels, since it performs no write.
-A close without a successful write in that composer opening cancels.
-`:q`/`:quit` always stay local, even after `:w`; saved summary/outcome and WIP
-comments remain. Before submission begins, `:q!` always cancels: unsaved
-edits disappear, saved summary/outcome and WIP comments remain.
-Deleting/hiding buffers, switching views, closing the whole editor or crashing
-must never trigger submission. Completion is an explicit composer action, not
-an arbitrary buffer-unload side effect.
-
-Hold the composer open while submitting and show progress. Confirmed failure
-keeps it open with saved text and a visible error. Retry requires another
-explicit completion action. Confirmed success closes it and ends the WIP.
-Failed progress writes after successful submission do not reopen the review.
-Once a provider attempt has started, closing the composer cannot cancel remote
-writes. Keep it visible until the result is known; closing the editor instead
-leaves any uncertain attempt for reconciliation on reopen, never blind retry.
-
-Allow an empty summary for Approve. Require a nonblank summary for Comment and
-Request changes, matching the current adapter's validation. Invalid completion
-stays in the composer and performs no provider writes; local saves remain.
-File/inline comments need not be present. Provider restrictions, including
-self-approval restrictions, are shown as specific errors; reading and commenting
-on one's own PR remain supported.
-The provider defines [review submission outcomes](https://docs.github.com/en/rest/pulls/reviews#submit-a-review-for-a-pull-request).
+Every composer is local: `:w` saves, `:wq` saves and returns, `:x`/`ZZ` use normal
+write-and-close behavior, `:q!` discards only unsaved edits. Closing, unloading,
+changing windows or leaving Neovim never publishes. Comment and Request changes
+require nonblank summary; Approve may omit it. Summary-only reviews work.
 
 ## Publication boundaries and retries
 
-Only saved changes participate. Freeze the selected saved changes for one
-publication attempt; later eligible saves remain pending for another attempt.
-During WIP submission, freeze that WIP's membership, activity, conclusion and
-included drafts until the result is known. Attempts to mutate or save into it
-retain the user's modified text and explain that submission is in progress.
-Standalone/progress saves can continue. This prevents new drafts being silently
-attached to a WIP that ends during publication. Confirmed failure unfreezes it;
-uncertain submission must be reconciled before changing its prepared content.
-Serialize publication per repository so concurrent editor sessions cannot send
-overlapping plans. Verify reviewer/account, target PR and known ownership/capabilities before
-writes. The provider remains the final authority on permissions and validation;
-surface rejection without losing saved work.
+Only `:Review publish` / JSON `op: publish` may write to the provider. The former
+`submit` operation is rejected. Publishing never asks for a conclusion. Missing
+`PublishReview` means draft: send comments in a pending GitHub review. If present,
+conclude after all preceding saved comments and ordered operations succeed.
 
-| Action | Changes sent |
-| --- | --- |
-| `:Review publish` | Standalone roots/replies, published-comment edits/deletes, pending thumbs-up and viewed-file changes |
-| Complete conclusion composer | WIP roots/replies and conclusion, then pending thumbs-up and viewed-file changes |
+A publication uses at most one GitHub review. Freeze its ordered surviving
+operations, with the conclusion terminal. Coalesce only unsent changes; preserve
+dependencies and the order of remaining operations. Validate known constraints
+and account identity before the first write. A blocked conflict/anchor prevents
+publication; never filter it out or bypass it with unrelated work.
 
-Each leaves the other style's drafts queued. Submission must use an actual
-provider review grouping; sending comments separately and then posting an
-unrelated conclusion is not equivalent. The adapter can prepare a pending
-provider review only during explicit submission, add its roots/replies, then
-submit it. Record preparation identities/results for retry. Grouped replies use
-[the pending-review association in GitHub's thread-reply input](https://docs.github.com/en/graphql/reference/pulls#addpullrequestreviewthreadreplyinput).
-Never expose WIP comments as standalone writes to work around grouping limits.
+Persist a marker before each write and its confirmed result/provider identities
+before advancing. Successfully sent content is immutable immediately, even in
+an unsubmitted provider review. A failed publication retains its ID, ordered
+plan and confirmed prefix; retry sends only unapplied operations. Confirmed
+failures permit editing unsent intent within that scope. Unknown results freeze
+the affected attempt until reconciliation, blocking later publication writes.
+No blind duplicate creation and no skip-ahead after errors.
 
-The Neovim publication command and explicit conclusion completion block until
-publication and a subsequent fresh PR fetch/reconciliation finish. Drain any
-preceding background refresh before writing, then fetch again after publication;
-an earlier in-flight snapshot cannot satisfy the post-publication refresh.
-Use the existing serialized local writer when applying fetched metadata and
-redraw readers before completing the action. This orchestration belongs to Lua;
-CLI publication remains an explicit write operation returning saved receipts.
-Refresh after partial success without retrying writes. Report a refresh failure
-separately from publication results, preserving successful receipts and any
-original publication error. A confirmed submission remains submitted even when
-its subsequent refresh fails.
-Ctrl-C interrupts waiting without cancelling an already-started publication.
-Retain the publication guard until its result and post-publication refresh finish;
-an immediate retry must not start duplicate provider writes.
+Adjacent compatible line-root creations use native bulk create-review. A final
+conclusion can be included when it immediately follows that group and ends the
+queue. Other operations split the group; existing pending reviews, file roots,
+replies and progress use supported sequential writes. Arbitrary GraphQL aliases
+are not atomic and can continue after individual errors, so they cannot replace
+strict stop-on-error sequencing.
 
-Publish roots before dependent replies. Unpublished replies share their parent
-style, and the UI does not stage checklist reactions on unpublished drafts, so
-normal interactions do not create cross-style dependencies. Reject an imported
-or otherwise invalid dependency with the affected items listed; do not pull
-queued changes from the other destination into the attempt.
+Successful draft publication closes that publication while retaining the pending
+provider review identity for a later publication to extend or conclude. A
+completed publication and its results never reopen; new work gets a new ID.
+A provider-side review from another tool is not silently adopted or deleted.
+Legacy identities, events, drafts, receipts and recovery data survive migration.
 
-Unresolved conflicts or invalid anchors block their affected comments and
-operations depending on them. Submission of a WIP containing one waits for
-resolution; it must not silently omit that item. Publish may send unrelated
-eligible standalone changes and report the blocked items separately.
-
-Persist each confirmed result and provider identity before continuing. After
-review submission succeeds, perform related progress writes independently.
-If they fail, keep the review submitted and leave failed progress queued for
-`:Review publish`. Do not duplicate the review or its comments. Standalone
-partial success likewise retains confirmed results and retries only outstanding
-eligible changes. Any staged provider drafts remain associated with the same
-attempt until resolved; never create a fresh review merely because retry occurs.
-
-A lost response or local receipt failure is an uncertain result, not a confirmed
-failure. Mark the attempt uncertain, reconcile with provider state before retry,
-and block duplicate creation until its outcome is known. Show the unresolved
-operation if it cannot be identified reliably; retain all local text and allow
-unrelated eligible work. Do not promise exactly-once delivery across arbitrary
-network/process failures. Editing a prepared but unsubmitted draft invalidates
-that prepared version; synchronize its known provider draft on explicit retry,
-without touching already-submitted content or duplicating it.
+Neovim waits for publication and a fresh subsequent fetch. Drain earlier
+background refreshes before writing; an earlier snapshot cannot satisfy this
+post-write refresh. Refresh after partial success without retrying writes.
+Report refresh failures separately, preserving all receipts and original errors.
+Ctrl-C interrupts waiting without canceling an already-started write; keep the
+publication guard until its result and refresh complete.
 
 ## Individual comment progress and navigation
 
@@ -566,7 +489,10 @@ Other users' reactions and provider thread-resolution status do not determine
 this checklist. Staged reaction intent updates the display immediately. Local
 drafts are excluded. A publication receipt alone never adds membership; the
 user's own published comments/replies enter the checklist once fetched too.
-Provider-prepared copies of an unsubmitted local WIP remain local drafts for
+Fetched PENDING roots and replies retain stable identities and a `draft` flag,
+shown as `[draft]` in readers. They are read-only and excluded from Todo/Done
+until submission. Refreshing submitted state updates the flag without duplicate
+comments or new local intent. Provider-prepared local copies remain drafts for
 this rule, even if refresh sees them after a failed submission. They enter the
 checklist only after confirmed submission and a fetch; a private preparation
 step must not turn them into Todo or duplicate their local identities.
@@ -613,45 +539,40 @@ Named viewed/unviewed actions also work from within the file's review diff.
 
 Marking preserves cursor row/column and scroll position. When an item changes
 section, the cursor stays in place rather than following it; clamp only at the
-buffer end. Next/previous Todo, from home, diff or discussion, follows home's
-displayed logical order and stops at the ends. After marking Done, continue
-from that item's former Todo position. With no selected comment or continuation
-position, next opens the first Todo and previous the last. An empty list gives
-a notice without moving. Refresh retains continuation by identity and order;
-never restart silently at the first item merely because an item became Done.
-Moving the cursor selects a new navigation context.
+buffer end. Navigation uses the backend's stable sequence and the current object
+identified by the focused buffer and cursor. Home file/comment rows supply the
+corresponding current object. Never recover context from a previously selected
+object, last path, active pane or saved continuation. Plain `s` creates no
+continuation; subsequent navigation uses the object then under the cursor.
 
-`:Review next|previous comment` includes Done in the same comment order.
-`:Review next|previous file` follows displayed file order across viewed sections.
-All stop at boundaries and change no progress state. Native diff motions handle
-hunks. Combined buffer-local `]F`/`[F` try marking the active file viewed, then
-open the next/previous unviewed file. `]R`/`[R` try marking the active comment Done,
-then open the next/previous Todo and its code. All four work in every Review
-buffer. The last diff explicitly opened or focused selects the active file;
-base and head are the same logical file within its session and pinned comparison.
-The last comment explicitly opened or focused is active; focusing a reply selects
-that individual comment. Moving between code and discussion retains the other
-active target. Without a visible active conversation, `]R` opens the first
-unfinished comment at the current diff line or picker location directly; `[R`
-opens the last. Include each root and reply independently, including unfinished
-replies to Done roots. Do not require Enter or mark anything on this first visit.
-Subsequent presses mark and advance in global Todo order across same-line threads.
-If the location has no Todo, retain ordinary Todo navigation as the fallback.
-Mark only while the target is visible in the current tab; either
-matching diff side suffices for a file. Hidden or closed means navigation only,
-even when another inactive target is visible. Home file rows supply navigation
-context when no active file is visible. With no file context, start at the first
-or last unviewed file. Multiple visible panes retain the explicit active
-selection; background rendering never changes it. Progress stays in the target's
-bound session, including when another session has focus. Already viewed/Done,
-local drafts and pending deletions advance without a mark attempt. Report mark
-failures but still advance. Unsaved composers block both actions. Save through
-the existing action-list API. Follow the backend's stable order, skip completed
-items and never wrap. Cancel an automatic jump if the user moved, changed active
-target or navigation, hid its last visible pane, or changed the pinned comparison
-while saving. A newer local navigation request cancels the jump even while its
-view is still loading; the pending mark still saves. Plain `s` keeps its
-position-preserving behavior; native lowercase `[c`/`]c` remain.
+Next searches strictly after current, then wraps through the prefix before it;
+previous searches strictly before current, then wraps through the suffix after
+it. Each step skips excluded objects and never returns current on wrap. Normal
+counts repeat this search from each result, loading only the final destination;
+a complete cycle may return to the original object. With no current
+object, start at the first/last eligible object. With no eligible destination,
+give a notice without moving. File navigation excludes viewed files; comment
+and Todo navigation exclude Done comments. Use projected progress, including
+staged unpublished viewed flags and own thumbs-up changes. Changing progress
+does not reorder the stable sequence. Navigation never changes progress.
+
+`:Review next|previous todo`, `:Review next|previous comment` and
+`:Review next|previous file` use this filtered wrapping search. Review-local
+`]f`/`[f` open the next/previous unviewed file; `]r`/`[r` open the next/previous
+Todo comment and its code. Include each root and reply independently, including
+unfinished replies to Done roots. From code without a current comment, `]r`
+opens the first eligible comment at the current diff line; `[r` opens the last.
+Without a matching location, use the first/last global Todo. Subsequent presses
+in a discussion search from the focused comment in global order, including
+across threads on the same line. Other visible panes never supply current
+objects. Unsaved composers block navigation. A newer local navigation request
+cancels an older load even while its view is still loading.
+
+Keep marking separate: `]f`, inspect, `s`, `]f` for files; `]r`, inspect, `s`,
+`]r` for comments. Contextual `s` stages viewed/Done through the existing
+action-list API, preserving cursor and scroll position without navigation.
+Historical code cannot mark a current file viewed; mark the comment Done from
+its discussion instead. Native `[c`/`]c` remain diff-hunk navigation.
 
 Reuse stable numbered reader buffers by review and reader kind/side. Navigation
 replaces the contents and resets target metadata, highlights and filetype together.
@@ -745,7 +666,7 @@ Current-comment/file navigation restores the pinned diff. These views do not
 change the workspace's pinned comparison. Historical code supports reading and
 navigation; replies/Done stay in the thread. New inline roots and viewed-file
 marks require current code. PR-wide comments open discussion without changing
-code. Apply these rules to Enter and comment navigation, including `]R`/`[R`.
+code. Apply these rules to Enter and comment navigation, including `]r`/`[r`.
 
 `:Review context` opens the selected comment's recorded original context in a
 separate reusable read-only context tab. With a known revision pair and objects,
@@ -785,11 +706,11 @@ home header is the explicit PR-wide creation context.
 | `prs [assignee=LOGIN\|@me\|all] [state=open\|closed\|merged\|all]` | Choose PR in current repository; defaults open/all assignees |
 | `start` / `leave` | Activate or leave saved WIP |
 | `conclude` | Outcome picker and review summary; home `cc` |
-| `publish` | Publish eligible standalone changes and progress |
+| `publish` | Send the ordered saved queue; missing conclusion leaves a draft review |
 | `refresh` | Refresh remote PR query, reread local session browser, or refresh bound session; never repin comparison |
 | `comment [review\|standalone]` | New comment at current line, range, file row or home header |
 | `reply [review\|standalone]` | Reply to selected inline comment, including own comment |
-| `edit` / `delete` | Edit or stage deletion of selected owned comment |
+| `edit` / `delete` | Edit or cancel the selected unsent local comment |
 | `restore` | Cancel selected fetched comment's unsent staged deletion |
 | `suggest` | Insert suggestion in eligible Markdown composer |
 | `done` / `todo` | Stage own thumbs-up addition/removal for selected fetched comment |
@@ -797,6 +718,7 @@ home header is the explicit PR-wide creation context.
 | `next [todo\|comment\|file]` / `previous [todo\|comment\|file]` | Navigate; Todo is default |
 | `compare latest` | Explicitly update pinned comparison |
 | `context` | Selected comment's original code context |
+| `move` | Move selected unsent legacy inline comments into the review |
 | `relocate [draft-id]` | Propose selected current diff location for an unpublished root |
 | `resolve local\|remote\|edit` | Resolve selected conflict locally |
 | `log` | Read-only event/result history for current workspace lineage |
@@ -805,19 +727,15 @@ The `<Plug>` mappings are `<Plug>(ReviewDone)`, `<Plug>(ReviewTodo)`,
 `<Plug>(ReviewViewed)`, `<Plug>(ReviewUnviewed)`, `<Plug>(ReviewNextTodo)`,
 `<Plug>(ReviewPreviousTodo)`, `<Plug>(ReviewNextComment)`,
 `<Plug>(ReviewPreviousComment)`, `<Plug>(ReviewNextFile)` and
-`<Plug>(ReviewPreviousFile)`, plus `<Plug>(ReviewViewedNext)`,
-`<Plug>(ReviewViewedPrevious)`, `<Plug>(ReviewDoneNext)` and
-`<Plug>(ReviewDonePrevious)`. They invoke the corresponding
+`<Plug>(ReviewPreviousFile)`. They invoke the corresponding
 named action. Default normal-mode mappings are buffer-local `<CR>`, `s`, `u`,
 diff/reader `a`, and home-only `cc`, plus `d`, `dd`, `D`, `x` for deletion in
-home/thread lists/discussions; visual `d`/`x` applies there too. Every Review
-buffer, including composers in normal mode, binds `]F`, `[F`, `]R` and `[R` for
-active-target progress/navigation, subject to the unsaved-composer guard. Visual
+home/thread lists/discussions; visual `d`/`x` applies there too. Visual
 `a` in review diffs creates a range comment and replaces the native
 `a{textobject}` prefix there. Visual `<CR>` has no plugin mapping; visual `s`/`u`
 are limited to read-only review object lists/threads.
-Review-local `]f`/`[f` navigate all files, including viewed ones; `]r`/`[r`
-navigate all comments, including Done ones. These motions never write progress.
+Review-local `]f`/`[f` navigate unviewed files; `]r`/`[r` navigate Todo comments.
+These motions never write progress and respect staged unpublished marks.
 Native `]c`/`[c` remain diff-hunk navigation. Review-local `]f`/`[f` replace their
 native `gf` aliases; `gf` itself remains available.
 
@@ -838,30 +756,32 @@ buffers retain native editing/navigation; Insert-mode Enter remains newline.
    list, even for a single thread; Enter again reads it. No threads means no action.
    Visual `a` instead starts a range comment. Write Markdown, optionally
    `:Review suggest`, then `:wq` to save locally and return to the originating context.
-   Mark inspected files viewed independently.
-4. Return with `:Review`; inspect Review/Standalone labels in Unpublished changes.
-5. `cc`, choose outcome, write summary, `:wq`. Submit saved WIP comments and
-   conclusion, then progress. Standalone drafts remain queued.
-6. Submission success ends WIP. Failure preserves composer and text; retry
-   explicitly. Progress-only failure leaves the review submitted and progress
-   queued for `:Review publish`. `:q!` cancels the composer without losing saves.
+   Mark inspected files viewed with `s`; `]f` opens the next unviewed file.
+4. Return with `:Review`; inspect unpublished comments. Use `:Review move` on
+   selected legacy standalone inline drafts when they should join the review.
+5. Optionally `cc`, choose outcome, write summary, `:wq`. This queues a local
+   conclusion event; it performs no provider writes.
+6. `:Review publish` sends the saved queue. Missing conclusion leaves a draft.
+   A queued conclusion submits after preceding operations. Failed publication
+   retains its ID and confirmed results; retry sends only remaining operations.
 
-A summary-only review can begin at `cc`. Previously saved standalone drafts
-never join it implicitly. Leaving WIP preserves drafts for a later session.
+A summary-only review can begin at `cc`. New inline drafts join the review;
+existing legacy destinations never change implicitly.
 
 ### Fix feedback
 
-1. Open the PR's Todo list. No submitted-review selection is required. Leave
-   active WIP when ordinary new replies should default standalone.
+1. Open the PR's Todo list. No submitted-review selection is required.
 2. Enter on an item opens discussion and matching code. For outdated comments,
    inspect discussion and use `:Review context` if original code is needed.
 3. Edit source using ordinary navigation such as Telescope; review buffers keep
    their compared revisions.
 4. Press `a` in the conversation to reply, including to one's own thread;
    `:wq` saves locally and returns to the conversation.
-5. Mark the individual fetched item with `s`. Cursor follows it into Done;
-   `:Review next` continues from its former Todo position. `u` reopens it.
-6. `:Review publish` sends standalone changes and progress. WIP drafts stay queued.
+5. Mark the individual fetched item with `s`. Cursor stays in place;
+   `]r` opens the next Todo from the item now under the cursor. `u` reopens a
+   Done item.
+6. `:Review publish` sends the ordered saved queue. A queued conclusion ends
+   its review; otherwise comments remain drafts.
    Commit/push source using the existing Git workflow.
 7. Refresh fetches new replies as Todo when unmarked, including one's own newly
    fetched replies. Resolve remote conflicts explicitly; no silent overwrite.
@@ -976,39 +896,34 @@ The integration is complete only when these observable cases pass:
 4. One discussion split is reused. Modified buffers survive attempted navigation,
    PR switches and refresh. Save failures keep text; no ordinary comment close
    publishes. No-op/blank/save-again/delete rules preserve identity and history.
-5. Review and Standalone coexist. Start/leave changes defaults only; explicit
-   Review creation while inactive leaves activity unchanged. Unpublished replies
-   share parent destination; conflicting overrides and deletion dependencies fail
-   without mutation. Unsent fetched-comment deletion can be restored locally;
-   confirmed/uncertain deletion and submitted summaries cannot be falsely restored
-   or deleted.
+5. New inline comments share the publication review; legacy standalone selections
+   move only through explicit `move`. Sent content is immutable; unsent
+   cancellation, membership changes and dependency checks preserve identities.
 6. Suggestions remain Markdown body text with captured source. File/PR-wide
    contexts, unknown authors, unsupported replies and unavailable source report
    their actual capabilities without fabricated anchors or permissions.
-7. `cc`/conclude picker, saved outcome, summary-only review, save/close submission,
-   cancellation after earlier saves and failed-submission retention work. Closing
-   Neovim, unloading buffers and reopening then immediately quitting never submit.
-   Summary-only composition works below home without opening a file; unchanged
-   `:x`/`ZZ` on a reopened composer does not submit.
-8. Publish and Submit select only their defined changes. Real review grouping,
-   parent-first creation, partial success, progress-only failure, concurrent saves
-   and uncertain-result reconciliation preserve queued work without blind resend.
-   Submitting WIP cannot accept new members or changed content until its result
-   is known; unrelated saved changes remain pending for their own attempt.
+7. `cc`/conclude queues one local conclusion event; Draft cancels its unsent
+   value without changing history. All save/close paths remain
+   local; only Publish writes. Draft and summary-only publications both work.
+8. Native batching, ordered stop-on-error, confirmed prefix receipts, unchanged
+   failed publication IDs, partial retries and uncertain reconciliation prevent
+   duplicates and skip-ahead writes. Completed publications remain immutable.
 9. Checklist membership is fetched-only and individual, includes own fetched
    replies and nonblank summaries, and counts only own thumbs-up. New replies,
    reaction overlays, pending deletions and file viewed independence behave as
    specified; receipts and private WIP preparation alone never create checklist
    members.
-10. Marking preserves cursor/viewport without following moved entries; Todo
-    next/previous resumes from former position,
-    crosses files, respects displayed order and stops at boundaries. Empty lists
-    and navigation without a current item behave predictably. Commands and
-    `<Plug>` mappings agree. Combined progress/navigation defaults save first,
-    skip finished items, stop at ends and preserve native lowercase diff motions.
+10. Marking preserves cursor/viewport without following moved entries. All
+    next/previous searches use focused cursor context and stable backend order,
+    wrap without returning current, and stay put without a destination. File
+    searches skip viewed; comment/Todo searches skip Done, including staged
+    unpublished progress. Commands and `<Plug>` mappings agree. Navigation never
+    marks progress; contextual `s` stages progress without navigation. Other
+    visible panes and remembered selections never provide navigation context.
+    Native lowercase diff motions remain unchanged.
 11. Refresh preserves saved/unsaved local work, reconciles published identities,
     and shows edit/delete conflicts. Keep local/use remote/edit affects only
-    explicit intent; blocked WIP waits while unrelated standalone work can publish.
+    explicit intent; blocked publication prevents skip-ahead writes.
     Changed-body deletion conflicts and missing-target resolution never discard
     new remote work or recreate absent resources implicitly.
 12. New commits do not repin code. Explicit comparison updates preserve old

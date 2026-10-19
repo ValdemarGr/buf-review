@@ -252,6 +252,7 @@ fn fetch_normalizes_all_pages_and_retains_read_history_without_creating_a_batch(
         ]
     );
     assert_eq!(review.read.comments.len(), 6);
+    assert!(review.read.comments.iter().all(|comment| !comment.draft));
     assert_eq!(
         review.read.comments[4].content.id.0,
         mapped(&backend, "review_summary", "301")
@@ -747,32 +748,71 @@ fn inline_and_issue_reaction_overflow_preserves_all_eight_reactions_and_authors(
 }
 
 #[test]
-fn private_pending_comments_never_become_fetched_comments_or_checklist_reactions() {
+fn pending_comments_preserve_paginated_roots_replies_and_identity_after_submission() {
     let fake = FakeGh::new();
     let mut snapshot = fake.read("snapshot");
-    let comments =
-        &mut snapshot["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"];
-    comments["nodes"][0]["state"] = json!("PENDING");
-    comments["nodes"][1]["state"] = json!("PENDING");
+    let pull = &mut snapshot["data"]["repository"]["pullRequest"];
+    pull["reviews"]["nodes"][2]["author"] = json!({"databaseId":1,"login":"reviewer"});
+    let mut thread = pull["reviewThreads"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    for comment in thread["comments"]["nodes"].as_array_mut().unwrap() {
+        comment["state"] = json!("PENDING");
+        comment["author"] = json!({"databaseId":1,"login":"reviewer"});
+        comment["pullRequestReview"]["fullDatabaseId"] = json!("303");
+    }
+    let reply = thread["comments"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .pop()
+        .unwrap();
+    thread["comments"]["pageInfo"] = json!({"hasNextPage":true,"endCursor":"comment-next"});
+    let mut next = connection(vec![reply], false, None);
+    next["totalCount"] = json!(2);
+    fake.write("comment_next", json!({"data":{"node":{"comments":next}}}));
+    pull["reviewThreads"]["pageInfo"] = json!({"hasNextPage":true,"endCursor":"thread-next"});
+    let mut next = connection(vec![thread], false, None);
+    next["totalCount"] = json!(2);
+    fake.write(
+        "thread_next",
+        json!({"data":{"repository":{"pullRequest":{"reviewThreads":next}}}}),
+    );
     fake.write("snapshot", snapshot);
     let id = fetched_id(fake.fetch(URL, None));
     let mut store = fake.store();
     let read = store.get_review(&id).unwrap().unwrap().read;
     let backend = store.review_backend(&id).unwrap().unwrap();
+    let parent = CommentId(mapped(&backend, "review_comment", "201"));
+    let reply = CommentId(mapped(&backend, "review_comment", "202"));
+    let root = read
+        .comments
+        .iter()
+        .find(|comment| comment.content.id == parent)
+        .unwrap();
+    let child = read
+        .comments
+        .iter()
+        .find(|comment| comment.content.id == reply)
+        .unwrap();
+    assert!(root.draft && child.draft);
+    assert!(matches!(root.target, CommentTarget::Diff(_)));
+    assert_eq!(child.target, CommentTarget::Reply(parent.clone()));
     assert!(
-        !read
-            .comments
+        read.comments
             .iter()
-            .any(|comment| matches!(comment.content.body.as_str(), "Current range" | "Reply"))
+            .filter(|comment| comment.content.id != parent && comment.content.id != reply)
+            .all(|comment| !comment.draft)
     );
+    assert_eq!(mapped(&backend, "review_member:303", "201"), parent.0);
+    assert_eq!(mapped(&backend, "review_member:303", "202"), reply.0);
+    assert_eq!(read.reactions.len(), 2);
     assert!(
-        !backend
-            .mappings
+        read.reactions
             .iter()
-            .any(|mapping| mapping.resource == "review_comment"
-                && matches!(mapping.remote_id.as_str(), "201" | "202"))
+            .any(|reaction| reaction.comment == parent)
     );
-    assert_eq!(read.reactions.len(), 1);
+    assert!(store.batch_ids(&id).unwrap().is_empty());
     assert!(read.reviews.iter().any(|review| matches!(
         review.state,
         ReadReviewState::Inactive {
@@ -780,6 +820,48 @@ fn private_pending_comments_never_become_fetched_comments_or_checklist_reactions
             ..
         }
     )));
+
+    let mut snapshot = fake.read("snapshot");
+    snapshot["data"]["repository"]["pullRequest"]["reviews"]["nodes"][2]["state"] =
+        json!("COMMENTED");
+    fake.write("snapshot", snapshot);
+    let mut thread_page = fake.read("thread_next");
+    thread_page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"]["nodes"]
+        [0]["state"] = json!("SUBMITTED");
+    fake.write("thread_next", thread_page);
+    let mut comment_page = fake.read("comment_next");
+    comment_page["data"]["node"]["comments"]["nodes"][0]["state"] = json!("SUBMITTED");
+    fake.write("comment_next", comment_page);
+    let submitted = fetched_id(fake.fetch(URL, None));
+    assert_ne!(submitted, id);
+    let after = store.get_review(&submitted).unwrap().unwrap().read;
+    let after_backend = store.review_backend(&submitted).unwrap().unwrap();
+    for (before, remote) in [(root, "201"), (child, "202")] {
+        let current = after
+            .comments
+            .iter()
+            .find(|comment| comment.content.id == before.content.id)
+            .unwrap();
+        assert!(!current.draft);
+        assert_eq!(current.content, before.content);
+        assert_eq!(current.target, before.target);
+        assert_eq!(
+            mapped(&after_backend, "review_member:303", remote),
+            before.content.id.0
+        );
+    }
+    assert_eq!(store.get_review(&id).unwrap().unwrap().read, read);
+    assert!(store.batch_ids(&submitted).unwrap().is_empty());
+}
+
+#[test]
+fn old_read_comments_default_to_submitted() {
+    let comment: ReadComment = serde_json::from_value(json!({
+        "id":"legacy-comment", "body":"Existing snapshot", "author":null,
+        "target":{"kind":"pull_request"}
+    }))
+    .unwrap();
+    assert!(!comment.draft);
 }
 
 #[test]

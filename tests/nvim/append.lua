@@ -42,9 +42,12 @@ local function row(needle)
   end
   error('Missing row: ' .. needle .. '\n' .. text())
 end
-local function footer()
+local function reader_end()
   local lines = api.nvim_buf_get_lines(0, 0, -1, false)
-  assert(lines[#lines - 1] == '-----------------------------' and lines[#lines] == '', 'reader append footer missing')
+  assert(lines[#lines] == '', 'reader trailing spacing missing')
+  local last_content = #lines
+  while last_content > 0 and lines[last_content] == '' do last_content = last_content - 1 end
+  assert(lines[last_content] ~= '-----------------------------', 'reader has trailing append divider')
   assert(vim.bo.readonly and not vim.bo.modifiable, 'append made reader text editable')
   return #lines
 end
@@ -61,7 +64,7 @@ local function location(line, empty)
     assert(kind() == 'diff' and api.nvim_get_current_buf() == origin and api.nvim_get_current_win() == window, 'empty diff Enter opened UI or composer')
   else
     assert(kind() == 'threads', 'diff Enter skipped existing location list')
-    footer()
+    reader_end()
   end
 end
 local function refreshed(snapshot)
@@ -76,7 +79,7 @@ local function draft(body)
 end
 local function append(body, reader, window)
   local comparison = kind() == 'diff'
-  if not comparison then api.nvim_win_set_cursor(0, { footer(), 0 }) end
+  if not comparison then api.nvim_win_set_cursor(0, { reader_end(), 0 }) end
   input('a' .. body .. '<Esc>')
   assert(kind() == 'composer', 'a did not open composer: ' .. vim.inspect(notices))
   if comparison then
@@ -94,7 +97,7 @@ local function append(body, reader, window)
   input(':wq<CR>')
   wait(function() return api.nvim_get_current_buf() == reader end, 'wq did not return to original reader')
   assert(api.nvim_get_current_win() == window, 'wq closed append reader pane')
-  if not comparison then footer() end
+  if not comparison then reader_end() end
 end
 
 write(initial)
@@ -108,7 +111,7 @@ local list, window = api.nvim_get_current_buf(), api.nvim_get_current_win()
 assert(#state().comments == 0, 'empty location entry created a comment')
 append('First root on line one', list, window)
 local first = draft('First root on line one')
-assert(first.comment.comment.target.target.range.start.line == 1 and first.destination == 'standalone', 'append root lost captured line/destination')
+assert(first.comment.comment.target.target.range.start.line == 1 and first.destination == 'review', 'append root lost captured line/destination')
 assert(kind() == 'diff', 'new diff root did not return comparison')
 location(1)
 assert(kind() == 'threads' and text():find('First root on line one', 1, true), 'one-root location bypassed list')
@@ -148,8 +151,14 @@ wait(function() return api.nvim_get_current_buf() == list and text():find('Saved
 row('First root on line one'); input('<CR>')
 assert(kind() == 'thread', 'location Enter did not open conversation')
 local conversation = api.nvim_get_current_buf()
+assert(not vim.tbl_contains(api.nvim_buf_get_lines(0, 0, -1, false), '-----------------------------'), 'single-comment conversation has divider')
 append('Reply to myself', conversation, window)
 assert(draft('Reply to myself').comment.comment.target.target == first.comment.comment.id, 'conversation append edited self instead of replying to root')
+local dividers = {}
+for line, value in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
+  if value == '-----------------------------' then dividers[#dividers + 1] = line end
+end
+assert(#dividers == 1 and row('First root on line one') < dividers[1] and dividers[1] < row('Reply to myself'), 'conversation divider is not between its two comments')
 row('Reply to myself')
 input('<CR>')
 assert(kind() == 'composer' and require('buf_review.editor').get().comment == draft('Reply to myself').comment.comment.id, 'conversation Enter stopped editing owned comment')

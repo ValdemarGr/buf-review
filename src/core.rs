@@ -478,25 +478,48 @@ pub fn prepare(
             }
         }
     }
-    if desired.state.conclusion != delivered.state.conclusion
-        && let Some(conclusion) = desired.state.conclusion
-    {
-        operations.push(operation(
-            batch,
-            Change::SetReviewConclusion { conclusion },
-        )?);
+    if let Some(conclusion) = desired.state.conclusion {
+        let conclusion = operation(batch, Change::SetReviewConclusion { conclusion })?;
+        if !completed.iter().any(|previous| previous == &conclusion) {
+            operations.push(conclusion);
+        }
     }
     Ok(CommitState { operations })
 }
 
-fn operation(batch: &Batch, change: Change) -> Result<Operation, CoreError> {
-    let source = batch
+/// Preserve the order of surviving local intent, with review submission last.
+pub fn prepare_ordered(
+    review: &Review,
+    batch: &Batch,
+    completed: &[Operation],
+) -> Result<CommitState, CoreError> {
+    let mut ordered = prepare(review, batch, completed)?
+        .operations
+        .into_iter()
+        .map(|operation| Ok((operation_source(batch, &operation.change)?, operation)))
+        .collect::<Result<Vec<_>, CoreError>>()?;
+    ordered.sort_by_key(|(source, operation)| {
+        (
+            matches!(operation.change, Change::SetReviewConclusion { .. }),
+            *source,
+        )
+    });
+    Ok(CommitState {
+        operations: ordered
+            .into_iter()
+            .map(|(_, operation)| operation)
+            .collect(),
+    })
+}
+
+pub(crate) fn operation_source(batch: &Batch, change: &Change) -> Result<usize, CoreError> {
+    batch
         .write
         .events
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, event)| match (&change, event) {
+        .find(|(_, event)| match (change, event) {
             (Change::CreateComment { comment }, Event::CreateComment { comment: candidate }) => {
                 comment.content.id == candidate.content.id
             }
@@ -535,7 +558,11 @@ fn operation(batch: &Batch, change: Change) -> Result<Operation, CoreError> {
             _ => false,
         })
         .map(|(index, _)| index + 1)
-        .ok_or_else(|| CoreError::Invalid("processed write has no source event".into()))?;
+        .ok_or_else(|| CoreError::Invalid("processed write has no source event".into()))
+}
+
+fn operation(batch: &Batch, change: Change) -> Result<Operation, CoreError> {
+    let source = operation_source(batch, &change)?;
     let kind = match &change {
         Change::CreateComment { .. } => "create_comment",
         Change::EditComment { .. } => "edit_comment",

@@ -139,7 +139,7 @@ for _, destination in ipairs({ 'standalone', 'review' }) do
   end, 'contextual u did not cancel real ' .. destination .. ' creation')
 end
 
--- Real backend blank writes: no object, local removal, then fetched staged deletion.
+-- Real backend blank writes: no object, local removal and same-ID restoration.
 home()
 api.nvim_win_set_cursor(0, { 1, 0 })
 vim.cmd('Review comment standalone')
@@ -182,147 +182,61 @@ for _, close_after in ipairs({ false, true }) do
     wait(function() return kind() ~= 'composer' end, 'restored real draft blank :wq did not close')
   end
 end
-home()
-for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
-  if text:find('Owned fetched feedback', 1, true) then api.nvim_win_set_cursor(0, { line, 0 }); break end
-end
-require('buf_review').enter()
-wait(function() return kind() == 'thread' end, 'owned fetched comment thread missing')
-for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
-  if text == 'Owned fetched feedback' then api.nvim_win_set_cursor(0, { line, 0 }); break end
-end
-input('dd')
-local dd_staged = false
-for _, row in ipairs(active().comments) do
-  if row.comment.comment.id == 'own-root' then dd_staged = row.pending_delete end
-end
-assert(dd_staged, 'real thread-body dd failed to stage deletion')
-wait(function() return table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('pending deletion', 1, true) end, 'real dd response was not rendered')
-api.nvim_win_set_cursor(0, { 2, 0 })
-input('u')
-wait(function()
-  for _, row in ipairs(active().comments) do if row.comment.comment.id == 'own-root' then return not row.pending_delete end end
-end, 'real dd deletion did not restore')
-vim.cmd('Review edit')
-api.nvim_buf_set_lines(0, 0, -1, false, { ' \t ' })
-local before_external_delete = active()
-local external_before_delete = vim.system({ vim.g.buf_review_executable, 'workspace' }, {
-  stdin = vim.json.encode({ op = 'actions', workspace = before_external_delete.id, generation = before_external_delete.generation, actions = { { action = 'save', comment = 'own-root', body = 'Externally updated owned feedback' } } }), text = true,
-}):wait()
-assert(external_before_delete.code == 0, external_before_delete.stderr)
-local blank_saved, blank_error = pcall(vim.cmd, 'write')
-assert(not blank_saved and blank_error:find('saved content changed', 1, true) and vim.bo.modified and api.nvim_get_current_line() == ' \t ', 'stale blank save deleted changed comment or lost whitespace')
-for _, row in ipairs(active().comments) do
-  if row.comment.comment.id == 'own-root' then assert(not row.pending_delete and row.comment.comment.body == 'Externally updated owned feedback') end
-end
-input(':q!<CR>')
-home()
-for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
-  if text:find('Externally updated owned feedback', 1, true) then api.nvim_win_set_cursor(0, { line, 0 }); break end
-end
-require('buf_review').enter()
-wait(function() return kind() == 'thread' end, 'updated owned fetched comment thread missing')
-vim.cmd('Review edit')
-input('cc <Tab> <Esc>')
-vim.cmd('write')
-assert(not vim.bo.modified)
-local staged = false
-for _, row in ipairs(active().comments) do
-  if row.comment.comment.id == 'own-root' then staged = row.pending_delete and row.comment.comment.body == 'Owned fetched feedback' end
-end
-assert(staged, 'real fetched blank write failed to stage deletion with original body')
-local deletion_generation = active().generation
-vim.cmd('write')
-assert(active().generation == deletion_generation, 'repeat fetched blank write changed real workspace')
-input('u')
-assert(api.nvim_get_current_line() == 'Externally updated owned feedback', 'real fetched undo did not recover original body')
-vim.cmd('write')
-for _, row in ipairs(active().comments) do
-  if row.comment.comment.id == 'own-root' then assert(not row.pending_delete and row.comment.comment.body == 'Externally updated owned feedback') end
-end
-api.nvim_buf_set_lines(0, 0, -1, false, { 'Typed real fetched body after deletion' })
-vim.cmd('write')
-assert(require('buf_review.editor').get().comment == 'own-root')
-api.nvim_buf_set_lines(0, 0, -1, false, { ' ' })
-input(':wq<CR>')
-wait(function() return kind() ~= 'composer' end, 'restored fetched blank :wq did not close')
-home()
-local deletion_visible = false
-local in_pending = false
-for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
-  if text:find('Unpublished changes', 1, true) then in_pending = true end
-  if text:find('Unviewed files', 1, true) then in_pending = false end
-  if in_pending and text:find('pending deletion', 1, true) then
-    deletion_visible = api.nvim_buf_get_lines(0, line, line + 1, false)[1]:find('Owned fetched feedback', 1, true) ~= nil
-    break
+-- Fetched comments and confirmed receipts are immutable through UI and RPC.
+for _, identity in ipairs({ 'own-root', assert(vim.env.BUF_REVIEW_RECEIPT_COMMENT) }) do
+  home()
+  local snapshot, published = active()
+  for _, row in ipairs(snapshot.comments) do if row.comment.comment.id == identity then published = row end end
+  assert(published and not published.destination and not published.pending_delete, 'published fixture missing or still mutable')
+  if published.fetched then
+    for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
+      if text:find(published.comment.comment.body, 1, true) then api.nvim_win_set_cursor(0, { line, 0 }); break end
+    end
+    require('buf_review').enter()
+    wait(function() return kind() == 'thread' end, 'published comment thread missing')
+    for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
+      if text == published.comment.comment.body then api.nvim_win_set_cursor(0, { line, 0 }); break end
+    end
+    input('<CR>')
+    assert(kind() == 'thread' and vim.bo.readonly and not require('buf_review.editor').get(), 'owned published Enter opened editor')
+    vim.cmd('Review edit'); vim.cmd('Review delete')
+    assert(kind() == 'thread' and notices[#notices]:find('immutable', 1, true), 'explicit published mutation opened composer or hid validation')
+    local before_operator = #notices
+    input('dd')
+    wait(function() return #notices > before_operator and notices[#notices]:find('immutable', 1, true) end, 'published delete operator bypassed core immutability')
+  end
+  for _, action in ipairs({
+    { action = 'save', comment = identity, body = 'Attempted published edit' },
+    { action = 'save', comment = identity, body = ' \t ' },
+    { action = 'delete', comment = identity },
+    { action = 'move', comments = { identity } },
+  }) do
+    local current = active()
+    local result = vim.system({ vim.g.buf_review_executable, 'workspace' }, {
+      stdin = vim.json.encode({ op = 'actions', workspace = current.id, generation = current.generation, actions = { action } }), text = true,
+    }):wait()
+    assert(result.code == 0, result.stderr)
+    local response = vim.json.decode(result.stdout)
+    assert(response.error and response.error:find('immutable', 1, true) and response.applied == 0,
+      'published action accepted edit/deletion/move: ' .. vim.inspect(response))
+    assert(active().generation == current.generation, 'rejected published action changed generation')
+  end
+  local unchanged = false
+  for _, row in ipairs(active().comments) do
+    if row.comment.comment.id == identity then unchanged = vim.deep_equal(row, published) end
+  end
+  assert(unchanged, 'published validation changed identity, body, anchor, destination or deletion state')
+  if not published.fetched then
+    local current = active()
+    local result = vim.system({ vim.g.buf_review_executable, 'workspace' }, {
+      stdin = vim.json.encode({ op = 'actions', workspace = current.id, generation = current.generation,
+        actions = { { action = 'undo', comments = { identity } } } }), text = true,
+    }):wait()
+    assert(result.code == 0 and vim.json.decode(result.stdout).error, 'undo cancelled confirmed unfetched creation')
+    assert(active().generation == current.generation, 'rejected unfetched undo changed generation')
+    assert(not vim.tbl_contains(active().todo, identity) and not vim.tbl_contains(active().done, identity), 'confirmed receipt entered checklist')
   end
 end
-assert(deletion_visible, 'real fetched staged deletion missing from Unpublished changes')
-
--- Confirmed-but-unfetched comments are published resources, including while deleted.
-local receipt_id = assert(vim.env.BUF_REVIEW_RECEIPT_COMMENT)
-local before_receipt_edit = active()
-local receipt_edit = vim.system({ vim.g.buf_review_executable, 'workspace' }, {
-  stdin = vim.json.encode({ op = 'actions', workspace = before_receipt_edit.id, generation = before_receipt_edit.generation, actions = { { action = 'save', comment = receipt_id, body = 'Confirmed receipt ready for deletion' } } }), text = true,
-}):wait()
-assert(receipt_edit.code == 0, receipt_edit.stderr)
-home()
-for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
-  if text:find('Confirmed receipt ready for deletion', 1, true) then api.nvim_win_set_cursor(0, { line, 0 }); break end
-end
-require('buf_review').enter()
-wait(function() return kind() == 'thread' end, 'confirmed receipt did not open discussion')
-vim.cmd('Review edit')
-input('cc <Tab> <Esc>')
-vim.cmd('write')
-local receipt_deleted = false
-for _, row in ipairs(active().comments) do
-  if row.comment.comment.id == receipt_id then receipt_deleted = row.pending_delete and not row.fetched end
-end
-assert(receipt_deleted, 'confirmed unfetched deletion disappeared from workspace View')
-input('u')
-assert(api.nvim_get_current_line() == 'Confirmed receipt ready for deletion')
-vim.cmd('write')
-assert(require('buf_review.editor').get().comment == receipt_id)
-for _, row in ipairs(active().comments) do
-  if row.comment.comment.id == receipt_id then assert(not row.pending_delete and row.comment.comment.body == 'Confirmed receipt ready for deletion') end
-end
-api.nvim_buf_set_lines(0, 0, -1, false, { ' ' })
-input(':wq<CR>')
-wait(function() return kind() ~= 'composer' end, 'confirmed receipt blank :wq did not close')
-home()
-local receipt_visible = false
-in_pending = false
-for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
-  if text:find('Unpublished changes', 1, true) then in_pending = true end
-  if text:find('Unviewed files', 1, true) then in_pending = false end
-  if in_pending and text:find('pending deletion', 1, true) then
-    local preview = api.nvim_buf_get_lines(0, line, line + 1, false)[1] or ''
-    if preview:find('Confirmed', 1, true) then receipt_visible = true end
-  end
-end
-assert(receipt_visible, 'confirmed receipt deletion missing from Unpublished changes')
-assert(not vim.tbl_contains(active().todo, receipt_id) and not vim.tbl_contains(active().done, receipt_id), 'confirmed unfetched deletion entered fetched-only checklist')
-for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
-  if text:find('Confirmed comment before refetch', 1, true) then api.nvim_win_set_cursor(0, { line, 0 }); break end
-end
-input('u')
-wait(function()
-  for _, row in ipairs(active().comments) do if row.comment.comment.id == receipt_id then return not row.pending_delete and not row.fetched end end
-end, 'u did not restore confirmed unfetched comment')
-local before_unfetched_reverse = active()
-local notices_before_reverse = #notices
-input('u')
-wait(function() return #notices > notices_before_reverse and notices[#notices]:find('only for fetched comments', 1, true) end, 'unfetched reverse did not report backend validation')
-local after_unfetched_reverse = active()
-assert(after_unfetched_reverse.generation == before_unfetched_reverse.generation, 'u cancelled confirmed unfetched creation')
-local confirmed_present = false
-for _, row in ipairs(after_unfetched_reverse.comments) do if row.comment.comment.id == receipt_id then confirmed_present = true end end
-assert(confirmed_present, 'u removed published receipt from real workspace')
-input('dd')
-wait(function()
-  for _, row in ipairs(active().comments) do if row.comment.comment.id == receipt_id then return row.pending_delete end end
-end, 'restored confirmed unfetched comment could not be deleted again')
 
 -- Exercise direct diff append against the actual Rust/SQLite protocol.
 home()

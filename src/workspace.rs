@@ -60,26 +60,6 @@ pub struct PublicationAttempt {
     pub provider: serde_json::Value,
 }
 
-impl PublicationAttempt {
-    fn suspend(&mut self) {
-        self.uncertain = true;
-        let inflight = self
-            .provider
-            .get("inflight")
-            .and_then(serde_json::Value::as_str);
-        if let Some(inflight) = inflight {
-            self.operations.retain(|operation| {
-                (self.destination == Destination::Review
-                    && matches!(
-                        operation.change,
-                        Event::CreateComment { .. } | Event::SetReviewConclusion { .. }
-                    ))
-                    || inflight == format!("operation {}", operation.id)
-            });
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: String,
@@ -115,6 +95,8 @@ pub struct Workspace {
 pub struct CommentView {
     pub comment: ProjectedComment,
     pub fetched: bool,
+    #[serde(default)]
+    pub draft: bool,
     pub done: bool,
     pub destination: Option<Destination>,
     pub pending_delete: bool,
@@ -186,6 +168,13 @@ pub enum Action {
     },
     Summary {
         conclusion: ReviewConclusion,
+    },
+    PublishReview {
+        conclusion: Option<ReviewConclusion>,
+    },
+    #[serde(rename = "move")]
+    MoveToReview {
+        comments: Vec<CommentId>,
     },
     CompareLatest,
     Relocate {
@@ -318,11 +307,18 @@ impl Workspace {
     }
 
     pub fn pending(&self) -> Result<CommitState, WorkspaceError> {
-        Ok(core::prepare(
-            &self.projection_review(),
-            &self.batch,
-            &self.completed,
-        )?)
+        let mut plan =
+            core::prepare_ordered(&self.projection_review(), &self.batch, &self.completed)?;
+        if self
+            .wip
+            .as_ref()
+            .and_then(|wip| wip.conclusion.as_ref())
+            .is_none()
+        {
+            plan.operations
+                .retain(|operation| !matches!(operation.change, Event::SetReviewConclusion { .. }));
+        }
+        Ok(plan)
     }
 
     fn attempts(&self) -> impl Iterator<Item = &PublicationAttempt> {
@@ -331,7 +327,12 @@ impl Workspace {
 
     fn frozen_wip(&self) -> bool {
         self.attempts().any(|attempt| {
-            attempt.destination == Destination::Review
+            (attempt.uncertain
+                || self
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|active| active.id == attempt.id))
+                && attempt.destination == Destination::Review
                 && self
                     .wip
                     .as_ref()
@@ -399,7 +400,7 @@ impl Workspace {
     }
 
     fn is_delivered(&self, id: &CommentId) -> bool {
-        self.review.read.comments.iter().any(|c| &c.content.id == id) || self.completed.iter().any(|op| matches!(&op.change, Event::CreateComment {comment} if &comment.content.id == id))
+        self.review.read.comments.iter().any(|c| &c.content.id == id) || self.completed.iter().chain(self.results.iter().map(|result| &result.operation)).any(|op| matches!(&op.change, Event::CreateComment {comment} if &comment.content.id == id))
     }
 
     /// Receipts remain authoritative after their effects enter a newer baseline.
@@ -418,7 +419,8 @@ impl Workspace {
             self.ensure_wip_mutable()?;
         }
         if self.attempts().any(|attempt| {
-            attempt.destination == Destination::Review && attempt.operations.iter().any(|op| {
+            (attempt.uncertain || self.attempt.as_ref().is_some_and(|active| active.id == attempt.id))
+            && attempt.destination == Destination::Review && attempt.operations.iter().any(|op| {
                 !self.has_result(&op.id)
                     && matches!(&op.change,Event::CreateComment{comment} if &comment.content.id==id)
             })
@@ -428,16 +430,32 @@ impl Workspace {
             ));
         }
         if self.suspended_attempts.iter().any(|attempt| {
-            attempt
-                .operations
-                .iter()
-                .any(|op| !self.has_result(&op.id) && operation_comment(&op.change) == Some(id))
+            attempt.uncertain
+                && attempt
+                    .operations
+                    .iter()
+                    .any(|op| !self.has_result(&op.id) && operation_comment(&op.change) == Some(id))
         }) {
             return Err(WorkspaceError::Invalid(
                 "comment has an uncertain publication result; reconcile it before editing".into(),
             ));
         }
         Ok(())
+    }
+
+    fn unsent_comment(&self, id: &CommentId) -> Result<(), WorkspaceError> {
+        if self.is_delivered(id)
+            || self
+                .attempts()
+                .map(|attempt| &attempt.provider)
+                .chain(std::iter::once(&self.preparation))
+                .any(|provider| prepared_comment(provider, id))
+        {
+            return Err(WorkspaceError::Invalid(
+                "published comments are immutable; create a new comment or reply".into(),
+            ));
+        }
+        self.comment_mutable(id)
     }
 
     pub fn apply(&mut self, action: Action) -> Result<(), WorkspaceError> {
@@ -609,9 +627,9 @@ impl Workspace {
                 target,
                 destination,
             } => {
+                self.unsent_comment(&id)?;
                 if body.trim().is_empty() {
                     // An explicit delete is repeatable; a stale composer save still needs its comment.
-                    self.comment_mutable(&id)?;
                     self.find(&id)?;
                     return self.apply_inner(Action::Delete { comment: id });
                 }
@@ -626,7 +644,6 @@ impl Workspace {
                         comment: id.clone(),
                     })?;
                 }
-                self.comment_mutable(&id)?;
                 if let Some(destination) = destination {
                     let current = if self.is_delivered(&id) {
                         Destination::Standalone
@@ -679,12 +696,7 @@ impl Workspace {
                 let mut target = target.ok_or_else(|| {
                     WorkspaceError::Invalid("new comment needs an explicit target".into())
                 })?;
-                let mut style =
-                    destination.unwrap_or(if self.wip.as_ref().is_some_and(|w| w.active) {
-                        Destination::Review
-                    } else {
-                        Destination::Standalone
-                    });
+                let mut style = Destination::Review;
                 match &target {
                     CommentTarget::PullRequest => {
                         if destination == Some(Destination::Review) {
@@ -758,13 +770,60 @@ impl Workspace {
                 self.destinations.insert(id.clone(), style);
                 self.saved_comment = Some(id);
             }
+            Action::MoveToReview { comments } => {
+                self.ensure_wip_mutable()?;
+                let selected = comments.into_iter().collect::<BTreeSet<_>>();
+                if selected.is_empty() {
+                    return Err(WorkspaceError::Invalid(
+                        "select unsent local inline drafts to move".into(),
+                    ));
+                }
+                for id in &selected {
+                    self.unsent_comment(id)?;
+                    let item = self.owned(id)?;
+                    if !matches!(
+                        item,
+                        ProjectedComment::Draft(DraftComment {
+                            target: CommentTarget::Diff(_) | CommentTarget::Reply(_),
+                            ..
+                        })
+                    ) {
+                        return Err(WorkspaceError::Invalid(
+                            "only unsent local inline drafts can move into the review".into(),
+                        ));
+                    }
+                }
+                for item in &self.projected()?.comments {
+                    let Some(parent) = parent(item) else { continue };
+                    let id = &item.content().id;
+                    let parent_moving = selected.contains(parent);
+                    let child_moving = selected.contains(id);
+                    if (child_moving
+                        && !parent_moving
+                        && !self.is_delivered(parent)
+                        && self.destinations.get(parent) != Some(&Destination::Review))
+                        || (parent_moving
+                            && !child_moving
+                            && !self.is_delivered(id)
+                            && self.destinations.get(id) != Some(&Destination::Review))
+                    {
+                        return Err(WorkspaceError::Invalid(
+                            "move unpublished parents and replies together".into(),
+                        ));
+                    }
+                }
+                self.wip();
+                for id in selected {
+                    self.destinations.insert(id, Destination::Review);
+                }
+            }
             Action::DeleteComments { comments } => {
                 for action in self.delete_actions(comments)? {
                     self.apply_inner(action)?;
                 }
             }
             Action::Delete { comment } => {
-                self.comment_mutable(&comment)?;
+                self.unsent_comment(&comment)?;
                 if self.summary_comments.contains(&comment) {
                     return Err(WorkspaceError::Invalid(
                         "submitted review summaries cannot be deleted".into(),
@@ -875,7 +934,7 @@ impl Workspace {
                     .read
                     .comments
                     .iter()
-                    .any(|c| c.content.id == comment)
+                    .any(|c| c.content.id == comment && !c.draft)
                 {
                     return Err(WorkspaceError::Invalid(
                         "progress is available only for fetched comments".into(),
@@ -896,10 +955,19 @@ impl Workspace {
                 }
             }
             Action::Summary { conclusion } => {
+                self.apply_inner(Action::PublishReview {
+                    conclusion: Some(conclusion),
+                })?;
+            }
+            Action::PublishReview { conclusion } => {
                 self.ensure_wip_mutable()?;
-                if self.wip().conclusion.as_ref() != Some(&conclusion) {
-                    self.wip().conclusion = Some(conclusion.clone());
-                    self.append(Event::SetReviewConclusion { conclusion })?;
+                if let Some(conclusion) = conclusion {
+                    if self.wip().conclusion.as_ref() != Some(&conclusion) {
+                        self.wip().conclusion = Some(conclusion.clone());
+                        self.append(Event::SetReviewConclusion { conclusion })?;
+                    }
+                } else if let Some(wip) = &mut self.wip {
+                    wip.conclusion = None;
                 }
             }
             Action::CompareLatest => {
@@ -914,7 +982,7 @@ impl Workspace {
                 self.completed.retain(|op|!matches!(&op.change,Event::SetFileViewed{path,..} if !paths.contains(path.as_str())));
             }
             Action::Relocate { comment, location } => {
-                self.comment_mutable(&comment)?;
+                self.unsent_comment(&comment)?;
                 if self.is_delivered(&comment) {
                     return Err(WorkspaceError::Invalid(
                         "only unpublished root drafts can be relocated".into(),
@@ -1024,7 +1092,55 @@ impl Workspace {
                     .ok_or_else(|| {
                         WorkspaceError::Invalid("suspended attempt does not exist".into())
                     })?;
-                self.attempt = Some(self.suspended_attempts.remove(index));
+                if index != 0 {
+                    return Err(WorkspaceError::Invalid(
+                        "retry the earliest failed publication before later attempts".into(),
+                    ));
+                }
+                let mut attempt = self.suspended_attempts.remove(index);
+                if !attempt.uncertain {
+                    let prepared = attempt
+                        .provider
+                        .get("prepared")
+                        .map(|value| serde_json::from_value::<Vec<OperationResult>>(value.clone()))
+                        .transpose()
+                        .map_err(|error| {
+                            WorkspaceError::Invalid(format!(
+                                "invalid saved review preparation: {error}"
+                            ))
+                        })?
+                        .unwrap_or_default();
+                    let applied = |operation: &Operation| {
+                        self.has_result(&operation.id)
+                            || prepared.iter().any(|result| result.operation == *operation)
+                    };
+                    let pending = self.pending()?;
+                    let remaining = CommitState {
+                        operations: pending
+                            .operations
+                            .into_iter()
+                            .filter(|operation| {
+                                attempt.operations.iter().any(|previous| {
+                                    !applied(previous)
+                                        && same_operation_target(
+                                            &previous.change,
+                                            &operation.change,
+                                        )
+                                })
+                            })
+                            .collect(),
+                    };
+                    self.validate_publication_plan(&remaining)?;
+                    let mut operations = attempt
+                        .operations
+                        .iter()
+                        .filter(|operation| applied(operation))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    operations.extend(remaining.operations);
+                    attempt.operations = operations;
+                }
+                self.attempt = Some(attempt);
             }
             Action::SuspendPublication => {
                 self.apply_inner(Action::FinishPublication {
@@ -1043,7 +1159,12 @@ impl Workspace {
                             .into(),
                     ));
                 }
-                let expected = self.prepare(destination)?;
+                if !self.suspended_attempts.is_empty() {
+                    return Err(WorkspaceError::Invalid(
+                        "resume the failed publication before starting another".into(),
+                    ));
+                }
+                let expected = self.publication_plan()?;
                 if expected.operations != operations {
                     return Err(WorkspaceError::Invalid(
                         "publication plan no longer matches saved workspace".into(),
@@ -1073,7 +1194,11 @@ impl Workspace {
                     ));
                 }
                 if !self.has_result(&result.operation.id) {
-                    self.completed.push(result.operation.clone());
+                    if !matches!(&result.operation.change, Event::CreateComment { comment }
+                        if self.review.read.comments.iter().any(|fetched| fetched.content.id == comment.content.id))
+                    {
+                        self.completed.push(result.operation.clone());
+                    }
                     self.results.push(result);
                 }
             }
@@ -1108,25 +1233,13 @@ impl Workspace {
                     if self.wip.is_none() {
                         self.preparation = serde_json::Value::Null;
                     }
-                    self.batch
-                        .write
-                        .events
-                        .retain(|event| !matches!(event, Event::SetReviewConclusion { .. }));
-                    self.completed
-                        .retain(|op| !matches!(op.change, Event::SetReviewConclusion { .. }));
-                    if let Some(conclusion) = self.wip.as_ref().and_then(|w| w.conclusion.clone()) {
-                        self.batch
-                            .write
-                            .events
-                            .push(Event::SetReviewConclusion { conclusion });
-                    }
-                } else if !success && !uncertain && attempt.destination == Destination::Review {
+                } else if !uncertain && attempt.destination == Destination::Review {
                     self.preparation = attempt.provider.clone();
                 }
-                if uncertain {
+                if !success || uncertain {
                     let mut attempt = self.attempt.take().unwrap();
-                    attempt.suspend();
-                    self.suspended_attempts.push(attempt);
+                    attempt.uncertain = uncertain;
+                    self.suspended_attempts.insert(0, attempt);
                 } else {
                     self.attempt = None;
                 }
@@ -1265,6 +1378,87 @@ impl Workspace {
             });
         }
         Ok(CommitState { operations })
+    }
+
+    /// Select every surviving local operation without skipping blocked intent.
+    pub fn publication_plan(&self) -> Result<CommitState, WorkspaceError> {
+        let plan = self.pending()?;
+        self.validate_publication_plan(&plan)?;
+        Ok(plan)
+    }
+
+    fn validate_publication_plan(&self, plan: &CommitState) -> Result<(), WorkspaceError> {
+        for operation in &plan.operations {
+            if let Event::CreateComment {
+                comment:
+                    DraftComment {
+                        content,
+                        target: CommentTarget::Diff(_) | CommentTarget::Reply(_),
+                        ..
+                    },
+            } = &operation.change
+                && self.destinations.get(&content.id) != Some(&Destination::Review)
+            {
+                return Err(WorkspaceError::Invalid(format!(
+                    "standalone inline draft {} requires explicit adoption with :Review move before publication",
+                    content.id.0
+                )));
+            }
+            if let Some(id) = operation_comment(&operation.change) {
+                let parent = match &operation.change {
+                    Event::CreateComment {
+                        comment:
+                            DraftComment {
+                                target: CommentTarget::Reply(parent),
+                                ..
+                            },
+                    } => Some(parent),
+                    _ => None,
+                };
+                if std::iter::once(id).chain(parent).any(|id| {
+                    self.conflicts.contains_key(id) || self.rejected_anchors.contains_key(id)
+                }) {
+                    return Err(WorkspaceError::Invalid(format!(
+                        "publication requires conflict or anchor resolution for {}",
+                        id.0
+                    )));
+                }
+            }
+            if self
+                .suspended_attempts
+                .iter()
+                .filter(|attempt| attempt.uncertain)
+                .any(|attempt| {
+                    attempt.operations.iter().any(|blocked| {
+                        !self.has_result(&blocked.id)
+                            && (blocked.id == operation.id
+                                || operation_comment(&blocked.change).is_some_and(|id| {
+                                    operation_comment(&operation.change) == Some(id)
+                                })
+                                || progress_key(&blocked.change).is_some_and(|key| {
+                                    progress_key(&operation.change) == Some(key)
+                                }))
+                    })
+                })
+            {
+                return Err(WorkspaceError::Invalid(
+                    "reconcile the uncertain publication before publishing its pending operations"
+                        .into(),
+                ));
+            }
+            if let Event::SetReviewConclusion { conclusion } = &operation.change
+                && conclusion.outcome != ReviewOutcome::Approve
+                && conclusion
+                    .body
+                    .as_ref()
+                    .is_none_or(|body| body.trim().is_empty())
+            {
+                return Err(WorkspaceError::Invalid(
+                    "Comment and Request changes require a nonblank summary".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn view(&self) -> Result<View, WorkspaceError> {
@@ -1442,6 +1636,26 @@ impl Workspace {
                 };
                 CommentView {
                     fetched,
+                    draft: match &comment {
+                        ProjectedComment::Read(comment) => comment.draft,
+                        ProjectedComment::Draft(_) => {
+                            !self.is_delivered(id)
+                                || self
+                                    .attempts()
+                                    .map(|attempt| &attempt.provider)
+                                    .chain(std::iter::once(&self.preparation))
+                                    .any(|provider| {
+                                        provider
+                                            .get("submitted")
+                                            .and_then(serde_json::Value::as_bool)
+                                            != Some(true)
+                                            && provider
+                                                .get("pending")
+                                                .is_some_and(|pending| !pending.is_null())
+                                            && prepared_comment(provider, id)
+                                    })
+                        }
+                    },
                     done,
                     destination: if !self.is_delivered(id) {
                         self.destinations.get(id).copied()
@@ -1458,12 +1672,12 @@ impl Workspace {
             .collect::<Vec<_>>();
         let todo = comments
             .iter()
-            .filter(|c| c.fetched && !c.done)
+            .filter(|c| c.fetched && !c.draft && !c.done)
             .map(|c| c.comment.content().id.clone())
             .collect();
         let done = comments
             .iter()
-            .filter(|c| c.fetched && c.done)
+            .filter(|c| c.fetched && !c.draft && c.done)
             .map(|c| c.comment.content().id.clone())
             .collect();
         let mut files = projected.files;
@@ -1653,28 +1867,15 @@ impl Workspace {
             }
             events.push(event);
         }
-        // Receipt retention and destination filtering must not replace the
-        // creation sequence already recorded in the ordered event log.
-        let creation_order = self
-            .batch
-            .write
-            .events
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| match event {
-                Event::CreateComment { comment } => Some((&comment.content.id, index)),
-                _ => None,
-            })
-            .collect::<BTreeMap<_, _>>();
-        events.sort_by_key(|event| match event {
-            Event::CreateComment { comment } => (
-                false,
-                *creation_order
-                    .get(&comment.content.id)
-                    .unwrap_or(&usize::MAX),
-            ),
-            _ => (true, 0),
+        // Preserve interleaving as well as creation chronology when rebasing intent.
+        let mut events = events
+            .into_iter()
+            .map(|event| Ok((core::operation_source(&self.batch, &event)?, event)))
+            .collect::<Result<Vec<_>, CoreError>>()?;
+        events.sort_by_key(|(source, event)| {
+            (matches!(event, Event::SetReviewConclusion { .. }), *source)
         });
+        let events = events.into_iter().map(|(_, event)| event).collect();
         self.review = review;
         self.batch = Batch {
             id: self.batch.id.clone(),
@@ -1704,6 +1905,34 @@ pub fn operation_comment(event: &Event) -> Option<&CommentId> {
 }
 fn is_thumbs_up(reaction: &str) -> bool {
     matches!(reaction, "👍" | "+1" | "THUMBS_UP")
+}
+
+fn prepared_comment(provider: &serde_json::Value, id: &CommentId) -> bool {
+    provider
+        .get("prepared")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|prepared| {
+            prepared.iter().any(|result| {
+                result
+                    .pointer("/operation/change/comment/id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(id.0.as_str())
+            })
+        })
+}
+
+fn same_operation_target(left: &Event, right: &Event) -> bool {
+    match (left, right) {
+        (Event::SetReviewConclusion { .. }, Event::SetReviewConclusion { .. }) => true,
+        (Event::DismissReview { review: left, .. }, Event::DismissReview { review: right, .. }) => {
+            left == right
+        }
+        (
+            Event::CreateComment { .. } | Event::EditComment { .. } | Event::DeleteComment { .. },
+            Event::CreateComment { .. } | Event::EditComment { .. } | Event::DeleteComment { .. },
+        ) => operation_comment(left) == operation_comment(right),
+        _ => progress_key(left).is_some_and(|key| progress_key(right) == Some(key)),
+    }
 }
 
 fn progress_key(event: &Event) -> Option<(u8, String, String)> {

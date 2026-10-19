@@ -139,6 +139,9 @@ pub struct ReadComment {
     pub content: CommentContent,
     pub author: Option<User>,
     pub target: CommentTarget<ReadDiffLocation>,
+    /// The fetched comment belongs to a pending provider review.
+    #[serde(default)]
+    pub draft: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -175,7 +175,11 @@ assert(kind() == 'threads' and #requests('actions') == before_pin_action and not
 command('')
 
 -- Rust preflights the whole selection before any mutation.
-reset({ comment('owned-preflight'), comment('foreign-preflight', 'other') })
+local owned_preflight, foreign_preflight = comment('owned-preflight'), comment('foreign-preflight', 'other')
+for _, item in ipairs({ owned_preflight, foreign_preflight }) do
+  item.comment.origin, item.fetched, item.destination = 'draft', false, 'review'
+end
+reset({ owned_preflight, foreign_preflight })
 local first = row('owned-preflight') - 1
 api.nvim_win_set_cursor(0, { first, 0 })
 local before = #requests('actions')

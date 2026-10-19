@@ -35,6 +35,7 @@ fn baseline() -> ReadState {
             viewed: false,
         }],
         comments: vec![ReadComment {
+            draft: false,
             content: CommentContent {
                 id: CommentId("remote".into()),
                 body: "original".into(),
@@ -95,11 +96,23 @@ fn apply(store: &mut Store, w: &mut Workspace, action: Action) {
     *w = store.mutate_workspace(&w.id, w.generation, action).unwrap();
 }
 
+// Persist intent written by older versions without reopening removed editing APIs.
+fn legacy_event(store: &mut Store, w: &mut Workspace, event: Event) {
+    *w = store
+        .update_workspace(&w.id, w.generation, |w| {
+            w.batch.write.events.push(event);
+            w.projected()?;
+            Ok(())
+        })
+        .unwrap();
+}
+
 #[test]
 fn same_location_threads_keep_chronology_through_receipts_refresh_and_restart() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let root = |id: &str| ReadComment {
+        draft: false,
         content: CommentContent {
             id: CommentId(id.into()),
             body: id.into(),
@@ -119,6 +132,7 @@ fn same_location_threads_keep_chronology_through_receipts_refresh_and_restart() 
         }),
     };
     let reply = |id: &str, parent: &str| ReadComment {
+        draft: false,
         target: CommentTarget::Reply(CommentId(parent.into())),
         ..root(id)
     };
@@ -227,7 +241,18 @@ fn same_location_threads_keep_chronology_through_receipts_refresh_and_restart() 
     };
     assert_eq!(ids(&w), expected);
     assert_eq!(w.view().unwrap().todo.len(), fetched.len());
-    let plan = w.prepare(Destination::Standalone).unwrap();
+    assert!(w.publication_plan().is_err());
+    apply(
+        &mut store,
+        &mut w,
+        Action::MoveToReview {
+            comments: creates
+                .iter()
+                .map(|(id, _)| CommentId((*id).into()))
+                .collect(),
+        },
+    );
+    let plan = w.publication_plan().unwrap();
     assert_eq!(
         plan.operations
             .iter()
@@ -311,6 +336,7 @@ fn same_location_threads_keep_chronology_through_receipts_refresh_and_restart() 
             CommentTarget::PullRequest => CommentTarget::PullRequest,
         };
         latest.comments.push(ReadComment {
+            draft: false,
             content: CommentContent {
                 id: CommentId(alias.clone()),
                 body: (*id).into(),
@@ -384,40 +410,23 @@ fn refresh_keeps_earlier_review_draft_before_later_delivered_unfetched_standalon
             Ok(())
         })
         .unwrap();
-    let plan = w.prepare(Destination::Standalone).unwrap();
-    assert_eq!(plan.operations.len(), 1);
-    apply(
-        &mut store,
-        &mut w,
-        Action::BeginPublication {
-            destination: Destination::Standalone,
-            operations: plan.operations.clone(),
-        },
-    );
-    apply(
-        &mut store,
-        &mut w,
-        Action::RecordResult {
-            result: OperationResult {
-                operation: plan.operations[0].clone(),
-                mappings: vec![IdMapping {
-                    resource: "review_comment".into(),
-                    core_id: expected[1].into(),
-                    remote_id: "300".into(),
-                }],
-                response: serde_json::json!({"id":300}),
-            },
-        },
-    );
-    apply(
-        &mut store,
-        &mut w,
-        Action::FinishPublication {
-            success: true,
-            uncertain: false,
-            error: None,
-        },
-    );
+    assert!(w.publication_plan().is_err());
+    let plan = w.pending().unwrap();
+    assert_eq!(plan.operations.len(), 2);
+    // Preserve a receipt produced by the former destination-selective runner.
+    store
+        .record_operation_result(
+            &w.batch.id,
+            &plan.operations[1],
+            &[IdMapping {
+                resource: "review_comment".into(),
+                core_id: expected[1].into(),
+                remote_id: "300".into(),
+            }],
+            &serde_json::json!({"id":300}),
+        )
+        .unwrap();
+    w = store.workspace(&w.id).unwrap().unwrap();
     let after = ReviewId("mixed-after".into());
     store
         .import_review(&after, &user(), &baseline(), &backend)
@@ -445,12 +454,6 @@ fn refresh_keeps_earlier_review_draft_before_later_delivered_unfetched_standalon
             .map(|c| c.comment.content().id.0.as_str())
             .collect::<Vec<_>>(),
         ["remote", expected[0], expected[1]]
-    );
-    assert!(
-        w.prepare(Destination::Standalone)
-            .unwrap()
-            .operations
-            .is_empty()
     );
     assert!(
         matches!(w.pending().unwrap().operations.as_slice(), [op] if matches!(&op.change, Event::CreateComment {comment} if comment.content.id.0==expected[0]))
@@ -573,7 +576,7 @@ fn blank_new_comment_is_noop_and_blank_saved_draft_cancels_without_relocation() 
 }
 
 #[test]
-fn blank_fetched_comment_stages_one_deletion_and_stale_blank_save_cannot_delete() {
+fn blank_fetched_comment_is_immutable_even_without_a_stale_generation() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let id = create(&mut store, "snapshot", baseline());
@@ -601,28 +604,9 @@ fn blank_fetched_comment_stages_one_deletion_and_stale_blank_save_cannot_delete(
         ))
     ));
     assert_eq!(store.workspace(&w.id).unwrap().unwrap(), before);
-    apply(&mut store, &mut w, blank.clone());
-    assert!(w.saved_comment.is_none());
-    assert_eq!(w.review.read.comments[0].content.body, "original");
-    assert!(
-        w.view()
-            .unwrap()
-            .comments
-            .iter()
-            .any(|row| row.pending_delete && row.comment.content().id.0 == "remote")
-    );
-    assert_eq!(
-        w.pending()
-            .unwrap()
-            .operations
-            .iter()
-            .filter(|operation| matches!(operation.change, Event::DeleteComment { .. }))
-            .count(),
-        1
-    );
-    let deleted = w.clone();
     assert!(store.mutate_workspace(&w.id, w.generation, blank).is_err());
-    assert_eq!(store.workspace(&w.id).unwrap().unwrap(), deleted);
+    assert_eq!(store.workspace(&w.id).unwrap().unwrap(), before);
+    assert!(!w.view().unwrap().comments[0].pending_delete);
 }
 
 #[test]
@@ -685,7 +669,7 @@ fn blank_save_reuses_delete_permissions_dependencies_conflicts_and_freezes() {
             },
         })
         .unwrap();
-    let operations = frozen.prepare(Destination::Review).unwrap().operations;
+    let operations = frozen.publication_plan().unwrap().operations;
     frozen
         .apply(Action::BeginPublication {
             destination: Destination::Review,
@@ -694,15 +678,10 @@ fn blank_save_reuses_delete_permissions_dependencies_conflicts_and_freezes() {
         .unwrap();
     cases.push((frozen, draft));
     let mut uncertain = base;
-    uncertain
-        .apply(Action::Delete {
-            comment: remote.clone(),
-        })
-        .unwrap();
-    let operations = uncertain
-        .prepare(Destination::Standalone)
-        .unwrap()
-        .operations;
+    uncertain.batch.write.events.push(Event::DeleteComment {
+        comment: remote.clone(),
+    });
+    let operations = uncertain.publication_plan().unwrap().operations;
     let operation = operations[0].id.clone();
     uncertain
         .apply(Action::BeginPublication {
@@ -748,197 +727,82 @@ fn blank_save_reuses_delete_permissions_dependencies_conflicts_and_freezes() {
 }
 
 #[test]
-fn nonblank_save_restores_unsent_deletion_atomically_with_same_identity() {
-    for origin in ["local", "fetched", "receipt"] {
-        let project = tempdir().unwrap();
-        let mut store = Store::open(project.path()).unwrap();
-        let snapshot = create(&mut store, "snapshot", baseline());
-        let mut w = store.open_workspace(&snapshot).unwrap();
-        let comment = if origin == "fetched" {
-            CommentId("remote".into())
-        } else {
-            apply(
-                &mut store,
-                &mut w,
-                save(
-                    CommentTarget::Diff(location()),
-                    Some(if origin == "local" {
-                        Destination::Review
-                    } else {
-                        Destination::Standalone
-                    }),
-                ),
-            );
-            w.saved_comment.clone().unwrap()
-        };
-        if origin == "receipt" {
-            let operations = w.prepare(Destination::Standalone).unwrap().operations;
-            apply(
-                &mut store,
-                &mut w,
-                Action::BeginPublication {
-                    destination: Destination::Standalone,
-                    operations: operations.clone(),
-                },
-            );
-            apply(
-                &mut store,
-                &mut w,
-                Action::RecordResult {
-                    result: OperationResult {
-                        operation: operations[0].clone(),
-                        mappings: vec![],
-                        response: serde_json::json!({"id":100}),
-                    },
-                },
-            );
-            apply(
-                &mut store,
-                &mut w,
-                Action::FinishPublication {
-                    success: true,
-                    uncertain: false,
-                    error: None,
-                },
-            );
-            apply(
-                &mut store,
-                &mut w,
+fn nonblank_save_restores_only_unsent_local_deletion_atomically() {
+    let project = tempdir().unwrap();
+    let mut store = Store::open(project.path()).unwrap();
+    let snapshot = create(&mut store, "snapshot", baseline());
+    let mut w = store.open_workspace(&snapshot).unwrap();
+    apply(
+        &mut store,
+        &mut w,
+        save(CommentTarget::Diff(location()), None),
+    );
+    let comment = w.saved_comment.clone().unwrap();
+    apply(
+        &mut store,
+        &mut w,
+        Action::Delete {
+            comment: comment.clone(),
+        },
+    );
+    let deleted = w.clone();
+    let deleted_batch = store.get_batch(&w.batch.id).unwrap().unwrap();
+    let mut invalid = location();
+    invalid.position.path = "absent".into();
+    assert!(
+        store
+            .mutate_workspace(
+                &w.id,
+                w.generation,
                 Action::Save {
                     comment: Some(comment.clone()),
-                    target: None,
-                    body: "latest published body".into(),
+                    target: Some(CommentTarget::Diff(invalid)),
+                    body: "must not persist".into(),
                     destination: None,
-                },
-            );
-            let operations = w.prepare(Destination::Standalone).unwrap().operations;
-            apply(
-                &mut store,
-                &mut w,
-                Action::BeginPublication {
-                    destination: Destination::Standalone,
-                    operations: operations.clone(),
-                },
-            );
-            apply(
-                &mut store,
-                &mut w,
-                Action::RecordResult {
-                    result: OperationResult {
-                        operation: operations[0].clone(),
-                        mappings: vec![],
-                        response: serde_json::json!({"id":100,"body":"latest published body"}),
-                    },
-                },
-            );
-            apply(
-                &mut store,
-                &mut w,
-                Action::FinishPublication {
-                    success: true,
-                    uncertain: false,
-                    error: None,
-                },
-            );
-        }
-        apply(
-            &mut store,
-            &mut w,
-            Action::Save {
-                comment: Some(comment.clone()),
-                target: None,
-                body: String::new(),
-                destination: None,
-            },
-        );
-        let deleted = w.clone();
-        let deleted_batch = store.get_batch(&w.batch.id).unwrap().unwrap();
-        if origin == "receipt" {
-            let view = w.view().unwrap();
-            assert!(
-                view.comments
-                    .iter()
-                    .any(|row| row.comment.content().id == comment
-                        && row.pending_delete
-                        && !row.fetched
-                        && row.comment.content().body == "latest published body")
-            );
-            assert_eq!(view.todo, vec![CommentId("remote".into())]);
-        }
-        let mut invalid = location();
-        invalid.position.path = "absent".into();
-        assert!(
-            store
-                .mutate_workspace(
-                    &w.id,
-                    w.generation,
-                    Action::Save {
-                        comment: Some(comment.clone()),
-                        target: Some(CommentTarget::Diff(invalid)),
-                        body: "must not persist".into(),
-                        destination: None
-                    }
-                )
-                .is_err()
-        );
-        assert_eq!(store.workspace(&w.id).unwrap().unwrap(), deleted);
-        apply(
-            &mut store,
-            &mut w,
-            Action::Save {
-                comment: Some(comment.clone()),
-                target: None,
-                body: "restored text".into(),
-                destination: None,
-            },
-        );
-        assert_eq!(w.saved_comment, Some(comment.clone()));
-        let view = w.view().unwrap();
-        let row = view
-            .comments
-            .iter()
-            .find(|row| row.comment.content().id == comment)
-            .unwrap();
-        assert!(!row.pending_delete);
-        assert_eq!(row.comment.content().body, "restored text");
-        let pending = w.pending().unwrap();
-        assert!(!pending.operations.iter().any(
-            |operation| matches!(&operation.change,Event::DeleteComment{comment:id} if *id==comment)
-        ));
-        assert!(
-            pending
-                .operations
-                .iter()
-                .any(|operation| match &operation.change {
-                    Event::CreateComment { comment: draft } =>
-                        origin == "local"
-                            && draft.content.id == comment
-                            && draft.content.body == "restored text",
-                    Event::EditComment { comment: id, body } =>
-                        origin != "local" && *id == comment && body == "restored text",
-                    _ => false,
-                })
-        );
-        if origin == "local" {
-            assert_eq!(row.destination, Some(Destination::Review));
-        }
-        assert_eq!(
-            store
-                .batch_revision(&deleted_batch.id, deleted_batch.revision.number)
-                .unwrap()
-                .unwrap(),
-            deleted_batch
-        );
-        drop(store);
-        assert_eq!(
-            Store::open(project.path())
-                .unwrap()
-                .workspace(&w.id)
-                .unwrap()
-                .unwrap(),
-            w
-        );
-    }
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(store.workspace(&w.id).unwrap().unwrap(), deleted);
+    apply(
+        &mut store,
+        &mut w,
+        Action::Save {
+            comment: Some(comment.clone()),
+            target: None,
+            body: "restored text".into(),
+            destination: None,
+        },
+    );
+    assert_eq!(w.saved_comment, Some(comment.clone()));
+    let view = w.view().unwrap();
+    let row = view
+        .comments
+        .iter()
+        .find(|row| row.comment.content().id == comment)
+        .unwrap();
+    assert!(!row.pending_delete);
+    assert_eq!(row.comment.content().body, "restored text");
+    assert_eq!(row.destination, Some(Destination::Review));
+    assert!(
+        matches!(&w.pending().unwrap().operations[..], [operation] if matches!(&operation.change,Event::CreateComment { comment:draft } if draft.content.id==comment && draft.content.body=="restored text"))
+    );
+    assert_eq!(
+        store
+            .batch_revision(&deleted_batch.id, deleted_batch.revision.number)
+            .unwrap()
+            .unwrap(),
+        deleted_batch
+    );
+    drop(store);
+    assert_eq!(
+        Store::open(project.path())
+            .unwrap()
+            .workspace(&w.id)
+            .unwrap()
+            .unwrap(),
+        w
+    );
 }
 
 #[test]
@@ -986,10 +850,9 @@ fn restoration_save_cannot_bypass_sent_uncertain_conflicted_or_foreign_deletion(
         read: baseline(),
     });
     let comment = CommentId("remote".into());
-    base.apply(Action::Delete {
+    base.batch.write.events.push(Event::DeleteComment {
         comment: comment.clone(),
-    })
-    .unwrap();
+    });
     let mut cases = vec![];
     for author in [
         None,
@@ -1014,7 +877,7 @@ fn restoration_save_cannot_bypass_sent_uncertain_conflicted_or_foreign_deletion(
         },
     );
     cases.push(conflict);
-    let operations = base.prepare(Destination::Standalone).unwrap().operations;
+    let operations = base.publication_plan().unwrap().operations;
     let mut active = base.clone();
     active
         .apply(Action::BeginPublication {
@@ -1073,7 +936,7 @@ fn restoration_save_cannot_bypass_sent_uncertain_conflicted_or_foreign_deletion(
 }
 
 #[test]
-fn restoration_save_cannot_mutate_frozen_review_or_resurrect_fetched_remote_deletion() {
+fn legacy_restoration_save_cannot_mutate_frozen_review_or_resurrect_fetched_remote_deletion() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let snapshot = create(&mut store, "snapshot", baseline());
@@ -1084,10 +947,10 @@ fn restoration_save_cannot_mutate_frozen_review_or_resurrect_fetched_remote_dele
         save(CommentTarget::Diff(location()), Some(Destination::Review)),
     );
     let draft = w.saved_comment.clone().unwrap();
-    apply(
+    legacy_event(
         &mut store,
         &mut w,
-        Action::Delete {
+        Event::DeleteComment {
             comment: draft.clone(),
         },
     );
@@ -1101,7 +964,7 @@ fn restoration_save_cannot_mutate_frozen_review_or_resurrect_fetched_remote_dele
             },
         },
     );
-    let operations = w.prepare(Destination::Review).unwrap().operations;
+    let operations = w.publication_plan().unwrap().operations;
     apply(
         &mut store,
         &mut w,
@@ -1136,10 +999,10 @@ fn restoration_save_cannot_mutate_frozen_review_or_resurrect_fetched_remote_dele
         },
     );
     let comment = CommentId("remote".into());
-    apply(
+    legacy_event(
         &mut store,
         &mut w,
-        Action::Delete {
+        Event::DeleteComment {
             comment: comment.clone(),
         },
     );
@@ -1297,17 +1160,17 @@ fn contextual_undo_resolves_current_state_and_never_revives_canceled_drafts() {
         read: baseline(),
     });
     let remote = CommentId("remote".into());
-    workspace
-        .apply(Action::Delete {
-            comment: remote.clone(),
-        })
-        .unwrap();
+    workspace.batch.write.events.push(Event::DeleteComment {
+        comment: remote.clone(),
+    });
     let deleted = workspace.clone();
-    workspace
-        .apply(Action::Delete {
-            comment: remote.clone(),
-        })
-        .unwrap();
+    assert!(
+        workspace
+            .apply(Action::Delete {
+                comment: remote.clone()
+            })
+            .is_err()
+    );
     assert_eq!(workspace, deleted);
     workspace
         .apply(Action::Undo {
@@ -1411,11 +1274,9 @@ fn contextual_undo_selection_rolls_back_when_one_restore_is_foreign() {
         reviewer: user(),
         read: baseline(),
     });
-    workspace
-        .apply(Action::Delete {
-            comment: CommentId("remote".into()),
-        })
-        .unwrap();
+    workspace.batch.write.events.push(Event::DeleteComment {
+        comment: CommentId("remote".into()),
+    });
     workspace.review.read.comments[0].author = Some(User {
         id: UserId("other".into()),
         name: "Other".into(),
@@ -1496,7 +1357,7 @@ fn grouped_deletions_resolve_prior_queued_undo_and_preflight_the_whole_selection
                     comments: vec![child],
                 },
                 Action::DeleteComments {
-                    comments: vec![root.clone(), root],
+                    comments: vec![root.clone(), root.clone()],
                 },
                 Action::Delete {
                     comment: CommentId("remote".into()),
@@ -1510,8 +1371,8 @@ fn grouped_deletions_resolve_prior_queued_undo_and_preflight_the_whole_selection
             ],
         )
         .unwrap();
-    assert_eq!(canceled.applied, 5);
-    assert!(canceled.failure.is_none());
+    assert_eq!(canceled.applied, 2);
+    assert_eq!(canceled.failure.as_ref().map(|(index, _)| *index), Some(2));
     let rows = canceled.workspace.view().unwrap().comments;
     assert_eq!(rows.len(), 2);
     assert!(
@@ -1519,15 +1380,16 @@ fn grouped_deletions_resolve_prior_queued_undo_and_preflight_the_whole_selection
             .find(|row| row.comment.content().id.0 == "remote")
             .unwrap()
             .pending_delete
+            == false
     );
     assert_eq!(
         store.workspace_log(&workspace.id).unwrap().last().unwrap()["action"],
-        serde_json::json!({"action":"delete_comments","comments":["remote"]})
+        serde_json::json!({"action":"delete_comments","comments":[root]})
     );
 }
 
 #[test]
-fn contextual_undo_keeps_execution_prefix_after_whole_selection_preflight() {
+fn contextual_undo_preserves_all_members_of_a_frozen_review() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let id = create(&mut store, "snapshot", baseline());
@@ -1555,7 +1417,7 @@ fn contextual_undo_keeps_execution_prefix_after_whole_selection_preflight() {
             },
         },
     );
-    let operations = workspace.prepare(Destination::Review).unwrap().operations;
+    let operations = workspace.publication_plan().unwrap().operations;
     apply(
         &mut store,
         &mut workspace,
@@ -1576,7 +1438,7 @@ fn contextual_undo_keeps_execution_prefix_after_whole_selection_preflight() {
         .unwrap();
     assert_eq!(result.applied, 0);
     assert_eq!(result.failure.as_ref().map(|(index, _)| *index), Some(0));
-    assert_eq!(result.workspace.generation, generation + 1);
+    assert_eq!(result.workspace.generation, generation);
     let remaining = result
         .workspace
         .view()
@@ -1585,14 +1447,10 @@ fn contextual_undo_keeps_execution_prefix_after_whole_selection_preflight() {
         .into_iter()
         .map(|row| row.comment.content().id.clone())
         .collect::<Vec<_>>();
-    assert!(!remaining.contains(&comments[0]));
+    assert!(remaining.contains(&comments[0]));
     assert!(remaining.contains(&comments[1]));
     assert!(remaining.contains(&comments[2]));
-    let log = store.workspace_log(&workspace.id).unwrap();
-    assert_eq!(
-        log.last().unwrap()["action"],
-        serde_json::json!({"action":"undo","comments":[comments[0]]})
-    );
+    assert_eq!(result.workspace, workspace);
     let persisted = store.workspace(&workspace.id).unwrap().unwrap();
     assert_eq!(persisted, result.workspace);
     assert!(persisted.completed.is_empty());
@@ -1607,35 +1465,21 @@ fn contextual_undo_keeps_execution_prefix_after_whole_selection_preflight() {
         )
         .unwrap();
     assert_eq!(canceled.applied, 0);
-    assert_eq!(canceled.workspace.generation, persisted.generation + 1);
+    assert_eq!(canceled.workspace.generation, persisted.generation);
     assert!(canceled.failure.is_some());
-    let remaining = canceled.workspace.view().unwrap().comments;
-    assert!(
-        !remaining
-            .iter()
-            .any(|row| row.comment.content().id == comments[2])
-    );
-    assert!(
-        remaining
-            .iter()
-            .any(|row| row.comment.content().id == comments[1])
-    );
-    assert_eq!(
-        store.workspace_log(&workspace.id).unwrap().last().unwrap()["action"],
-        serde_json::json!({"action":"delete_comments","comments":[comments[2]]})
-    );
+    assert_eq!(canceled.workspace, persisted);
 }
 
 #[test]
-fn delete_restore_supersedes_log_without_erasing_history() {
+fn legacy_delete_restore_supersedes_log_without_erasing_history() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let id = create(&mut store, "snapshot", baseline());
     let mut w = store.open_workspace(&id).unwrap();
-    apply(
+    legacy_event(
         &mut store,
         &mut w,
-        Action::Delete {
+        Event::DeleteComment {
             comment: CommentId("remote".into()),
         },
     );
@@ -1744,19 +1588,17 @@ fn file_stats_follow_the_pinned_comparison_across_refresh_and_reopen() {
 }
 
 #[test]
-fn refresh_changed_edit_conflicts_and_remote_resolution_preserve_snapshot_history() {
+fn legacy_refresh_changed_edit_conflicts_and_remote_resolution_preserve_snapshot_history() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let id = create(&mut store, "old", baseline());
     let mut w = store.open_workspace(&id).unwrap();
-    apply(
+    legacy_event(
         &mut store,
         &mut w,
-        Action::Save {
-            comment: Some(CommentId("remote".into())),
-            target: None,
+        Event::EditComment {
+            comment: CommentId("remote".into()),
             body: "local".into(),
-            destination: None,
         },
     );
     let mut fresh = baseline();
@@ -1776,12 +1618,7 @@ fn refresh_changed_edit_conflicts_and_remote_resolution_preserve_snapshot_histor
     assert!(view.new_commits);
     assert_eq!(view.files.len(), 1);
     assert_eq!(view.comparison.head, "head");
-    assert!(
-        w.prepare(Destination::Standalone)
-            .unwrap()
-            .operations
-            .is_empty()
-    );
+    assert!(w.publication_plan().is_err());
     apply(
         &mut store,
         &mut w,
@@ -1803,15 +1640,15 @@ fn refresh_changed_edit_conflicts_and_remote_resolution_preserve_snapshot_histor
 }
 
 #[test]
-fn changed_body_deletion_conflicts_and_missing_edit_cannot_recreate_resource() {
+fn legacy_changed_body_deletion_conflicts_and_missing_edit_cannot_recreate_resource() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let id = create(&mut store, "old", baseline());
     let mut w = store.open_workspace(&id).unwrap();
-    apply(
+    legacy_event(
         &mut store,
         &mut w,
-        Action::Delete {
+        Event::DeleteComment {
             comment: CommentId("remote".into()),
         },
     );
@@ -1829,14 +1666,12 @@ fn changed_body_deletion_conflicts_and_missing_edit_cannot_recreate_resource() {
             body: None,
         },
     );
-    apply(
+    legacy_event(
         &mut store,
         &mut w,
-        Action::Save {
-            comment: Some(CommentId("remote".into())),
-            target: None,
+        Event::EditComment {
+            comment: CommentId("remote".into()),
             body: "local".into(),
-            destination: None,
         },
     );
     let mut missing = baseline();
@@ -1910,16 +1745,13 @@ fn publication_selection_freezes_wip_and_receipts_do_not_create_todo() {
             viewed: true,
         },
     );
-    let plan = w.prepare(Destination::Review).unwrap();
-    assert_eq!(plan.operations.len(), 3);
+    let plan = w.publication_plan().unwrap();
+    assert_eq!(plan.operations.len(), 4);
     assert!(matches!(
         plan.operations.last().unwrap().change,
-        Event::SetFileViewed { .. }
+        Event::SetReviewConclusion { .. }
     ));
-    assert_eq!(
-        w.prepare(Destination::Standalone).unwrap().operations.len(),
-        2
-    );
+    assert_eq!(w.publication_plan().unwrap().operations.len(), 4);
     apply(
         &mut store,
         &mut w,
@@ -1984,7 +1816,7 @@ fn publication_selection_freezes_wip_and_receipts_do_not_create_todo() {
         },
     );
     assert!(
-        w.prepare(Destination::Review)
+        w.publication_plan()
             .unwrap()
             .operations
             .iter()
@@ -2014,7 +1846,7 @@ fn provider_id_mapping_merges_new_fetched_identity_with_local_receipt() {
         save(CommentTarget::Diff(location()), None),
     );
     let local = w.saved_comment.clone().unwrap();
-    let plan = w.prepare(Destination::Standalone).unwrap();
+    let plan = w.publication_plan().unwrap();
     apply(
         &mut store,
         &mut w,
@@ -2089,7 +1921,7 @@ fn provider_id_mapping_merges_new_fetched_identity_with_local_receipt() {
 }
 
 #[test]
-fn confirmed_failure_retains_provider_preparation_and_hides_private_remote_mirrors() {
+fn confirmed_failure_imports_pending_comments_and_preserves_preparation_receipts() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let backend = ReviewBackend {
@@ -2120,7 +1952,7 @@ fn confirmed_failure_retains_provider_preparation_and_hides_private_remote_mirro
             },
         },
     );
-    let plan = w.prepare(Destination::Review).unwrap();
+    let plan = w.publication_plan().unwrap();
     apply(
         &mut store,
         &mut w,
@@ -2138,11 +1970,13 @@ fn confirmed_failure_retains_provider_preparation_and_hides_private_remote_mirro
         }],
         response: serde_json::Value::Null,
     };
+    let prepared_operation = prepared.operation.clone();
+    let prepared_receipt = prepared.clone();
     apply(
         &mut store,
         &mut w,
         Action::SetAttemptProvider {
-            provider: serde_json::json!({"pending":{"id":12,"node_id":"node"},"prepared":[prepared],"submitted":false}),
+            provider: serde_json::json!({"pending":{"id":12,"node_id":"node","head":"head"},"prepared":[prepared],"submitted":false}),
         },
     );
     apply(
@@ -2162,6 +1996,7 @@ fn confirmed_failure_retains_provider_preparation_and_hides_private_remote_mirro
         id: CommentId("mirror".into()),
         body: "draft".into(),
     };
+    mirror.draft = true;
     fresh.comments.push(mirror);
     let next = ReviewId("fresh".into());
     let backend = ReviewBackend {
@@ -2190,18 +2025,45 @@ fn confirmed_failure_retains_provider_preparation_and_hides_private_remote_mirro
             .unwrap()
             .comments
             .iter()
-            .any(|c| !c.fetched && c.comment.content().id == local)
+            .any(|c| c.fetched && c.draft && c.comment.content().id == local)
     );
     // A suspended unknown submission uses the same private-membership rule.
-    let plan = w.prepare(Destination::Review).unwrap();
+    let attempt_id = w.suspended_attempts[0].id.clone();
+    apply(&mut store, &mut w, Action::ResumePublication { attempt_id });
+    assert!(
+        w.attempt
+            .as_ref()
+            .unwrap()
+            .operations
+            .contains(&prepared_operation)
+    );
+    // The resumed runner promotes legacy prepared evidence after the same comment was fetched.
     apply(
         &mut store,
         &mut w,
-        Action::BeginPublication {
-            destination: Destination::Review,
-            operations: plan.operations,
+        Action::RecordResult {
+            result: prepared_receipt,
         },
     );
+    assert!(w.has_result(&prepared_operation.id));
+    assert!(!w.completed.contains(&prepared_operation));
+    assert!(w.pending().is_ok());
+    let before = w.clone();
+    assert!(
+        store
+            .mutate_workspace(
+                &w.id,
+                w.generation,
+                Action::Save {
+                    comment: Some(local.clone()),
+                    target: None,
+                    body: "must remain immutable".into(),
+                    destination: None,
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(store.workspace(&w.id).unwrap().unwrap(), before);
     apply(
         &mut store,
         &mut w,
@@ -2227,7 +2089,7 @@ fn confirmed_failure_retains_provider_preparation_and_hides_private_remote_mirro
             .unwrap()
             .comments
             .iter()
-            .any(|row| !row.fetched && row.comment.content().id == local)
+            .any(|row| row.fetched && row.draft && row.comment.content().id == local)
     );
 }
 
@@ -2243,7 +2105,7 @@ fn unfetched_confirmed_creation_remains_local_until_remote_contains_it() {
         save(CommentTarget::Diff(location()), None),
     );
     let local = w.saved_comment.clone().unwrap();
-    let plan = w.prepare(Destination::Standalone).unwrap();
+    let plan = w.publication_plan().unwrap();
     apply(
         &mut store,
         &mut w,
@@ -2292,7 +2154,7 @@ fn publication_lock_is_repository_wide_and_failed_start_does_not_persist() {
     let first = create(&mut store, "first", baseline());
     let mut one = store.open_workspace(&first).unwrap();
     apply(&mut store, &mut one, save(CommentTarget::PullRequest, None));
-    let plan = one.prepare(Destination::Standalone).unwrap();
+    let plan = one.publication_plan().unwrap();
     apply(
         &mut store,
         &mut one,
@@ -2306,7 +2168,7 @@ fn publication_lock_is_repository_wide_and_failed_start_does_not_persist() {
     let second = create(&mut store, "second", second);
     let mut two = store.open_workspace(&second).unwrap();
     apply(&mut store, &mut two, save(CommentTarget::PullRequest, None));
-    let plan = two.prepare(Destination::Standalone).unwrap();
+    let plan = two.publication_plan().unwrap();
     assert!(
         store
             .mutate_workspace(
@@ -2329,7 +2191,7 @@ fn publication_lock_is_repository_wide_and_failed_start_does_not_persist() {
             error: Some("confirmed failure".into()),
         },
     );
-    let plan = two.prepare(Destination::Standalone).unwrap();
+    let plan = two.publication_plan().unwrap();
     apply(
         &mut store,
         &mut two,
@@ -2376,11 +2238,8 @@ fn rejected_anchor_blocks_its_review_and_dependents_until_explicit_relocation() 
             message: "line no longer reviewable".into(),
         },
     );
-    assert!(w.prepare(Destination::Review).is_err());
-    assert_eq!(
-        w.prepare(Destination::Standalone).unwrap().operations.len(),
-        1
-    );
+    assert!(w.publication_plan().is_err());
+    assert_eq!(w.pending().unwrap().operations.len(), 4);
     assert!(
         w.view()
             .unwrap()
@@ -2398,7 +2257,7 @@ fn rejected_anchor_blocks_its_review_and_dependents_until_explicit_relocation() 
             destination: None,
         },
     );
-    assert!(w.prepare(Destination::Review).is_err());
+    assert!(w.publication_plan().is_err());
     let mut moved = location();
     moved.position = position(4);
     apply(
@@ -2409,11 +2268,11 @@ fn rejected_anchor_blocks_its_review_and_dependents_until_explicit_relocation() 
             location: moved,
         },
     );
-    assert!(w.prepare(Destination::Review).is_ok());
+    assert!(w.publication_plan().is_ok());
 }
 
 #[test]
-fn pending_delete_retains_its_existing_done_state_until_refresh() {
+fn legacy_pending_delete_retains_its_existing_done_state_until_refresh() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let mut read = baseline();
@@ -2424,10 +2283,10 @@ fn pending_delete_retains_its_existing_done_state_until_refresh() {
     });
     let id = create(&mut store, "old", read);
     let mut w = store.open_workspace(&id).unwrap();
-    apply(
+    legacy_event(
         &mut store,
         &mut w,
-        Action::Delete {
+        Event::DeleteComment {
             comment: CommentId("remote".into()),
         },
     );
@@ -2436,7 +2295,7 @@ fn pending_delete_retains_its_existing_done_state_until_refresh() {
 }
 
 #[test]
-fn uncertain_review_freezes_only_its_members_and_unrelated_standalone_can_publish() {
+fn uncertain_review_blocks_skip_ahead_publication_until_reconciliation() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let id = create(&mut store, "old", baseline());
@@ -2457,7 +2316,7 @@ fn uncertain_review_freezes_only_its_members_and_unrelated_standalone_can_publis
             },
         },
     );
-    let plan = w.prepare(Destination::Review).unwrap();
+    let plan = w.publication_plan().unwrap();
     apply(
         &mut store,
         &mut w,
@@ -2506,46 +2365,22 @@ fn uncertain_review_freezes_only_its_members_and_unrelated_standalone_can_publis
             viewed: true,
         },
     );
-    let unrelated = w.prepare(Destination::Standalone).unwrap();
-    assert_eq!(unrelated.operations.len(), 2);
-    apply(
-        &mut store,
-        &mut w,
-        Action::BeginPublication {
-            destination: Destination::Standalone,
-            operations: unrelated.operations.clone(),
-        },
-    );
-    for operation in unrelated.operations {
-        apply(
-            &mut store,
-            &mut w,
-            Action::RecordResult {
-                result: OperationResult {
-                    operation,
-                    mappings: vec![],
-                    response: serde_json::Value::Null,
-                },
-            },
-        );
-    }
-    apply(
-        &mut store,
-        &mut w,
-        Action::FinishPublication {
-            success: true,
-            uncertain: false,
-            error: None,
-        },
-    );
-    assert_eq!(w.suspended_attempts[0].id, uncertain_id);
-    assert!(w.prepare(Destination::Review).is_err());
+    let before = w.clone();
+    assert!(w.publication_plan().is_err());
     assert!(
-        w.prepare(Destination::Standalone)
-            .unwrap()
-            .operations
-            .is_empty()
+        store
+            .mutate_workspace(
+                &w.id,
+                w.generation,
+                Action::BeginPublication {
+                    destination: Destination::Standalone,
+                    operations: w.pending().unwrap().operations,
+                }
+            )
+            .is_err()
     );
+    assert_eq!(store.workspace(&w.id).unwrap().unwrap(), before);
+    assert_eq!(w.suspended_attempts[0].id, uncertain_id);
     apply(
         &mut store,
         &mut w,
@@ -2571,7 +2406,7 @@ fn uncertain_progress_preserves_new_intent_but_blocks_same_target_until_reconcil
             viewed: true,
         },
     );
-    let plan = w.prepare(Destination::Standalone).unwrap();
+    let plan = w.publication_plan().unwrap();
     apply(
         &mut store,
         &mut w,
@@ -2598,12 +2433,7 @@ fn uncertain_progress_preserves_new_intent_but_blocks_same_target_until_reconcil
         },
     );
     assert!(!w.view().unwrap().files[0].viewed);
-    assert!(
-        w.prepare(Destination::Standalone)
-            .unwrap()
-            .operations
-            .is_empty()
-    );
+    assert!(w.publication_plan().unwrap().operations.is_empty());
     assert_eq!(w.suspended_attempts.len(), 1);
 }
 
@@ -2672,19 +2502,17 @@ fn process_publication_lock_releases_with_its_file_handle() {
 }
 
 #[test]
-fn remote_body_resolution_preserves_independent_staged_reaction() {
+fn legacy_remote_body_resolution_preserves_independent_staged_reaction() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let id = create(&mut store, "old", baseline());
     let mut w = store.open_workspace(&id).unwrap();
-    apply(
+    legacy_event(
         &mut store,
         &mut w,
-        Action::Save {
-            comment: Some(CommentId("remote".into())),
-            target: None,
+        Event::EditComment {
+            comment: CommentId("remote".into()),
             body: "local".into(),
-            destination: None,
         },
     );
     apply(
@@ -2717,7 +2545,7 @@ fn remote_body_resolution_preserves_independent_staged_reaction() {
 }
 
 #[test]
-fn unattempted_progress_returns_to_pending_when_grouped_comment_result_is_unknown() {
+fn uncertain_comment_retains_the_whole_ordered_attempt_and_blocks_later_progress() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let id = create(&mut store, "old", baseline());
@@ -2745,7 +2573,7 @@ fn unattempted_progress_returns_to_pending_when_grouped_comment_result_is_unknow
             viewed: true,
         },
     );
-    let plan = w.prepare(Destination::Review).unwrap();
+    let plan = w.publication_plan().unwrap();
     let create_id = plan.operations[0].id.clone();
     apply(
         &mut store,
@@ -2775,14 +2603,11 @@ fn unattempted_progress_returns_to_pending_when_grouped_comment_result_is_unknow
         w.suspended_attempts[0]
             .operations
             .iter()
-            .all(|op| !matches!(op.change, Event::SetFileViewed { .. }))
+            .any(|op| matches!(op.change, Event::SetFileViewed { .. }))
     );
-    let pending = w.prepare(Destination::Standalone).unwrap();
-    assert_eq!(pending.operations.len(), 1);
-    assert!(matches!(
-        pending.operations[0].change,
-        Event::SetFileViewed { .. }
-    ));
+    assert_eq!(w.suspended_attempts[0].operations.len(), 3);
+    assert!(w.publication_plan().is_err());
+    assert_eq!(w.pending().unwrap().operations.len(), 3);
 }
 
 #[test]
@@ -2809,9 +2634,19 @@ fn reconciling_old_submitted_progress_preserves_new_wip_summary() {
             viewed: true,
         },
     );
-    let plan = w.prepare(Destination::Review).unwrap();
-    let conclusion = plan.operations[0].clone();
-    let progress = plan.operations[1].clone();
+    let plan = w.publication_plan().unwrap();
+    let conclusion = plan
+        .operations
+        .iter()
+        .find(|op| matches!(op.change, Event::SetReviewConclusion { .. }))
+        .unwrap()
+        .clone();
+    let progress = plan
+        .operations
+        .iter()
+        .find(|op| matches!(op.change, Event::SetFileViewed { .. }))
+        .unwrap()
+        .clone();
     apply(
         &mut store,
         &mut w,
@@ -2900,15 +2735,16 @@ fn reconciling_old_submitted_progress_preserves_new_wip_summary() {
         },
     );
     assert_eq!(w.wip.as_ref().unwrap().id, fresh_id);
-    assert!(w.prepare(Destination::Review).unwrap().operations.iter().any(|op|matches!(&op.change,Event::SetReviewConclusion{conclusion} if conclusion.body.as_deref()==Some("new summary"))));
+    assert!(w.publication_plan().unwrap().operations.iter().any(|op|matches!(&op.change,Event::SetReviewConclusion{conclusion} if conclusion.body.as_deref()==Some("new summary"))));
 }
 
 #[test]
-fn deleting_owned_fetched_root_preserves_foreign_fetched_reply_without_reply_capability() {
+fn legacy_deleting_owned_fetched_root_preserves_foreign_fetched_reply_without_reply_capability() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let mut read = baseline();
     read.comments.push(ReadComment {
+        draft: false,
         content: CommentContent {
             id: CommentId("foreign-reply".into()),
             body: "reply".into(),
@@ -2921,10 +2757,10 @@ fn deleting_owned_fetched_root_preserves_foreign_fetched_reply_without_reply_cap
     });
     let id = create(&mut store, "old", read);
     let mut w = store.open_workspace(&id).unwrap();
-    apply(
+    legacy_event(
         &mut store,
         &mut w,
-        Action::Delete {
+        Event::DeleteComment {
             comment: CommentId("remote".into()),
         },
     );
@@ -2947,10 +2783,7 @@ fn deleting_owned_fetched_root_preserves_foreign_fetched_reply_without_reply_cap
             )
             .is_err()
     );
-    assert_eq!(
-        w.prepare(Destination::Standalone).unwrap().operations.len(),
-        1
-    );
+    assert_eq!(w.publication_plan().unwrap().operations.len(), 1);
 }
 
 #[test]
@@ -2960,6 +2793,7 @@ fn summary_permissions_and_chronological_unlocated_order_use_provider_metadata()
     let mut read = baseline();
     read.comments = vec![
         ReadComment {
+            draft: false,
             content: CommentContent {
                 id: CommentId("summary".into()),
                 body: "own summary".into(),
@@ -2968,6 +2802,7 @@ fn summary_permissions_and_chronological_unlocated_order_use_provider_metadata()
             target: CommentTarget::PullRequest,
         },
         ReadComment {
+            draft: false,
             content: CommentContent {
                 id: CommentId("unknown".into()),
                 body: "unknown author".into(),
@@ -3061,7 +2896,7 @@ fn refresh_preserves_uncertain_progress_and_later_opposite_intent() {
             present: true,
         },
     );
-    let plan = w.prepare(Destination::Standalone).unwrap();
+    let plan = w.publication_plan().unwrap();
     let viewed = plan
         .operations
         .iter()
@@ -3109,13 +2944,7 @@ fn refresh_preserves_uncertain_progress_and_later_opposite_intent() {
     assert!(!w.view().unwrap().files[0].viewed);
     assert_eq!(w.view().unwrap().done.len(), 1);
     assert!(w.last_error.is_some());
-    assert!(
-        !w.prepare(Destination::Standalone)
-            .unwrap()
-            .operations
-            .iter()
-            .any(|op| matches!(op.change, Event::SetFileViewed { .. }))
-    );
+    assert!(w.publication_plan().is_err());
     apply(
         &mut store,
         &mut w,
@@ -3144,7 +2973,7 @@ fn refresh_preserves_uncertain_progress_and_later_opposite_intent() {
         },
     );
     assert!(
-        w.prepare(Destination::Standalone)
+        w.publication_plan()
             .unwrap()
             .operations
             .iter()
@@ -3182,7 +3011,7 @@ fn suspended_refresh_keeps_durable_receipts_without_replaying_fetched_creations(
             viewed: true,
         },
     );
-    let plan = w.prepare(Destination::Review).unwrap();
+    let plan = w.publication_plan().unwrap();
     let created = plan.operations[0].clone();
     let conclusion = plan.operations[1].clone();
     let progress = plan.operations[2].clone();
@@ -3283,7 +3112,7 @@ fn publication_receipt_merges_after_unrelated_save_without_overwriting_new_work(
     let id = create(&mut store, "old", baseline());
     let mut w = store.open_workspace(&id).unwrap();
     apply(&mut store, &mut w, save(CommentTarget::PullRequest, None));
-    let plan = w.prepare(Destination::Standalone).unwrap();
+    let plan = w.publication_plan().unwrap();
     let original = plan.operations[0].clone();
     apply(
         &mut store,
@@ -3345,7 +3174,7 @@ fn publication_receipt_merges_after_unrelated_save_without_overwriting_new_work(
 }
 
 #[test]
-fn suspended_deletion_refresh_retains_missing_provider_identity_for_reconciliation() {
+fn legacy_suspended_deletion_refresh_retains_missing_provider_identity_for_reconciliation() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let backend = ReviewBackend {
@@ -3364,14 +3193,14 @@ fn suspended_deletion_refresh_retains_missing_provider_identity_for_reconciliati
         .import_review(&id, &user(), &baseline(), &backend)
         .unwrap();
     let mut w = store.open_workspace(&id).unwrap();
-    apply(
+    legacy_event(
         &mut store,
         &mut w,
-        Action::Delete {
+        Event::DeleteComment {
             comment: CommentId("remote".into()),
         },
     );
-    let plan = w.prepare(Destination::Standalone).unwrap();
+    let plan = w.publication_plan().unwrap();
     let deleted = plan.operations[0].clone();
     apply(
         &mut store,
@@ -3451,7 +3280,7 @@ fn submitted_review_refresh_keeps_fetched_resource_identity_separate_from_receip
             conclusion: conclusion.clone(),
         },
     );
-    let plan = w.prepare(Destination::Review).unwrap();
+    let plan = w.publication_plan().unwrap();
     let operation = plan.operations[0].clone();
     apply(
         &mut store,
@@ -3575,7 +3404,7 @@ fn uncertain_submitted_review_can_record_conclusion_receipt_after_fetch_without_
             conclusion: conclusion.clone(),
         },
     );
-    let plan = w.prepare(Destination::Review).unwrap();
+    let plan = w.publication_plan().unwrap();
     let operation = plan.operations[0].clone();
     apply(
         &mut store,
@@ -3676,7 +3505,7 @@ fn uncertain_submitted_review_can_record_conclusion_receipt_after_fetch_without_
 }
 
 #[test]
-fn confirmed_deletion_removes_pending_row_and_checklist_before_refetch_and_after_restart() {
+fn legacy_confirmed_deletion_removes_pending_row_and_checklist_before_refetch_and_after_restart() {
     for origin in ["fetched_todo", "fetched_done", "unfetched_receipt"] {
         let project = tempdir().unwrap();
         let mut store = Store::open(project.path()).unwrap();
@@ -3700,11 +3529,7 @@ fn confirmed_deletion_removes_pending_row_and_checklist_before_refetch_and_after
                 ),
             );
             let comment = w.saved_comment.clone().unwrap();
-            let operation = w
-                .prepare(Destination::Standalone)
-                .unwrap()
-                .operations
-                .remove(0);
+            let operation = w.publication_plan().unwrap().operations.remove(0);
             store
                 .record_operation_result(
                     &w.batch.id,
@@ -3718,10 +3543,10 @@ fn confirmed_deletion_removes_pending_row_and_checklist_before_refetch_and_after
         } else {
             CommentId("remote".into())
         };
-        apply(
+        legacy_event(
             &mut store,
             &mut w,
-            Action::Delete {
+            Event::DeleteComment {
                 comment: comment.clone(),
             },
         );
@@ -3739,11 +3564,7 @@ fn confirmed_deletion_removes_pending_row_and_checklist_before_refetch_and_after
         if origin == "fetched_done" {
             assert!(staged.done.contains(&comment));
         }
-        let operation = w
-            .prepare(Destination::Standalone)
-            .unwrap()
-            .operations
-            .remove(0);
+        let operation = w.publication_plan().unwrap().operations.remove(0);
         apply(
             &mut store,
             &mut w,
@@ -3799,4 +3620,770 @@ fn confirmed_deletion_removes_pending_row_and_checklist_before_refetch_and_after
         assert!(!view.done.contains(&comment));
         assert_eq!(view.stats.published.deletions, 1);
     }
+}
+
+#[test]
+fn publication_plan_combines_destinations_in_event_order_without_skipping_blocked_intent() {
+    let mut w = Workspace::new(Review {
+        id: ReviewId("snapshot".into()),
+        reviewer: user(),
+        read: baseline(),
+    });
+    w.apply(Action::Viewed {
+        path: "file.rs".into(),
+        viewed: true,
+    })
+    .unwrap();
+    w.apply(save(CommentTarget::PullRequest, None)).unwrap();
+    let standalone = w.saved_comment.clone().unwrap();
+    w.apply(save(
+        CommentTarget::Diff(location()),
+        Some(Destination::Standalone),
+    ))
+    .unwrap();
+    let inline = w.saved_comment.clone().unwrap();
+    assert_eq!(w.destinations[&standalone], Destination::Standalone);
+    assert_eq!(w.destinations[&inline], Destination::Review);
+    w.apply(Action::PublishReview {
+        conclusion: Some(ReviewConclusion {
+            outcome: ReviewOutcome::Approve,
+            body: None,
+        }),
+    })
+    .unwrap();
+    w.apply(Action::Reaction {
+        comment: CommentId("remote".into()),
+        present: true,
+    })
+    .unwrap();
+    let plan = w.publication_plan().unwrap();
+    assert!(matches!(
+        &plan.operations[0].change,
+        Event::SetFileViewed { .. }
+    ));
+    assert!(
+        matches!(&plan.operations[1].change, Event::CreateComment { comment } if comment.content.id == standalone)
+    );
+    assert!(
+        matches!(&plan.operations[2].change, Event::CreateComment { comment } if comment.content.id == inline)
+    );
+    assert!(matches!(
+        &plan.operations[3].change,
+        Event::SetCommentReaction { .. }
+    ));
+    assert!(matches!(
+        &plan.operations[4].change,
+        Event::SetReviewConclusion { .. }
+    ));
+    w.apply(Action::RejectAnchor {
+        comment: inline,
+        message: "invalid anchor".into(),
+    })
+    .unwrap();
+    assert!(w.publication_plan().is_err());
+}
+
+#[test]
+fn fetched_and_api_delivered_comments_are_immutable_but_progress_remains_local() {
+    let mut w = Workspace::new(Review {
+        id: ReviewId("snapshot".into()),
+        reviewer: user(),
+        read: baseline(),
+    });
+    w.apply(save(CommentTarget::Diff(location()), None))
+        .unwrap();
+    let local = w.saved_comment.clone().unwrap();
+    let operations = w.publication_plan().unwrap().operations;
+    w.apply(Action::BeginPublication {
+        destination: Destination::Review,
+        operations: operations.clone(),
+    })
+    .unwrap();
+    w.apply(Action::RecordResult {
+        result: OperationResult {
+            operation: operations[0].clone(),
+            mappings: vec![],
+            response: serde_json::Value::Null,
+        },
+    })
+    .unwrap();
+    w.apply(Action::FinishPublication {
+        success: true,
+        uncertain: false,
+        error: None,
+    })
+    .unwrap();
+    for comment in [CommentId("remote".into()), local] {
+        for action in [
+            Action::Save {
+                comment: Some(comment.clone()),
+                target: None,
+                body: "changed".into(),
+                destination: None,
+            },
+            Action::Delete {
+                comment: comment.clone(),
+            },
+            Action::Relocate {
+                comment: comment.clone(),
+                location: location(),
+            },
+        ] {
+            let before = w.clone();
+            assert!(w.apply(action).is_err());
+            assert_eq!(w, before);
+        }
+    }
+    w.apply(Action::Reaction {
+        comment: CommentId("remote".into()),
+        present: true,
+    })
+    .unwrap();
+    assert_eq!(w.view().unwrap().done, [CommentId("remote".into())]);
+}
+
+#[test]
+fn move_adopts_only_unsent_local_inline_families_atomically() {
+    let mut w = Workspace::new(Review {
+        id: ReviewId("snapshot".into()),
+        reviewer: user(),
+        read: baseline(),
+    });
+    w.apply(save(CommentTarget::Diff(location()), None))
+        .unwrap();
+    let root = w.saved_comment.clone().unwrap();
+    w.apply(save(CommentTarget::Reply(root.clone()), None))
+        .unwrap();
+    let reply = w.saved_comment.clone().unwrap();
+    // A persisted old standalone family stays unchanged until explicitly adopted.
+    w.destinations.insert(root.clone(), Destination::Standalone);
+    w.destinations
+        .insert(reply.clone(), Destination::Standalone);
+    let before = w.clone();
+    assert!(w.publication_plan().is_err());
+    assert!(
+        w.apply(Action::MoveToReview {
+            comments: vec![root.clone()]
+        })
+        .is_err()
+    );
+    assert_eq!(w, before);
+    assert!(
+        w.apply(Action::MoveToReview {
+            comments: vec![reply.clone()]
+        })
+        .is_err()
+    );
+    assert_eq!(w, before);
+    w.apply(Action::MoveToReview {
+        comments: vec![root.clone(), reply.clone()],
+    })
+    .unwrap();
+    assert_eq!(w.batch, before.batch);
+    assert_eq!(w.destinations[&root], Destination::Review);
+    assert_eq!(w.destinations[&reply], Destination::Review);
+    assert_eq!(w.projected().unwrap(), before.projected().unwrap());
+    assert!(w.publication_plan().is_ok());
+    w.apply(save(CommentTarget::PullRequest, None)).unwrap();
+    let general = w.saved_comment.clone().unwrap();
+    let before = w.clone();
+    for comment in [general, CommentId("remote".into())] {
+        assert!(
+            w.apply(Action::MoveToReview {
+                comments: vec![comment]
+            })
+            .is_err()
+        );
+        assert_eq!(w, before);
+    }
+    assert!(matches!(
+        serde_json::from_value::<Action>(serde_json::json!({"action":"move", "comments":[root]}))
+            .unwrap(),
+        Action::MoveToReview { .. }
+    ));
+}
+
+#[test]
+fn imported_pending_comments_remain_read_only_outside_the_checklist() {
+    let mut read = baseline();
+    read.comments[0].draft = true;
+    let mut w = Workspace::new(Review {
+        id: ReviewId("pending-snapshot".into()),
+        reviewer: user(),
+        read,
+    });
+    let view = w.view().unwrap();
+    assert!(view.comments[0].fetched && view.comments[0].draft);
+    assert!(view.todo.is_empty() && view.done.is_empty() && view.pending.is_empty());
+    assert!(
+        w.apply(Action::Reaction {
+            comment: CommentId("remote".into()),
+            present: true
+        })
+        .is_err()
+    );
+    assert!(
+        w.apply(Action::Save {
+            comment: Some(CommentId("remote".into())),
+            target: None,
+            body: "changed".into(),
+            destination: None
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn failed_attempt_keeps_its_full_order_identity_and_successful_prefix() {
+    let mut w = Workspace::new(Review {
+        id: ReviewId("snapshot".into()),
+        reviewer: user(),
+        read: baseline(),
+    });
+    w.apply(Action::Viewed {
+        path: "file.rs".into(),
+        viewed: true,
+    })
+    .unwrap();
+    w.apply(save(CommentTarget::Diff(location()), None))
+        .unwrap();
+    let draft = w.saved_comment.clone().unwrap();
+    let operations = w.publication_plan().unwrap().operations;
+    w.apply(Action::BeginPublication {
+        destination: Destination::Review,
+        operations: operations.clone(),
+    })
+    .unwrap();
+    let attempt = w.attempt.as_ref().unwrap().id.clone();
+    w.apply(Action::RecordResult {
+        result: OperationResult {
+            operation: operations[0].clone(),
+            mappings: vec![],
+            response: serde_json::Value::Null,
+        },
+    })
+    .unwrap();
+    w.apply(Action::FinishPublication {
+        success: false,
+        uncertain: false,
+        error: Some("rejected comment".into()),
+    })
+    .unwrap();
+    assert!(w.attempt.is_none());
+    assert_eq!(w.suspended_attempts[0].id, attempt);
+    assert_eq!(w.suspended_attempts[0].operations, operations);
+    assert!(!w.suspended_attempts[0].uncertain);
+    w.apply(Action::Save {
+        comment: Some(draft),
+        target: None,
+        body: "fixed comment".into(),
+        destination: None,
+    })
+    .unwrap();
+    let retry = w.publication_plan().unwrap();
+    assert_eq!(retry.operations.len(), 1);
+    assert!(
+        matches!(&retry.operations[0].change, Event::CreateComment { comment } if comment.content.body == "fixed comment")
+    );
+    w.apply(Action::ResumePublication {
+        attempt_id: attempt.clone(),
+    })
+    .unwrap();
+    assert_eq!(w.attempt.as_ref().unwrap().id, attempt);
+    assert!(w.has_result(&operations[0].id));
+}
+
+#[test]
+fn known_failure_retry_replans_only_original_unsent_targets() {
+    let mut w = Workspace::new(Review {
+        id: ReviewId("snapshot".into()),
+        reviewer: user(),
+        read: baseline(),
+    });
+    w.apply(Action::Viewed {
+        path: "file.rs".into(),
+        viewed: true,
+    })
+    .unwrap();
+    w.apply(save(CommentTarget::Diff(location()), None))
+        .unwrap();
+    let draft = w.saved_comment.clone().unwrap();
+    w.apply(Action::Reaction {
+        comment: CommentId("remote".into()),
+        present: true,
+    })
+    .unwrap();
+    w.apply(Action::PublishReview {
+        conclusion: Some(ReviewConclusion {
+            outcome: ReviewOutcome::Approve,
+            body: None,
+        }),
+    })
+    .unwrap();
+    let original = w.publication_plan().unwrap().operations;
+    w.apply(Action::BeginPublication {
+        destination: Destination::Review,
+        operations: original.clone(),
+    })
+    .unwrap();
+    let attempt_id = w.attempt.as_ref().unwrap().id.clone();
+    w.apply(Action::RecordResult {
+        result: OperationResult {
+            operation: original[0].clone(),
+            mappings: vec![],
+            response: serde_json::Value::Null,
+        },
+    })
+    .unwrap();
+    w.apply(Action::FinishPublication {
+        success: false,
+        uncertain: false,
+        error: Some("rejected".into()),
+    })
+    .unwrap();
+    w.apply(Action::Save {
+        comment: Some(draft.clone()),
+        target: None,
+        body: "corrected".into(),
+        destination: None,
+    })
+    .unwrap();
+    w.apply(Action::Reaction {
+        comment: CommentId("remote".into()),
+        present: false,
+    })
+    .unwrap();
+    w.apply(Action::Reaction {
+        comment: CommentId("remote".into()),
+        present: true,
+    })
+    .unwrap();
+    w.apply(Action::PublishReview {
+        conclusion: Some(ReviewConclusion {
+            outcome: ReviewOutcome::Comment,
+            body: Some("corrected summary".into()),
+        }),
+    })
+    .unwrap();
+    w.apply(save(CommentTarget::Diff(location()), None))
+        .unwrap();
+    let unrelated = w.saved_comment.clone().unwrap();
+    w.apply(Action::RejectAnchor {
+        comment: unrelated.clone(),
+        message: "unrelated invalid anchor".into(),
+    })
+    .unwrap();
+    assert!(w.publication_plan().is_err());
+    w.apply(Action::ResumePublication {
+        attempt_id: attempt_id.clone(),
+    })
+    .unwrap();
+    let resumed = w.attempt.as_ref().unwrap();
+    assert_eq!(resumed.id, attempt_id);
+    assert_eq!(resumed.operations.len(), 4);
+    assert_eq!(resumed.operations[0], original[0]);
+    assert!(
+        matches!(&resumed.operations[1].change, Event::CreateComment { comment } if comment.content.id == draft && comment.content.body == "corrected")
+    );
+    assert!(matches!(
+        &resumed.operations[2].change,
+        Event::SetCommentReaction { present: true, .. }
+    ));
+    assert_ne!(resumed.operations[2].id, original[2].id);
+    assert!(
+        matches!(&resumed.operations[3].change, Event::SetReviewConclusion { conclusion } if conclusion.body.as_deref() == Some("corrected summary"))
+    );
+    assert_ne!(resumed.operations[3].id, original[3].id);
+    assert!(
+        !resumed
+            .operations
+            .iter()
+            .any(|op| operation_comment(&op.change) == Some(&unrelated))
+    );
+}
+
+#[test]
+fn own_pending_api_comment_keeps_private_draft_status_after_success_and_restart() {
+    let project = tempdir().unwrap();
+    let mut store = Store::open(project.path()).unwrap();
+    let review = create(&mut store, "snapshot", baseline());
+    let mut w = store.open_workspace(&review).unwrap();
+    apply(
+        &mut store,
+        &mut w,
+        save(CommentTarget::Diff(location()), None),
+    );
+    let comment = w.saved_comment.clone().unwrap();
+    let operations = w.publication_plan().unwrap().operations;
+    apply(
+        &mut store,
+        &mut w,
+        Action::BeginPublication {
+            destination: Destination::Review,
+            operations: operations.clone(),
+        },
+    );
+    let result = OperationResult {
+        operation: operations[0].clone(),
+        mappings: vec![],
+        response: serde_json::json!({"id":100}),
+    };
+    apply(
+        &mut store,
+        &mut w,
+        Action::RecordResult {
+            result: result.clone(),
+        },
+    );
+    let provider = serde_json::json!({"pending":{"id":99,"node_id":"pending99","head":"head"},"prepared":[result],"submitted":false});
+    apply(
+        &mut store,
+        &mut w,
+        Action::SetAttemptProvider {
+            provider: provider.clone(),
+        },
+    );
+    apply(
+        &mut store,
+        &mut w,
+        Action::FinishPublication {
+            success: true,
+            uncertain: false,
+            error: None,
+        },
+    );
+    assert_eq!(w.preparation, provider);
+    let view = w.view().unwrap();
+    let row = view
+        .comments
+        .iter()
+        .find(|row| row.comment.content().id == comment)
+        .unwrap();
+    assert!(row.draft && !row.fetched && row.destination.is_none());
+    assert!(!view.todo.contains(&comment) && !view.done.contains(&comment));
+    assert!(
+        w.apply(Action::Delete {
+            comment: comment.clone()
+        })
+        .is_err()
+    );
+    drop(store);
+    let store = Store::open(project.path()).unwrap();
+    assert_eq!(
+        serde_json::to_value(store.workspace(&w.id).unwrap().unwrap().view().unwrap()).unwrap(),
+        serde_json::to_value(view).unwrap()
+    );
+}
+
+#[test]
+fn finished_conclusion_preserves_history_and_identical_next_review_gets_a_new_operation() {
+    let mut w = Workspace::new(Review {
+        id: ReviewId("snapshot".into()),
+        reviewer: user(),
+        read: baseline(),
+    });
+    let conclusion = ReviewConclusion {
+        outcome: ReviewOutcome::Approve,
+        body: None,
+    };
+    w.apply(Action::PublishReview {
+        conclusion: Some(conclusion.clone()),
+    })
+    .unwrap();
+    w.apply(Action::Viewed {
+        path: "file.rs".into(),
+        viewed: true,
+    })
+    .unwrap();
+    let original_events = w.batch.write.events.clone();
+    let operations = w.publication_plan().unwrap().operations;
+    let sent_conclusion = operations.last().unwrap().clone();
+    w.apply(Action::BeginPublication {
+        destination: Destination::Review,
+        operations: operations.clone(),
+    })
+    .unwrap();
+    for operation in operations {
+        w.apply(Action::RecordResult {
+            result: OperationResult {
+                operation,
+                mappings: vec![],
+                response: serde_json::Value::Null,
+            },
+        })
+        .unwrap();
+    }
+    w.apply(Action::FinishPublication {
+        success: true,
+        uncertain: false,
+        error: None,
+    })
+    .unwrap();
+    assert_eq!(w.batch.write.events, original_events);
+    assert!(w.completed.contains(&sent_conclusion));
+    assert!(w.publication_plan().unwrap().operations.is_empty());
+    assert!(w.wip.is_none());
+    w.apply(Action::Reaction {
+        comment: CommentId("remote".into()),
+        present: true,
+    })
+    .unwrap();
+    let reaction = w.publication_plan().unwrap().operations[0].clone();
+    w.apply(Action::PublishReview {
+        conclusion: Some(conclusion),
+    })
+    .unwrap();
+    let next = w.publication_plan().unwrap().operations;
+    assert_eq!(next.len(), 2);
+    assert_eq!(next[0], reaction);
+    assert_eq!(next[1].change, sent_conclusion.change);
+    assert_ne!(next[1].id, sent_conclusion.id);
+    assert_eq!(
+        w.batch.write.events[..original_events.len()],
+        original_events
+    );
+}
+
+#[test]
+fn refresh_preserves_interleaving_of_surviving_local_operations() {
+    let project = tempdir().unwrap();
+    let mut store = Store::open(project.path()).unwrap();
+    let snapshot = create(&mut store, "before", baseline());
+    let mut w = store.open_workspace(&snapshot).unwrap();
+    apply(
+        &mut store,
+        &mut w,
+        Action::Viewed {
+            path: "file.rs".into(),
+            viewed: true,
+        },
+    );
+    apply(
+        &mut store,
+        &mut w,
+        save(CommentTarget::Diff(location()), None),
+    );
+    let inline = w.saved_comment.clone().unwrap();
+    apply(
+        &mut store,
+        &mut w,
+        Action::Reaction {
+            comment: CommentId("remote".into()),
+            present: true,
+        },
+    );
+    apply(&mut store, &mut w, save(CommentTarget::PullRequest, None));
+    apply(
+        &mut store,
+        &mut w,
+        Action::Save {
+            comment: Some(inline),
+            target: None,
+            body: "final local body".into(),
+            destination: None,
+        },
+    );
+    apply(
+        &mut store,
+        &mut w,
+        Action::PublishReview {
+            conclusion: Some(ReviewConclusion {
+                outcome: ReviewOutcome::Approve,
+                body: None,
+            }),
+        },
+    );
+    let expected = w
+        .publication_plan()
+        .unwrap()
+        .operations
+        .into_iter()
+        .map(|op| op.change)
+        .collect::<Vec<_>>();
+    let fresh = create(&mut store, "after", baseline());
+    w = store
+        .refresh_workspace(&w.id, w.generation, &fresh)
+        .unwrap();
+    assert_eq!(
+        w.publication_plan()
+            .unwrap()
+            .operations
+            .into_iter()
+            .map(|op| op.change)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    drop(store);
+    let store = Store::open(project.path()).unwrap();
+    assert_eq!(
+        store
+            .workspace(&w.id)
+            .unwrap()
+            .unwrap()
+            .pending()
+            .unwrap()
+            .operations
+            .into_iter()
+            .map(|op| op.change)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn retrying_legacy_attempts_cannot_skip_or_rotate_the_earliest_failure() {
+    let mut w = Workspace::new(Review {
+        id: ReviewId("snapshot".into()),
+        reviewer: user(),
+        read: baseline(),
+    });
+    w.apply(save(CommentTarget::Diff(location()), None))
+        .unwrap();
+    let operations = w.publication_plan().unwrap().operations;
+    w.apply(Action::BeginPublication {
+        destination: Destination::Review,
+        operations,
+    })
+    .unwrap();
+    let earliest = w.attempt.as_ref().unwrap().id.clone();
+    w.apply(Action::FinishPublication {
+        success: false,
+        uncertain: false,
+        error: Some("first error".into()),
+    })
+    .unwrap();
+    w.apply(Action::Viewed {
+        path: "file.rs".into(),
+        viewed: true,
+    })
+    .unwrap();
+    let progress = w
+        .pending()
+        .unwrap()
+        .operations
+        .into_iter()
+        .find(|op| matches!(op.change, Event::SetFileViewed { .. }))
+        .unwrap();
+    // Earlier versions allowed a second independent publication after the first failed.
+    w.suspended_attempts.push(PublicationAttempt {
+        id: "later-legacy-attempt".into(),
+        wip: None,
+        destination: Destination::Standalone,
+        operations: vec![progress],
+        uncertain: false,
+        provider: serde_json::Value::Null,
+    });
+    let before = w.clone();
+    assert!(
+        w.apply(Action::ResumePublication {
+            attempt_id: "later-legacy-attempt".into()
+        })
+        .is_err()
+    );
+    assert_eq!(w, before);
+    w.apply(Action::ResumePublication {
+        attempt_id: earliest.clone(),
+    })
+    .unwrap();
+    assert_eq!(w.attempt.as_ref().unwrap().id, earliest);
+    w.apply(Action::FinishPublication {
+        success: false,
+        uncertain: false,
+        error: Some("still failing".into()),
+    })
+    .unwrap();
+    assert_eq!(
+        w.suspended_attempts
+            .iter()
+            .map(|attempt| attempt.id.as_str())
+            .collect::<Vec<_>>(),
+        [earliest.as_str(), "later-legacy-attempt"]
+    );
+}
+
+#[test]
+fn publish_review_can_edit_or_cancel_unsent_conclusion_without_erasing_history() {
+    let mut w = Workspace::new(Review {
+        id: ReviewId("snapshot".into()),
+        reviewer: user(),
+        read: baseline(),
+    });
+    w.apply(save(CommentTarget::Diff(location()), None))
+        .unwrap();
+    w.apply(Action::PublishReview {
+        conclusion: Some(ReviewConclusion {
+            outcome: ReviewOutcome::Approve,
+            body: None,
+        }),
+    })
+    .unwrap();
+    let edited = ReviewConclusion {
+        outcome: ReviewOutcome::Comment,
+        body: Some("edited conclusion".into()),
+    };
+    w.apply(Action::PublishReview {
+        conclusion: Some(edited.clone()),
+    })
+    .unwrap();
+    let old_summary = w.publication_plan().unwrap().operations.pop().unwrap();
+    assert!(
+        matches!(&old_summary.change,Event::SetReviewConclusion { conclusion } if conclusion==&edited)
+    );
+    let history = w.batch.write.events.clone();
+    let cancel = serde_json::from_value::<Action>(
+        serde_json::json!({"action":"publish_review","conclusion":null}),
+    )
+    .unwrap();
+    assert!(matches!(cancel, Action::PublishReview { conclusion: None }));
+    w.apply(cancel.clone()).unwrap();
+    assert_eq!(w.batch.write.events, history);
+    assert!(w.wip.as_ref().unwrap().conclusion.is_none());
+    assert!(
+        matches!(&w.publication_plan().unwrap().operations[..],[op] if matches!(op.change,Event::CreateComment { .. }))
+    );
+    w.apply(Action::PublishReview {
+        conclusion: Some(edited),
+    })
+    .unwrap();
+    assert_eq!(w.batch.write.events[..history.len()], history);
+    let operations = w.publication_plan().unwrap().operations;
+    assert_ne!(operations.last().unwrap().id, old_summary.id);
+    w.apply(Action::BeginPublication {
+        destination: Destination::Review,
+        operations,
+    })
+    .unwrap();
+    let frozen = w.clone();
+    assert!(w.apply(cancel.clone()).is_err());
+    assert_eq!(w, frozen);
+    w.apply(Action::FinishPublication {
+        success: false,
+        uncertain: false,
+        error: Some("confirmed rejection".into()),
+    })
+    .unwrap();
+    let attempt_id = w.suspended_attempts[0].id.clone();
+    w.apply(cancel.clone()).unwrap();
+    w.apply(Action::ResumePublication {
+        attempt_id: attempt_id.clone(),
+    })
+    .unwrap();
+    assert_eq!(w.attempt.as_ref().unwrap().id, attempt_id);
+    assert!(
+        w.attempt
+            .as_ref()
+            .unwrap()
+            .operations
+            .iter()
+            .all(|op| !matches!(op.change, Event::SetReviewConclusion { .. }))
+    );
+    w.apply(Action::FinishPublication {
+        success: false,
+        uncertain: true,
+        error: Some("unknown response".into()),
+    })
+    .unwrap();
+    let uncertain = w.clone();
+    assert!(w.apply(cancel).is_err());
+    assert_eq!(w, uncertain);
 }

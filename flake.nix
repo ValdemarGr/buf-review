@@ -24,10 +24,16 @@
           (fenix.packages.${system}.stable.withComponents [ "cargo" "rustc" "rustfmt" "clippy" ])
           pkgs.neovim
           pkgs.python3
+          (pkgs.writeShellScriptBin "nvimreview" ''
+            (cd "$PROJECTPATH" && cargo build --release --locked --bin pr) || exit $?
+            export PATH="$PROJECTPATH/target/release:$PATH"
+            exec nvim --cmd 'lua vim.opt.runtimepath:prepend(vim.env.PROJECTPATH)' "$@"
+          '')
         ];
         runScript = "zsh";
         shellHook = ''
           export SHELL='zsh'
+          export PROJECTPATH="$PWD"
         '';
     };
   };

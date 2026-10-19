@@ -92,7 +92,7 @@ end
 write('state.json', initial)
 write('routes.json', { entry = { route = 'batch', batch = initial.id, fresh_review = initial.review.id } })
 write('post_publish.json', {
-  tag = scenario, operation = conclusion and 'submit' or 'publish',
+  tag = scenario, operation = 'publish',
   ['local'] = { comments = local_comments, pending = pending, publications = { receipt }, wip = vim.NIL },
   remote = { comments = remote_comments, pending = pending },
   error = partial and 'Fixture publication failed after first receipt' or nil,
@@ -118,26 +118,26 @@ if conclusion then
   wait(function() return kind() == 'composer' end, 'Conclusion composer missing')
   composer = api.nvim_get_current_buf()
   api.nvim_buf_set_lines(composer, 0, -1, false, { 'Ready to submit' })
-  -- Native :wq must finish submission, refresh and redraw before the next key.
   api.nvim_feedkeys(api.nvim_replace_termcodes(':wq<CR>', true, false, true), 'xt', false)
-else
-  -- No wait here: the command itself must be the publication boundary.
-  if scenario == 'interrupt' then
-    local function interrupt()
-      if #requests('publish') == 0 then vim.defer_fn(interrupt, 5); return end
-      api.nvim_input('\003')
-    end
-    vim.defer_fn(interrupt, 0)
+  assert(not api.nvim_buf_is_valid(composer) and #requests('publish') == 0 and #requests('submit') == 0,
+    'Conclusion write-and-close published instead of queuing locally')
+end
+-- No wait here: publish itself must finish publication and fresh-state redraw.
+if scenario == 'interrupt' then
+  local function interrupt()
+    if #requests('publish') == 0 then vim.defer_fn(interrupt, 5); return end
+    api.nvim_input('\003')
   end
+  vim.defer_fn(interrupt, 0)
+end
+command('publish')
+if scenario == 'interrupt' then
+  assert(notice('Publication continues in the background; wait for it to finish before retrying'), 'Native Ctrl-C did not interrupt publication wait')
+  assert(not state().publications[1], 'Interrupted wait did not return before publication finished')
   command('publish')
-  if scenario == 'interrupt' then
-    assert(notice('Publication continues in the background; wait for it to finish before retrying'), 'Native Ctrl-C did not interrupt publication wait')
-    assert(not state().publications[1], 'Interrupted wait did not return before publication finished')
-    command('publish')
-    assert(notice('Publication is still running; wait before retrying'), 'Interrupted publication allowed duplicate writes')
-    assert(#requests('publish') == 1, 'Duplicate publication reached provider')
-    wait(function() return text():find('Fetched after publication', 1, true) end, 'Interrupted publication did not finish refreshing in background')
-  end
+  assert(notice('Publication is still running; wait before retrying'), 'Interrupted publication allowed duplicate writes')
+  assert(#requests('publish') == 1, 'Duplicate publication reached provider')
+  wait(function() return text():find('Fetched after publication', 1, true) end, 'Interrupted publication did not finish refreshing in background')
 end
 
 local final = state()
@@ -145,7 +145,7 @@ assert(final.id == initial.id and vim.deep_equal(final.comparison, revision), 'P
 assert(final.publications[1] and final.publications[1].id == receipt.id, 'Publication receipt missing after command returned')
 assert(#requests('fetch_refresh') >= 1, 'Publication returned before fetching remote state')
 assert(#requests('apply_refresh') >= 1, 'Publication returned before applying fetched state')
-assert(#requests(conclusion and 'submit' or 'publish') == 1, 'Publication was unexpectedly repeated')
+assert(#requests('publish') == 1 and #requests('submit') == 0, 'Publication was repeated or used the removed submit command')
 local events, publication_index, fresh_index = records('post_publish_events.jsonl')
 for index, event in ipairs(events) do
   if event.phase == 'published' then publication_index = index end
@@ -168,13 +168,13 @@ else
     assert(notice('Fixture publication failed after first receipt'), 'Partial publication error disappeared during refresh')
     assert(#final.pending == 1 and final.pending[1].id == 'op-remaining', 'Refresh lost pending operation after partial publication')
     assert(text():find('Still pending', 1, true), 'Pending comment disappeared after partial publication')
-    if conclusion then assert(notice('Review submitted; progress remains queued:'), 'Submitted review outcome lost after partial progress failure') end
+    if conclusion then assert(not final.wip and final.publications[1].published.comments == 1, 'Submitted review outcome lost after partial progress failure') end
   else
     assert(#final.pending == 0 and (#notices == 0 or scenario == 'interrupt'), 'Successful publication retained pending state or reported an error: ' .. vim.inspect(notices))
   end
 end
 if composer then
-  assert(not api.nvim_buf_is_valid(composer) and not final.wip and kind() == 'home', 'Submitted conclusion did not close after fresh-state redraw')
+  assert(not api.nvim_buf_is_valid(composer) and not final.wip and kind() == 'home', 'Queued conclusion did not publish with fresh-state redraw')
 end
 print('Post-publication ' .. scenario .. ' passed')
 vim.fn.delete(fixture, 'rf')

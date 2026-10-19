@@ -158,6 +158,59 @@ assert(marker(head, 3):find('1 comment [ ]', 1, true), 'unhandled remote comment
 assert(marker(base, 2):find('1 comment [x]', 1, true), 'Done base marker wrong')
 ranges({})
 
+-- File winbars show projected progress immediately in every visible code pane.
+local function file_winbars(path, viewed)
+  local sides = {}
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    local meta = vim.b[api.nvim_win_get_buf(win)].buf_review
+    if meta and meta.kind == 'diff' then
+      local expected = ('%s %s  %s [%s]'):format(meta.side == 'base' and 'Base' or 'Head',
+        revision[meta.side], path, viewed and 'viewed' or 'unviewed')
+      if meta.path ~= path or vim.wo[win].winbar ~= expected then return false end
+      sides[meta.side] = true
+    end
+  end
+  return sides.base and sides.head
+end
+wait(function() return file_winbars('src/file.rs', false) end, 'initial diff winbars lack unviewed status or pin/path labels')
+local function file_progress(key, viewed)
+  local buffer, window, cursor = api.nvim_get_current_buf(), api.nvim_get_current_win(), api.nvim_win_get_cursor(0)
+  local head_tick, base_tick = api.nvim_buf_get_changedtick(head), api.nvim_buf_get_changedtick(base)
+  local actions, code = #requests('actions'), #requests('code')
+  local refreshes, objects = #requests('fetch_refresh'), #requests('fetch_objects')
+  local publications, submissions = #requests('publish'), #requests('submit')
+  input(key)
+  wait(function() return #requests('actions') == actions + 1 and state().files[1].viewed == viewed
+    and file_winbars('src/file.rs', viewed) end, key .. ' did not update both projected file winbars')
+  assert(api.nvim_get_current_buf() == buffer and api.nvim_get_current_win() == window
+    and vim.deep_equal(api.nvim_win_get_cursor(0), cursor), 'file progress moved focused code/cursor')
+  assert(api.nvim_buf_get_changedtick(head) == head_tick and api.nvim_buf_get_changedtick(base) == base_tick
+    and #requests('code') == code, 'file progress reloaded immutable code')
+  assert(#requests('fetch_refresh') == refreshes and #requests('fetch_objects') == objects
+    and #requests('publish') == publications and #requests('submit') == submissions,
+    'file status required fetch or publication')
+end
+for _, side in ipairs({ 'base', 'head' }) do
+  local _, win = diff(side)
+  api.nvim_set_current_win(win); api.nvim_win_set_cursor(0, { 2, 0 })
+  local duplicate
+  if side == 'head' then vim.cmd('split'); duplicate = api.nvim_get_current_win() end
+  file_progress('s', true)
+  file_progress('u', false)
+  if duplicate then api.nvim_win_close(duplicate, true) end
+end
+local _, viewed_window = diff('head')
+api.nvim_set_current_win(viewed_window)
+file_progress('s', true)
+input(']f')
+wait(function() return kind() == 'diff' and file_winbars('src/other.rs', false) end,
+  'opening another file retained viewed status from reused diff panes')
+command(''); wait(function() return kind() == 'home' end, 'home missing after file status navigation')
+row('src/file.rs'); require('buf_review').enter()
+wait(function() return kind() == 'diff' and file_winbars('src/file.rs', true) end, 'reopened file lost projected viewed status')
+head, base = diff('head'), diff('base')
+file_progress('u', false)
+
 -- Progress uses the current local projection immediately; replies participate, drafts do not.
 open('root'); ranges({ 1, 2 })
 head, user_window = diff('head')

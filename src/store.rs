@@ -1870,6 +1870,8 @@ impl Store {
                         | Action::Viewed { .. }
                         | Action::Reaction { .. }
                         | Action::Summary { .. }
+                        | Action::PublishReview { .. }
+                        | Action::MoveToReview { .. }
                         | Action::CompareLatest
                         | Action::Relocate { .. }
                         | Action::Resolve { .. }
@@ -2162,30 +2164,17 @@ impl Store {
             }
         }
         let incoming = mappings(&review.id)?;
-        let private_reviews = preparations
-            .iter()
-            .filter(|preparation| {
-                preparation.get("submitted").and_then(Value::as_bool) != Some(true)
-            })
-            .filter_map(|preparation| preparation.pointer("/pending/id").and_then(Value::as_u64))
-            .collect::<std::collections::BTreeSet<_>>();
-        let private_ids = incoming
+        let submitted_reviews = incoming
             .iter()
             .filter(|mapping| {
-                private_reviews
-                    .iter()
-                    .any(|id| mapping.resource == format!("review_member:{id}"))
+                mapping.resource == "review"
+                    && review.read.reviews.iter().any(|remote| {
+                        remote.id.as_ref().is_some_and(|id| id.0 == mapping.core_id)
+                            && matches!(remote.state, crate::model::ReadReviewState::Submitted(_))
+                    })
             })
-            .map(|mapping| mapping.core_id.clone())
+            .filter_map(|mapping| mapping.remote_id.parse::<u64>().ok())
             .collect::<std::collections::BTreeSet<_>>();
-        review
-            .read
-            .comments
-            .retain(|comment| !private_ids.contains(&comment.content.id.0));
-        review
-            .read
-            .reactions
-            .retain(|reaction| !private_ids.contains(&reaction.comment.0));
         let old = previous
             .iter()
             .map(|m| ((m.resource.clone(), m.remote_id.clone()), m.core_id.clone()))
@@ -2218,10 +2207,7 @@ impl Store {
                 reaction.comment.0 = id.clone();
             }
         }
-        if !aliases.is_empty()
-            || !private_ids.is_empty()
-            || previous.iter().any(|mapping| !incoming.contains(mapping))
-        {
+        if !aliases.is_empty() || previous.iter().any(|mapping| !incoming.contains(mapping)) {
             // Keep imported evidence intact; reuse equivalent canonical evidence
             // only when reviewer, snapshot and all provider identities agree.
             let incoming_id = review.id.clone();
@@ -2259,6 +2245,23 @@ impl Store {
                 for mapping in &backend.mappings {
                     transaction.execute("INSERT INTO id_mappings(review_id,resource,core_id,remote_id) VALUES (?1,?2,?3,?4)",(&review.id.0,&mapping.resource,&mapping.core_id,&mapping.remote_id))?;
                 }
+            }
+        }
+        if workspace.attempt.is_none()
+            && workspace.suspended_attempts.is_empty()
+            && workspace
+                .preparation
+                .pointer("/pending/id")
+                .and_then(Value::as_u64)
+                .is_some_and(|id| submitted_reviews.contains(&id))
+        {
+            workspace.preparation = Value::Null;
+            if workspace
+                .wip
+                .as_ref()
+                .is_some_and(|wip| wip.conclusion.is_none())
+            {
+                workspace.wip = None;
             }
         }
         workspace.refresh(review)?;

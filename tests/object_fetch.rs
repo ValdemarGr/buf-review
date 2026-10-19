@@ -104,6 +104,7 @@ fn batch_with_comments(root: &Path, revision: DiffRevision, comments: Vec<ReadCo
 
 fn comment(id: &str, revision: ReadCommentRevision) -> ReadComment {
     ReadComment {
+        draft: false,
         content: CommentContent {
             id: CommentId(id.into()),
             body: "Please fix this".into(),
@@ -423,6 +424,7 @@ fn prepares_pins_then_fetches_only_distinct_missing_historical_commits_together(
             },
         ),
         ReadComment {
+            draft: false,
             content: CommentContent {
                 id: CommentId("reply".into()),
                 body: "Same historical context".into(),

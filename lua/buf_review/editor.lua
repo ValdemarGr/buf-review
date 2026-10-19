@@ -19,9 +19,8 @@ end
 
 function M.save(buf)
   local editor = assert(editors[buf], 'Not a review composer')
-  if editor.completed then error('Review already submitted; close this composer before starting another review') end
-  if editor.submitting or editor.saving then
-    error('Review save/submission in progress; text retained')
+  if editor.saving then
+    error('Review save in progress; text retained')
   end
   if editor.before_write then editor.before_write() end
   local text = body(buf)
@@ -32,7 +31,6 @@ function M.save(buf)
     failure = err
     finished = true
     if not err and api.nvim_buf_is_valid(buf) then
-      editor.saved_in_open = true
       editor.saved_body = text
       if body(buf) == text then
         vim.bo[buf].modified = false
@@ -40,7 +38,7 @@ function M.save(buf)
     end
   end)
   -- BufWriteCmd must finish the local write before native :w can succeed.
-  -- Provider operations run only on explicit publication or conclusion close.
+  -- Provider operations run only through explicit publication.
   if not vim.wait(10000, function() return finished end, 10) then
     error('Local save still running; text retained. Wait before retrying.')
   end
@@ -62,6 +60,11 @@ local function close_window(buf, force, win, editor)
     api.nvim_win_close(win, force)
     local origin = editor.return_win
     if focused and #vim.fn.win_findbuf(buf) == 0 and origin and api.nvim_win_is_valid(origin) then
+      for saved_win, saved in pairs(editor.return_views or {}) do
+        if api.nvim_win_is_valid(saved_win) and api.nvim_win_get_buf(saved_win) == saved.buffer then
+          api.nvim_win_call(saved_win, function() vim.fn.winrestview(saved.view) end)
+        end
+      end
       api.nvim_set_current_win(origin)
     end
   end
@@ -71,8 +74,8 @@ function M.close(buf, command, force, win)
   local editor = editors[buf]
   if not editor then return end
   win = win or api.nvim_get_current_win()
-  if editor.submitting or editor.saving then
-    error('Review save/submission in progress; keep composer open until result is known')
+  if editor.saving then
+    error('Review save in progress; keep composer open until result is known')
   end
   local windows = 0
   for _, win in ipairs(api.nvim_list_wins()) do
@@ -91,32 +94,12 @@ function M.close(buf, command, force, win)
   if vim.bo[buf].modified and not force then
     error('E37: No write since last change (add ! to override)')
   end
-  local complete = command == 'wq' or command == 'wquit' or command == 'x' or command == 'xit' or command == 'exit'
-  if editor.kind ~= 'conclusion' or not complete or not editor.saved_in_open then
-    close_window(buf, force, win, editor)
-    return
-  end
-  editor.submitting = true
-  editor.status('Submitting review…')
-  editor.submit(function(err)
-    editor.submitting = false
-    if not api.nvim_buf_is_valid(buf) then return end
-    if err then
-      editor.status('Submission failed: ' .. err)
-      vim.notify('buf-review: ' .. err, vim.log.levels.ERROR)
-    else
-      editor.completed = true
-      editor.saved_in_open = false
-      editor.status('Review submitted')
-      close_window(buf, false, win, editor)
-    end
-  end)
+  close_window(buf, force, win, editor)
 end
 
 function M.attach(buf, editor)
   editors[buf] = editor
   editor.saved_body = body(buf)
-  editor.saved_in_open = false
   vim.bo[buf].buftype = 'acwrite'
   vim.bo[buf].bufhidden = 'wipe'
   vim.bo[buf].swapfile = false

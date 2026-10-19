@@ -156,24 +156,22 @@ assert(kind() == 'thread' and not require('buf_review.editor').get() and vim.fn.
 assert(#state().comments == comments_before - 1 and #requests('save') == writes_before and not vim.bo.modified, 'undo-append created orphan reply or changed reader text')
 assert(notices[#notices]:find('Comment no longer present', 1, true), 'undo-append did not report missing target')
 
--- Deleting a fetched root keeps its row, but every subsequent composer action
--- must validate its updated pending-delete state, including a selected child.
+-- Native deletion cannot mutate a published root; later replies remain available.
 api.nvim_set_current_win(diff_win)
 api.nvim_win_set_cursor(diff_win, { 2, 0 })
-normal('<CR>')
-row('Remote root')
-normal('<CR>')
-row('Remote root')
-normal('dd:Review reply<CR>')
-assert(kind() == 'thread' and not require('buf_review.editor').get() and state().comments[1].pending_delete, 'queued delete allowed explicit reply composer')
-assert(notices[#notices]:find('pending deletion', 1, true), 'reply did not validate updated deletion state')
-row('Remote child')
-normal(':Review reply<CR>')
-assert(kind() == 'thread' and not require('buf_review.editor').get() and notices[#notices]:find('pending deletion', 1, true), 'child selection bypassed deleted parent reply guard')
-row('Remote root')
-normal('udd:Review edit<CR>')
-assert(kind() == 'thread' and not require('buf_review.editor').get() and state().comments[1].pending_delete, 'queued delete allowed explicit edit composer')
-assert(notices[#notices]:find('pending deletion', 1, true), 'edit did not validate updated deletion state')
+normal('<CR>'); row('Remote root'); normal('<CR>'); row('Remote root')
+local before_published = #state().comments
+normal('dd:Review edit<CR>')
+assert(kind() == 'thread' and not require('buf_review.editor').get() and not state().comments[1].pending_delete,
+  'published deletion/edit opened composer or staged deletion')
+assert(#state().comments == before_published and notices[#notices]:find('immutable', 1, true), 'published mutation changed saved state or hid validation')
+row('Remote child'); normal(':Review reply<CR>')
+assert(kind() == 'composer' and require('buf_review.editor').get().target.target == 'remote-root', 'published child selection lost root reply capability')
+normal(':q!<CR>')
+row('Remote root'); normal('aReply without changing published root<Esc>:wq<CR>')
+assert(kind() == 'thread' and not state().comments[1].pending_delete and state().comments[1].comment.comment.body == 'Remote root',
+  'published-root append mutated its parent')
+assert(#matches('Reply without changing published root') == 1, 'immutable parent prevented new reply')
 
 assert(vim.deep_equal(api.nvim_buf_get_lines(diff, 0, -1, false), source) and not vim.bo[diff].modified, 'native comment operations mutated immutable source')
 assert(#requests('publish') == 0 and #requests('submit') == 0, 'native local composition published remotely')

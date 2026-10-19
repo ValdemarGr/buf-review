@@ -307,6 +307,7 @@ fn cli_plan_after_editor_refresh_uses_current_delta_not_historical_receipts() {
     let fresh = ReviewId("fresh".into());
     let mut read = baseline();
     read.comments.push(ReadComment {
+        draft: false,
         content: comment.content,
         author: Some(reviewer()),
         target: CommentTarget::PullRequest,

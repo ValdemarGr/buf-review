@@ -74,6 +74,13 @@ local function focus_code()
   end
   error('Missing head pane')
 end
+local function focus_thread(id)
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    local meta = vim.b[api.nvim_win_get_buf(win)].buf_review
+    if meta and meta.kind == 'thread' and meta.object == id then api.nvim_set_current_win(win); return win end
+  end
+  error('Missing discussion ' .. id)
+end
 local function current_file(path) return kind() == 'diff' and vim.b.buf_review.path == path end
 local function visible_thread(id)
   for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
@@ -88,15 +95,18 @@ local function code_since(before)
   return paths
 end
 
--- File changes retire the managed old discussion; subsequent comment movement cannot mark it.
+-- Staging stays put; pure file changes retire the managed old discussion.
 open('a'); focus_code()
 local before_actions = #requests('actions')
-input(']F')
-wait(function() return current_file('src/b.rs') end, 'file mark did not advance')
+input('s')
+wait(function() return state().files[1].viewed end, 'file progress was not staged')
+assert(current_file('src/a.rs') and visible_thread('a'), 'staging navigated away from current file')
+input(']f')
+wait(function() return current_file('src/b.rs') end, 'file navigation did not advance')
 assert(not visible_thread(), 'file change retained managed discussion from previous file')
 assert(state().files[1].viewed and not state().comments[1].done, 'file mark changed comment progress')
 before_actions = #requests('actions')
-input(']R')
+input(']r')
 wait(function() return kind() == 'thread' end, 'comment navigation without open discussion failed')
 assert(#requests('actions') == before_actions, 'closed old discussion was marked in background')
 
@@ -115,19 +125,20 @@ api.nvim_win_close(file_picker, true)
 reset(); local retained_reader = open('a')
 vim.cmd('split')
 local retained_window = api.nvim_get_current_win()
-focus_code(); input(']F')
+focus_code(); input(']f')
 wait(function() return current_file('src/b.rs') end, 'file change with extra reader failed')
 assert(api.nvim_win_is_valid(retained_window) and api.nvim_win_get_buf(retained_window) == retained_reader
   and #vim.fn.win_findbuf(retained_reader) == 1, 'file change removed manually retained reader')
 api.nvim_win_close(retained_window, true)
 
 -- A newer PR-wide selection wins over an older delayed code/comment response.
-reset(); open('a'); focus_code()
+reset(); open('a')
 vim.fn.writefile({ '0.25' }, fixture .. '/delay_code')
 local before_code = #requests('code')
 command('next todo')
 wait(function() return #requests('code') == before_code + 1 end, 'delayed comment read missing')
-command('next todo')
+api.nvim_set_current_buf(home_buffer)
+row('Feedback wide'); require('buf_review').enter()
 assert(kind() == 'thread' and vim.b.buf_review.object == 'wide', 'new PR-wide choice missing')
 ReviewTest.wait(400)
 assert(kind() == 'thread' and vim.b.buf_review.object == 'wide', 'older code callback replaced newer PR-wide choice')
@@ -136,11 +147,11 @@ for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
   if meta and meta.kind == 'diff' then assert(meta.path == 'src/a.rs', 'stale callback changed code after PR-wide choice') end
 end
 vim.fn.delete(fixture .. '/delay_code')
-focus_code(); command('next todo')
+command('next todo')
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'e' end, 'new selected comment and navigation order diverged')
 
 -- Returning home cancels delayed code and comment installation too.
-reset(); open('a'); focus_code()
+reset(); open('a')
 vim.fn.writefile({ '0.25' }, fixture .. '/delay_code')
 before_code = #requests('code')
 command('next todo')
@@ -149,49 +160,52 @@ command(''); wait(function() return kind() == 'home' end, 'newer home choice mis
 ReviewTest.wait(400)
 assert(kind() == 'home' and #api.nvim_tabpage_list_wins(0) == 1, 'old callback reopened code after home')
 
--- Saving progress succeeds, but a newer local file request cancels automatic comment advance.
-reset(); open('a'); focus_code()
+-- Explicit file navigation settles pending comment progress without competing requests.
+reset(); open('a')
 vim.fn.writefile({ '0.12' }, fixture .. '/delay_actions')
 vim.fn.writefile({ '0.35' }, fixture .. '/delay_code')
 before_actions, before_code = #requests('actions'), #requests('code')
-input(']R')
+input('s')
 wait(function() return #requests('actions') == before_actions + 1 end, 'delayed comment mark missing')
+focus_code()
 command('next file')
 wait(function() return #requests('code') == before_code + 1 end, 'new file intent missing')
-wait(function() return current_file('src/b.rs') end, 'pending comment mark overrode newer file navigation')
+wait(function() return current_file('src/b.rs') end, 'file navigation did not settle comment progress')
 ReviewTest.wait(200)
-assert(state().comments[1].done and vim.deep_equal(code_since(before_code), { 'src/b.rs' }), 'comment advance issued stale competing navigation')
+assert(state().comments[1].done and vim.deep_equal(code_since(before_code), { 'src/b.rs' }), 'staging issued competing navigation')
 assert(not visible_thread(), 'new file retained old discussion after delayed comment mark')
 
--- The symmetric file mark must not override a newer explicit comment request.
+-- Explicit comment navigation also settles pending file progress.
 reset(); open('a'); focus_code()
 vim.fn.writefile({ '0.12' }, fixture .. '/delay_actions')
 vim.fn.writefile({ '0.35' }, fixture .. '/delay_code')
 before_actions, before_code = #requests('actions'), #requests('code')
-input(']F')
+input('s')
 wait(function() return #requests('actions') == before_actions + 1 end, 'delayed file mark missing')
+focus_thread('a')
 command('next todo')
 wait(function() return #requests('code') == before_code + 1 end, 'new comment intent missing')
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'c' end, 'pending file mark overrode newer comment choice')
 ReviewTest.wait(200)
-assert(state().files[1].viewed and vim.deep_equal(code_since(before_code), { 'src/c.rs' }), 'file advance issued stale competing navigation')
+assert(state().files[1].viewed and vim.deep_equal(code_since(before_code), { 'src/c.rs' }), 'file staging issued competing navigation')
 
 -- PR-wide and log discussions are independent of the selected code file.
 reset(); open('a')
 command('next todo'); wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'c' end, 'global discussion setup missing')
 command('next todo'); assert(kind() == 'thread' and vim.b.buf_review.object == 'wide', 'PR-wide discussion missing')
 local wide_reader = api.nvim_get_current_buf()
-focus_code(); input(']F')
+focus_code(); input(']f')
 wait(function() return current_file('src/e.rs') end, 'file navigation beside PR-wide comment failed')
 assert(#vim.fn.win_findbuf(wide_reader) == 1, 'file change closed PR-wide discussion')
 reset(); open('a'); focus_code()
 command('log'); wait(function() return kind() == 'log' end, 'log setup missing')
 local log_reader = api.nvim_get_current_buf()
-input(']F'); wait(function() return current_file('src/b.rs') end, 'file navigation beside log failed')
+focus_code()
+input(']f'); wait(function() return current_file('src/b.rs') end, 'file navigation beside log failed')
 assert(#vim.fn.win_findbuf(log_reader) == 1, 'file change closed independent log view')
 
 -- An older local reader cannot replace a newer comment or reopen a context tab after home.
-reset(); open('a'); focus_code()
+reset(); open('a')
 vim.fn.writefile({ '0.25' }, fixture .. '/delay_log')
 local before_log = #requests('log')
 command('log'); wait(function() return #requests('log') == before_log + 1 end, 'delayed log request missing')
@@ -213,12 +227,12 @@ assert(kind() == 'composer', 'guard composer missing')
 api.nvim_buf_set_lines(0, 0, -1, false, { 'Unsaved comment' })
 local composer = api.nvim_get_current_buf()
 before_actions, before_code = #requests('actions'), #requests('code')
-input(']F'); command('next file')
+input(']f'); command('next file')
 assert(api.nvim_get_current_buf() == composer and vim.bo.modified and api.nvim_get_current_line() == 'Unsaved comment'
   and #requests('actions') == before_actions and #requests('code') == before_code, 'file navigation discarded or bypassed unsaved composer')
 input(':q!<CR>')
 
--- Newer navigation also wins when the pending mark belongs to another bound session.
+-- Staging in a retained reader stays bound to its session during explicit navigation.
 reset(); local old_reader = open('a')
 local another = vim.deepcopy(initial)
 another.id, another.generation = 'navigation-other', 0
@@ -238,19 +252,19 @@ wait(function() return current_file('src/a.rs') and vim.b.buf_review.workspace =
 local origin_window = api.nvim_get_current_win()
 vim.cmd('split'); api.nvim_win_set_buf(0, old_reader)
 local extra_window = api.nvim_get_current_win()
-api.nvim_set_current_win(origin_window)
 vim.fn.writefile({ '0.12' }, fixture .. '/delay_actions')
 vim.fn.writefile({ '0.35' }, fixture .. '/delay_code')
 before_actions, before_code = #requests('actions'), #requests('code')
-input(']R')
+input('s')
 wait(function() return #requests('actions') == before_actions + 1 end, 'old-session mark missing')
 assert(requests('actions')[before_actions + 1].workspace == initial.id, 'old reader marked wrong bound session')
+api.nvim_set_current_win(origin_window)
 command('next file')
-wait(function() return current_file('src/b.rs') and vim.b.buf_review.workspace == another.id end, 'old-bound continuation replaced newer session navigation')
+wait(function() return current_file('src/b.rs') and vim.b.buf_review.workspace == another.id end, 'old-bound staging replaced newer session navigation')
 ReviewTest.wait(200)
 views = vim.json.decode(table.concat(vim.fn.readfile(fixture .. '/views.json'), '\n'))
 assert(views[initial.id].comments[1].done and not state().comments[1].done, 'mixed-session progress was lost or saved in wrong session')
-assert(vim.deep_equal(code_since(before_code), { 'src/b.rs' }), 'old-bound continuation issued competing code request')
+assert(vim.deep_equal(code_since(before_code), { 'src/b.rs' }), 'old-bound staging issued competing code request')
 assert(api.nvim_win_is_valid(extra_window) and api.nvim_win_get_buf(extra_window) == old_reader, 'newer navigation closed manually retained old reader')
 api.nvim_win_close(extra_window, true)
 

@@ -166,7 +166,7 @@ fn confirmed_remote_identity_restores_exact_original_comparison_across_batches()
             },
         )
         .unwrap();
-    let operation = w.prepare(Destination::Standalone).unwrap().operations[0].clone();
+    let operation = w.publication_plan().unwrap().operations[0].clone();
     let local = w.saved_comment.as_ref().unwrap();
     store
         .record_operation_result(
@@ -203,6 +203,7 @@ fn confirmed_remote_identity_restores_exact_original_comparison_across_batches()
     let mut incoming = baseline();
     incoming.pull_request.revision.head = "new-head".into();
     incoming.comments.push(ReadComment {
+        draft: false,
         content: CommentContent {
             id: CommentId("remote-derived-id".into()),
             body: "Remote edit".into(),
