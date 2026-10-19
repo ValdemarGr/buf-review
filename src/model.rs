@@ -144,9 +144,54 @@ pub struct ReadComment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PullRequestStatus {
+    Local,
     Open,
     Closed,
     Merged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchSource {
+    pub repository: String,
+    pub branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchPair {
+    pub source: BranchSource,
+    pub sink: BranchSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PullRequestSource {
+    LocalIntent {
+        branches: BranchPair,
+    },
+    Remote {
+        locator: String,
+        branches: Option<BranchPair>,
+    },
+}
+
+/// A PR has a local identity before its provider resource exists. Review
+/// snapshots retain their own immutable metadata and comparisons.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestObject {
+    pub id: PullRequestId,
+    pub revision: u64,
+    pub source: PullRequestSource,
+    pub title: String,
+    pub body: String,
+}
+
+/// Frozen creation input survives interruption independently of review writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestResolution {
+    pub branches: BranchPair,
+    pub title: String,
+    pub body: String,
+    pub draft: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +201,8 @@ pub struct PullRequest {
     pub body: String,
     pub author: Option<User>,
     pub status: PullRequestStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<BranchSource>,
     pub revision: DiffRevision,
 }
 
@@ -172,10 +219,18 @@ pub enum FileChange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStats {
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedFile {
     pub path: String,
     pub previous_path: Option<String>,
     pub change: FileChange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<FileStats>,
     pub viewed: bool,
 }
 
@@ -292,6 +347,15 @@ pub struct Review {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Batch {
     pub id: BatchId,
+    #[serde(default)]
+    pub revision: BatchRevision,
     pub review: ReviewId,
     pub write: WriteState,
+}
+
+/// Internal log version. Legacy operation namespaces remain unchanged on import.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchRevision {
+    pub number: u64,
+    pub namespace: Option<String>,
 }

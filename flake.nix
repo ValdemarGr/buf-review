@@ -22,6 +22,8 @@
         buildInputs = [
           codex-cli-nix.packages.${system}.default
           (fenix.packages.${system}.stable.withComponents [ "cargo" "rustc" "rustfmt" "clippy" ])
+          pkgs.neovim
+          pkgs.python3
         ];
         runScript = "zsh";
         shellHook = ''

@@ -18,6 +18,10 @@ struct FakeGh {
     directory: TempDir,
 }
 
+fn connection(nodes: Vec<Value>, has_next: bool, cursor: Option<&str>) -> Value {
+    json!({"totalCount":nodes.len(),"nodes":nodes,"pageInfo":{"hasNextPage":has_next,"endCursor":cursor}})
+}
+
 impl FakeGh {
     fn new() -> Self {
         let this = Self {
@@ -26,115 +30,88 @@ impl FakeGh {
         fs::create_dir(this.directory.path().join("bin")).unwrap();
         fs::create_dir(this.directory.path().join("project")).unwrap();
         let executable = this.directory.path().join("bin/gh");
-        fs::write(
-            &executable,
-            r#"#!/bin/sh
+        fs::write(&executable, r#"#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_GH_REQUESTS"
-endpoint=
-paginate=false
-slurp=false
-for argument do
-    case "$argument" in
-        /user|user|graphql|repos/*) endpoint=$argument ;;
-        --paginate) paginate=true ;;
-        --slurp) slurp=true ;;
-    esac
-done
-case "$endpoint" in
-    /user|user) fixture=user ;;
-    graphql) fixture=graphql ;;
-    repos/acme/repo/pulls/7) fixture=pr ;;
-    repos/acme/repo/pulls/7/files*) fixture=files ;;
-    repos/acme/repo/issues/7/comments*) fixture=issue_comments ;;
-    repos/acme/repo/pulls/7/comments*) fixture=review_comments ;;
-    repos/acme/repo/pulls/7/reviews*) fixture=reviews ;;
-    repos/acme/repo/issues/comments/101/reactions*) fixture=reactions101 ;;
-    repos/acme/repo/pulls/comments/201/reactions*) fixture=reactions201 ;;
-    repos/acme/repo/pulls/comments/202/reactions*) fixture=reactions202 ;;
-    repos/acme/repo/pulls/comments/203/reactions*) fixture=reactions203 ;;
-    *) printf 'Unexpected endpoint: %s\n' "$endpoint" >&2; exit 1 ;;
+case "$2" in
+ graphql)
+   body=$(cat)
+   printf '%s\n' "$body" >> "$FAKE_GH_REQUESTS.query"
+   case "$body" in
+     *ReviewSnapshot*) fixture=snapshot ;;
+     *ReviewFilePage*) fixture=graphql ;;
+     *CommentReactions*) fixture=review_reactions ;;
+     *ReviewIssueCommentPage*) fixture=issue_next ;;
+     *ReviewReviewPage*) fixture=review_next ;;
+     *ReviewThreadPage*) fixture=thread_next ;;
+     *ThreadComments*) fixture=comment_next ;;
+     *) printf 'Unexpected GraphQL query' >&2; exit 1 ;;
+   esac ;;
+ repos/acme/repo/pulls/7) fixture=pr ;;
+ repos/acme/repo/pulls/comments/201) fixture=anchor ;;
+ repos/acme/repo/pulls/7/files*) fixture=files ;;
+ *) printf 'Unexpected endpoint: %s\n' "$2" >&2; exit 1 ;;
 esac
-case "$fixture" in
-    user|pr) ;;
-    *)
-        if [ "$paginate" != true ] || [ "$slurp" != true ]; then
-            printf 'Missing pagination flags for %s\n' "$fixture" >&2
-            exit 1
-        fi
-        ;;
-esac
-if [ "${FAKE_GH_FAIL:-}" = "$fixture" ]; then
-    printf 'Fixture request failed: %s\n' "$fixture" >&2
-    exit 1
-fi
+if [ "${FAKE_GH_FAIL:-}" = "$fixture" ]; then printf 'Fixture request failed: %s\n' "$fixture" >&2; exit 1; fi
 cat "$FAKE_GH_FIXTURES/$fixture.json"
-"#,
-        )
-        .unwrap();
+"#).unwrap();
         fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
-        let reviewer = json!({"id":1,"node_id":"U_1","login":"reviewer"});
-        let author = json!({"id":2,"node_id":"U_2","login":"author"});
-        this.write("user", reviewer.clone());
         this.write(
             "pr",
-            json!({
-                "id":70,"node_id":"PR_70","number":7,"title":"Review this",
-            "body":"PR description","user":author,"state":"open","merged":false,"changed_files":2,
-                "base":{"sha":"base-sha"},"head":{"sha":"head-sha"}
-            }),
+            json!({"base":{"sha":"base-sha"},"head":{"sha":"head-sha"},"changed_files":2}),
+        );
+        this.write("files", json!([[{"filename":"src/new.rs","status":"modified","additions":12,"deletions":3}],[{"filename":"src/old.rs","previous_filename":"src/original.rs","status":"renamed","additions":0,"deletions":8}]]));
+        let user = json!({"databaseId":1,"login":"reviewer"});
+        let author = json!({"databaseId":2,"login":"author"});
+        let empty = connection(vec![], false, None);
+        let reaction =
+            |id: &str, content: &str, user: Value| json!({"id":id,"content":content,"user":user});
+        let root = json!({"id":"RC_201","fullDatabaseId":"201","body":"Current range","createdAt":"2026-01-01T00:00:01Z","author":user,"replyTo":null,"pullRequestReview":{"fullDatabaseId":"301"},"commit":{"oid":"head-sha"},"originalCommit":{"oid":"old-head"},"path":"src/new.rs","line":5,"startLine":3,"originalLine":4,"originalStartLine":2,"subjectType":"LINE","diffHunk":"@@ -1 +1 @@","outdated":false,"state":"SUBMITTED","reactions":connection(vec![reaction("r201","HEART",Value::Null)],false,None)});
+        let mut reply = root.clone();
+        reply["id"] = json!("RC_202");
+        reply["fullDatabaseId"] = json!("202");
+        reply["body"] = json!("Reply");
+        reply["createdAt"] = json!("2026-01-01T00:00:02Z");
+        reply["author"] = author.clone();
+        reply["replyTo"] = json!({"fullDatabaseId":"201"});
+        reply["reactions"] = empty.clone();
+        let outdated = json!({"id":"RC_203","fullDatabaseId":"203","body":"Outdated comment","createdAt":"2026-01-01T00:00:03Z","author":null,"replyTo":null,"pullRequestReview":{"fullDatabaseId":"302"},"commit":{"oid":"head-sha"},"originalCommit":{"oid":"older-head"},"path":"src/old.rs","line":null,"startLine":null,"originalLine":7,"originalStartLine":null,"subjectType":"LINE","diffHunk":"@@ -7 +7 @@","outdated":true,"state":"SUBMITTED","reactions":empty});
+        let review = |id: &str, num: &str, state: &str, body: &str, user: Value| json!({"id":id,"fullDatabaseId":num,"state":state,"body":body,"author":user,"submittedAt":"2026-01-02T00:00:00Z","reactions":empty});
+        let mut files = connection(
+            vec![json!({"path":"src/new.rs","changeType":"MODIFIED","viewerViewedState":"VIEWED"})],
+            true,
+            Some("files-next"),
+        );
+        files["totalCount"] = json!(2);
+        this.write("snapshot",json!({"data":{"viewer":user,"repository":{"pullRequest":{
+            "id":"PR_70","fullDatabaseId":"70","title":"Review this","body":"PR description","author":author,"state":"OPEN","baseRefOid":"base-sha","headRefOid":"head-sha","headRefName":"feature/review","baseRefName":"master","headRepository":{"url":"https://github.com/contributor/repo"},"changedFiles":2,"files":files,
+            "comments":connection(vec![json!({"id":"IC_101","fullDatabaseId":"101","body":"PR-wide comment","createdAt":"2026-01-01T00:00:00Z","author":null,"reactions":connection(vec![reaction("r101","THUMBS_UP",user.clone())],false,None)})],false,None),
+            "reviews":connection(vec![review("R_301","301","APPROVED","Looks good",user.clone()),review("R_302","302","DISMISSED","Old objections",Value::Null),review("R_303","303","PENDING","Unsubmitted",author.clone())],false,None),
+            "reviewThreads":connection(vec![json!({"id":"T201","diffSide":"RIGHT","startDiffSide":"RIGHT","comments":connection(vec![root,reply],false,None)}),json!({"id":"T203","diffSide":"LEFT","startDiffSide":null,"comments":connection(vec![outdated],false,None)})],false,None)
+        }}}}));
+        let mut files = connection(
+            vec![
+                json!({"path":"src/old.rs","changeType":"RENAMED","viewerViewedState":"UNVIEWED"}),
+            ],
+            false,
+            None,
+        );
+        files["totalCount"] = json!(2);
+        this.write(
+            "graphql",
+            json!({"data":{"repository":{"pullRequest":{"files":files}}}}),
         );
         this.write(
-            "files",
-            json!([
-                [{"filename":"src/new.rs","status":"modified"}],
-                [{"filename":"src/old.rs","previous_filename":"src/original.rs","status":"renamed"}]
-            ]),
+            "review_reactions",
+            json!({"data":{"node":{"reactions":empty}}}),
         );
-        this.write(
-            "issue_comments",
-            json!([
-                [{"id":101,"node_id":"IC_101","body":"PR-wide comment","user":null}],[]
-            ]),
-        );
-        this.write("review_comments", json!([
-            [{"id":201,"node_id":"RC_201","body":"Current range","user":reviewer,
-              "path":"src/new.rs","commit_id":"head-sha","original_commit_id":"old-head",
-              "line":5,"start_line":3,"side":"RIGHT","start_side":"RIGHT",
-              "original_line":4,"original_start_line":2,"original_side":"RIGHT",
-              "original_start_side":"RIGHT","subject_type":"line","diff_hunk":"@@ -1 +1 @@"}],
-            [{"id":202,"node_id":"RC_202","body":"Reply","user":author,"in_reply_to_id":201,
-              "path":"src/new.rs","commit_id":"head-sha","original_commit_id":"old-head",
-              "line":5,"start_line":3,"side":"RIGHT","start_side":"RIGHT",
-              "original_line":4,"original_start_line":2,"subject_type":"line","diff_hunk":"@@ -1 +1 @@"},
-             {"id":203,"node_id":"RC_203","body":"Outdated comment","user":null,
-              "path":"src/old.rs","commit_id":"head-sha","original_commit_id":"older-head",
-              "line":null,"start_line":null,"side":"LEFT","original_line":7,
-              "original_start_line":null,"subject_type":"line","diff_hunk":"@@ -7 +7 @@"}]
-        ]));
-        this.write("reviews", json!([
-            [{"id":301,"node_id":"R_301","state":"APPROVED","body":"Looks good","user":reviewer}],
-            [{"id":302,"node_id":"R_302","state":"DISMISSED","body":"Old objections","user":null},
-             {"id":303,"node_id":"R_303","state":"PENDING","body":"Unsubmitted","user":author}]
-        ]));
-        this.write(
-            "reactions101",
-            json!([[{"id":1001,"content":"+1","user":reviewer}],[]]),
-        );
-        this.write(
-            "reactions201",
-            json!([[{"id":1002,"content":"heart","user":null}]]),
-        );
-        this.write("reactions202", json!([[]]));
-        this.write("reactions203", json!([[]]));
-        this.write("graphql", json!([
-            {"data":{"repository":{"pullRequest":{"baseRefOid":"base-sha","headRefOid":"head-sha",
-             "files":{"totalCount":2,"nodes":[{"path":"src/new.rs","viewerViewedState":"VIEWED"}],
-             "pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}}},
-            {"data":{"repository":{"pullRequest":{"baseRefOid":"base-sha","headRefOid":"head-sha",
-             "files":{"totalCount":2,"nodes":[{"path":"src/old.rs","viewerViewedState":"UNVIEWED"}],
-             "pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}
-        ]));
         this
+    }
+
+    fn read(&self, fixture: &str) -> Value {
+        serde_json::from_slice(
+            &fs::read(self.directory.path().join(format!("{fixture}.json"))).unwrap(),
+        )
+        .unwrap()
     }
 
     fn write(&self, fixture: &str, value: Value) {
@@ -228,6 +205,21 @@ fn fetch_normalizes_all_pages_and_retains_read_history_without_creating_a_batch(
     assert_eq!(review.read.pull_request.title, "Review this");
     assert_eq!(review.read.pull_request.body, "PR description");
     assert_eq!(
+        review.read.pull_request.source,
+        Some(BranchSource {
+            repository: "https://github.com/contributor/repo".into(),
+            branch: "feature/review".into(),
+        })
+    );
+    let queries = fs::read_to_string(fake.directory.path().join("requests.query")).unwrap();
+    assert!(queries.contains("headRefName baseRefName headRepository{url}"));
+    assert!(
+        matches!(store.pull_request(&review.read.pull_request.id).unwrap().unwrap().source,
+        PullRequestSource::Remote { branches: Some(BranchPair { source, sink }), .. }
+        if source.branch == "feature/review" && sink.branch == "master"
+            && sink.repository == "https://github.com/acme/repo")
+    );
+    assert_eq!(
         review.read.pull_request.revision,
         DiffRevision {
             base: "base-sha".into(),
@@ -241,17 +233,38 @@ fn fetch_normalizes_all_pages_and_retains_read_history_without_creating_a_batch(
                 path: "src/new.rs".into(),
                 previous_path: None,
                 change: FileChange::Modified,
+                stats: Some(FileStats {
+                    additions: 12,
+                    deletions: 3,
+                }),
                 viewed: true
             },
             ChangedFile {
                 path: "src/old.rs".into(),
                 previous_path: Some("src/original.rs".into()),
                 change: FileChange::Renamed,
+                stats: Some(FileStats {
+                    additions: 0,
+                    deletions: 8,
+                }),
                 viewed: false
             },
         ]
     );
-    assert_eq!(review.read.comments.len(), 4);
+    assert_eq!(review.read.comments.len(), 6);
+    assert_eq!(
+        review.read.comments[4].content.id.0,
+        mapped(&backend, "review_summary", "301")
+    );
+    assert_eq!(review.read.comments[4].content.body, "Looks good");
+    assert_eq!(review.read.comments[5].content.body, "Old objections");
+    assert!(
+        review
+            .read
+            .comments
+            .iter()
+            .all(|comment| comment.content.body != "Unsubmitted")
+    );
     let issue = &review.read.comments[0];
     assert_eq!(issue.content.id.0, mapped(&backend, "issue_comment", "101"));
     assert_eq!(issue.content.body, "PR-wide comment");
@@ -369,18 +382,59 @@ fn fetch_normalizes_all_pages_and_retains_read_history_without_creating_a_batch(
     );
     assert!(store.batch_ids(&id).unwrap().is_empty());
     for mapping in &backend.mappings {
-        assert_ne!(mapping.core_id, mapping.remote_id);
+        if !mapping.resource.starts_with("created_at:") {
+            assert_ne!(mapping.core_id, mapping.remote_id);
+        }
         Uuid::parse_str(&mapping.core_id).unwrap();
     }
     let second = fetched_id(fake.fetch(URL, None));
-    assert_ne!(id, second);
+    assert_eq!(id, second);
     assert_eq!(
         store.get_review(&second).unwrap().unwrap().read,
         review.read
     );
     assert_eq!(store.review_backend(&second).unwrap().unwrap(), backend);
     assert!(store.batch_ids(&second).unwrap().is_empty());
+    assert_eq!(store.review_ids().unwrap(), vec![id.clone()]);
+
+    let mut changed = fake.read("snapshot");
+    changed["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]["body"] =
+        json!("Remote edit without a new commit");
+    fake.write("snapshot", changed);
+    let edited = fetched_id(fake.fetch(URL, None));
+    assert_ne!(edited, id);
+    let edited_review = store.get_review(&edited).unwrap().unwrap();
+    assert_eq!(
+        edited_review.read.pull_request.revision,
+        review.read.pull_request.revision
+    );
+    assert!(edited_review.read.comments.iter().any(|comment| {
+        comment.content.id == issue.content.id
+            && comment.content.body == "Remote edit without a new commit"
+    }));
+    assert_eq!(store.get_review(&id).unwrap().unwrap(), review);
+    assert_eq!(store.review_backend(&edited).unwrap().unwrap(), backend);
+    assert!(store.batch_ids(&edited).unwrap().is_empty());
     assert_eq!(store.review_ids().unwrap().len(), 2);
+}
+
+#[test]
+fn unavailable_head_repository_keeps_fetched_review_readable_without_branch_source() {
+    let fake = FakeGh::new();
+    let mut snapshot = fake.read("snapshot");
+    snapshot["data"]["repository"]["pullRequest"]["headRepository"] = Value::Null;
+    fake.write("snapshot", snapshot);
+    let id = fetched_id(fake.fetch(URL, None));
+    assert_eq!(
+        fake.store()
+            .get_review(&id)
+            .unwrap()
+            .unwrap()
+            .read
+            .pull_request
+            .source,
+        None
+    );
 }
 
 #[test]
@@ -390,12 +444,10 @@ fn late_request_failure_leaves_existing_snapshot_and_mappings_unchanged() {
     let mut store = fake.store();
     let snapshot = store.get_review(&id).unwrap();
     let backend = store.review_backend(&id).unwrap();
-    let failed = fake.fetch(URL, Some("reactions203"));
+    let failed = fake.fetch(URL, Some("pr"));
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&failed.stderr).contains("Fixture request failed: reactions203")
-    );
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("Fixture request failed: pr"));
     assert_eq!(store.review_ids().unwrap(), vec![id.clone()]);
     assert_eq!(store.get_review(&id).unwrap(), snapshot);
     assert_eq!(store.review_backend(&id).unwrap(), backend);
@@ -405,31 +457,24 @@ fn late_request_failure_leaves_existing_snapshot_and_mappings_unchanged() {
 fn graphql_errors_fail_before_creating_local_state() {
     let fake = FakeGh::new();
     fake.write(
-        "graphql",
-        json!([{"errors":[{"message":"Forbidden viewed-file query"}]}]),
+        "snapshot",
+        json!({"errors":[{"message":"Forbidden snapshot query"}]}),
     );
     let failed = fake.fetch(URL, None);
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("Forbidden viewed-file query"));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("Forbidden snapshot query"));
     fake.assert_no_store();
 }
 
 #[test]
 fn missing_viewed_file_data_fails_instead_of_saving_a_partial_snapshot() {
     let fake = FakeGh::new();
-    fake.write(
-        "graphql",
-        json!([
-            {"data":{"repository":{"pullRequest":{"baseRefOid":"base-sha","headRefOid":"head-sha",
-             "files":{"totalCount":2,"nodes":[{"path":"src/new.rs","viewerViewedState":"VIEWED"}],
-             "pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}
-        ]),
-    );
+    fake.write("graphql",json!({"data":{"repository":{"pullRequest":{"files":{"totalCount":2,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}));
     let failed = fake.fetch(URL, None);
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("viewed-file"));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("pagination incomplete"));
     fake.assert_no_store();
 }
 
@@ -439,8 +484,8 @@ fn duplicate_rest_file_paths_fail_even_when_file_counts_match_viewed_data() {
     fake.write(
         "files",
         json!([
-            [{"filename":"src/new.rs","status":"modified"}],
-            [{"filename":"src/new.rs","status":"modified"}]
+            [{"filename":"src/new.rs","status":"modified","additions":12,"deletions":3}],
+            [{"filename":"src/new.rs","status":"modified","additions":12,"deletions":3}]
         ]),
     );
     let failed = fake.fetch(URL, None);
@@ -472,14 +517,382 @@ fn invalid_pull_request_urls_fail_without_invoking_gh_or_creating_state() {
 #[test]
 fn pull_requests_beyond_github_file_limit_fail_without_saving_truncated_state() {
     let fake = FakeGh::new();
-    let mut pull: Value =
-        serde_json::from_slice(&fs::read(fake.directory.path().join("pr.json")).unwrap()).unwrap();
-    pull["changed_files"] = json!(3001);
-    fake.write("pr", pull);
+    let mut snapshot = fake.read("snapshot");
+    snapshot["data"]["repository"]["pullRequest"]["changedFiles"] = json!(3001);
+    fake.write("snapshot", snapshot);
 
     let failed = fake.fetch(URL, None);
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
     assert!(String::from_utf8_lossy(&failed.stderr).contains("3000"));
     fake.assert_no_store();
+}
+
+#[test]
+fn review_summary_reactions_paginate_and_preserve_current_user() {
+    let fake = FakeGh::new();
+    let mut snapshot = fake.read("snapshot");
+    for review in snapshot["data"]["repository"]["pullRequest"]["reviews"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .take(2)
+    {
+        review["reactions"] = json!({"totalCount":2,"nodes":[{"id":"up","content":"THUMBS_UP","user":{"databaseId":1,"login":"reviewer"}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}});
+    }
+    fake.write("snapshot", snapshot);
+    fake.write("review_reactions",json!({"data":{"node":{"reactions":{"totalCount":2,"nodes":[{"id":"heart","content":"HEART","user":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}));
+    let id = fetched_id(fake.fetch(URL, None));
+    let mut store = fake.store();
+    let review = store.get_review(&id).unwrap().unwrap();
+    let backend = store.review_backend(&id).unwrap().unwrap();
+    for remote in ["301", "302"] {
+        let comment = CommentId(mapped(&backend, "review_summary", remote));
+        let reactions = review
+            .read
+            .reactions
+            .iter()
+            .filter(|reaction| reaction.comment == comment)
+            .collect::<Vec<_>>();
+        assert_eq!(reactions.len(), 2);
+        assert_eq!(reactions[0].reaction, "👍");
+        assert_eq!(reactions[0].author, Some(review.reviewer.id.clone()));
+        assert_eq!(reactions[1].author, None);
+    }
+}
+
+#[test]
+fn failed_summary_reaction_fetch_never_saves_partial_snapshot() {
+    let fake = FakeGh::new();
+    let mut snapshot = fake.read("snapshot");
+    snapshot["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0]["reactions"] =
+        json!({"totalCount":1,"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"next"}});
+    fake.write("snapshot", snapshot);
+    let output = fake.fetch(URL, Some("review_reactions"));
+    assert!(!output.status.success());
+    fake.assert_no_store();
+}
+
+#[test]
+fn ordinary_snapshot_fetch_uses_three_requests_and_inlines_reactions() {
+    let fake = FakeGh::new();
+    let mut snapshot = fake.read("snapshot");
+    let second =
+        fake.read("graphql")["data"]["repository"]["pullRequest"]["files"]["nodes"][0].clone();
+    let files = &mut snapshot["data"]["repository"]["pullRequest"]["files"];
+    files["nodes"].as_array_mut().unwrap().push(second);
+    files["pageInfo"] = json!({"hasNextPage":false,"endCursor":null});
+    fake.write("snapshot", snapshot);
+    fetched_id(fake.fetch(URL, None));
+    let requests = fs::read_to_string(fake.directory.path().join("requests")).unwrap();
+    assert_eq!(requests.lines().count(), 3, "{requests}");
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|line| line.starts_with("api graphql "))
+            .count(),
+        1
+    );
+    assert!(!requests.contains("/reactions"));
+    assert!(!requests.lines().any(|line| line.starts_with("api user ")));
+}
+
+#[test]
+fn overflow_fetches_each_connection_without_refetching_other_first_pages() {
+    let fake = FakeGh::new();
+    let mut snapshot = fake.read("snapshot");
+    let pull = &mut snapshot["data"]["repository"]["pullRequest"];
+    let mut issue = pull["comments"]["nodes"][0].clone();
+    issue["id"] = json!("IC_102");
+    issue["fullDatabaseId"] = json!("102");
+    issue["author"] = json!({"databaseId":9,"login":"bot[bot]"});
+    issue["reactions"] = connection(vec![], false, None);
+    pull["comments"]["totalCount"] = json!(2);
+    pull["comments"]["pageInfo"] = json!({"hasNextPage":true,"endCursor":"issue-next"});
+    let mut next = connection(vec![issue], false, None);
+    next["totalCount"] = json!(2);
+    fake.write(
+        "issue_next",
+        json!({"data":{"repository":{"pullRequest":{"comments":next}}}}),
+    );
+    let mut review = pull["reviews"]["nodes"][0].clone();
+    review["id"] = json!("R_304");
+    review["fullDatabaseId"] = json!("304");
+    review["body"] = json!("Another review");
+    pull["reviews"]["totalCount"] = json!(4);
+    pull["reviews"]["pageInfo"] = json!({"hasNextPage":true,"endCursor":"review-next"});
+    let mut next = connection(vec![review], false, None);
+    next["totalCount"] = json!(4);
+    fake.write(
+        "review_next",
+        json!({"data":{"repository":{"pullRequest":{"reviews":next}}}}),
+    );
+    let reply = pull["reviewThreads"]["nodes"][0]["comments"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .pop()
+        .unwrap();
+    pull["reviewThreads"]["nodes"][0]["comments"]["pageInfo"] =
+        json!({"hasNextPage":true,"endCursor":"comment-next"});
+    let mut next = connection(vec![reply], false, None);
+    next["totalCount"] = json!(2);
+    fake.write("comment_next", json!({"data":{"node":{"comments":next}}}));
+    let mut file_thread = pull["reviewThreads"]["nodes"][1].clone();
+    file_thread["id"] = json!("T204");
+    let file = &mut file_thread["comments"]["nodes"][0];
+    file["id"] = json!("RC_204");
+    file["fullDatabaseId"] = json!("204");
+    file["subjectType"] = json!("FILE");
+    file["originalLine"] = Value::Null;
+    pull["reviewThreads"]["totalCount"] = json!(3);
+    pull["reviewThreads"]["pageInfo"] = json!({"hasNextPage":true,"endCursor":"thread-next"});
+    let mut next = connection(vec![file_thread], false, None);
+    next["totalCount"] = json!(3);
+    fake.write(
+        "thread_next",
+        json!({"data":{"repository":{"pullRequest":{"reviewThreads":next}}}}),
+    );
+    fake.write("snapshot", snapshot);
+    let id = fetched_id(fake.fetch(URL, None));
+    let mut store = fake.store();
+    let review = store.get_review(&id).unwrap().unwrap();
+    let backend = store.review_backend(&id).unwrap().unwrap();
+    assert_eq!(review.read.comments.len(), 9);
+    assert_eq!(review.read.reviews.len(), 4);
+    let bot = review
+        .read
+        .comments
+        .iter()
+        .find(|comment| comment.content.id.0 == mapped(&backend, "issue_comment", "102"))
+        .unwrap();
+    assert_eq!(bot.author.as_ref().unwrap().name, "bot[bot]");
+    let file = review
+        .read
+        .comments
+        .iter()
+        .find(|comment| comment.content.id.0 == mapped(&backend, "review_comment", "204"))
+        .unwrap();
+    let CommentTarget::Diff(anchor) = &file.target else {
+        panic!("file anchor lost")
+    };
+    assert_eq!(anchor.subject, Some(CommentSubject::File));
+    assert!(anchor.original.position.range.is_none());
+    assert!(anchor.current.as_ref().unwrap().position.range.is_none());
+    assert_eq!(
+        fs::read_to_string(fake.directory.path().join("requests"))
+            .unwrap()
+            .lines()
+            .count(),
+        8
+    );
+}
+
+#[test]
+fn inline_and_issue_reaction_overflow_preserves_all_eight_reactions_and_authors() {
+    let fake = FakeGh::new();
+    let mut snapshot = fake.read("snapshot");
+    let first = json!({"id":"r0","content":"THUMBS_UP","user":{"databaseId":1,"login":"reviewer"}});
+    let mut page = connection(vec![first], true, Some("reaction-next"));
+    page["totalCount"] = json!(8);
+    snapshot["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]["reactions"] =
+        page.clone();
+    snapshot["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"]["nodes"]
+        [0]["reactions"] = page;
+    let nodes = [
+        "THUMBS_DOWN",
+        "LAUGH",
+        "HOORAY",
+        "CONFUSED",
+        "HEART",
+        "ROCKET",
+        "EYES",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, content)| json!({"id":format!("r{}",i+1),"content":content,"user":null}))
+    .collect();
+    let mut next = connection(nodes, false, None);
+    next["totalCount"] = json!(8);
+    fake.write(
+        "review_reactions",
+        json!({"data":{"node":{"reactions":next}}}),
+    );
+    fake.write("snapshot", snapshot);
+    let id = fetched_id(fake.fetch(URL, None));
+    let mut store = fake.store();
+    let review = store.get_review(&id).unwrap().unwrap();
+    let backend = store.review_backend(&id).unwrap().unwrap();
+    for (resource, numeric) in [("issue_comment", "101"), ("review_comment", "201")] {
+        let id = mapped(&backend, resource, numeric);
+        let reactions = review
+            .read
+            .reactions
+            .iter()
+            .filter(|reaction| reaction.comment.0 == id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reactions
+                .iter()
+                .map(|reaction| reaction.reaction.as_str())
+                .collect::<Vec<_>>(),
+            ["👍", "👎", "😄", "🎉", "😕", "❤️", "🚀", "👀"]
+        );
+        assert_eq!(reactions[0].author, Some(review.reviewer.id.clone()));
+        assert!(
+            reactions[1..]
+                .iter()
+                .all(|reaction| reaction.author.is_none())
+        );
+    }
+}
+
+#[test]
+fn private_pending_comments_never_become_fetched_comments_or_checklist_reactions() {
+    let fake = FakeGh::new();
+    let mut snapshot = fake.read("snapshot");
+    let comments =
+        &mut snapshot["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"];
+    comments["nodes"][0]["state"] = json!("PENDING");
+    comments["nodes"][1]["state"] = json!("PENDING");
+    fake.write("snapshot", snapshot);
+    let id = fetched_id(fake.fetch(URL, None));
+    let mut store = fake.store();
+    let read = store.get_review(&id).unwrap().unwrap().read;
+    let backend = store.review_backend(&id).unwrap().unwrap();
+    assert!(
+        !read
+            .comments
+            .iter()
+            .any(|comment| matches!(comment.content.body.as_str(), "Current range" | "Reply"))
+    );
+    assert!(
+        !backend
+            .mappings
+            .iter()
+            .any(|mapping| mapping.resource == "review_comment"
+                && matches!(mapping.remote_id.as_str(), "201" | "202"))
+    );
+    assert_eq!(read.reactions.len(), 1);
+    assert!(read.reviews.iter().any(|review| matches!(
+        review.state,
+        ReadReviewState::Inactive {
+            state: InactiveReviewState::Pending,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn missing_graphql_commit_objects_use_only_the_affected_roots_rest_anchor() {
+    let fake = FakeGh::new();
+    let mut snapshot = fake.read("snapshot");
+    let root = &mut snapshot["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0];
+    root["comments"]["nodes"][0]["commit"] = Value::Null;
+    root["comments"]["nodes"][0]["originalCommit"] = Value::Null;
+    root["startDiffSide"] = Value::Null;
+    fake.write("snapshot", snapshot);
+    fake.write(
+        "anchor",
+        json!({"commit_id":"head-sha","original_commit_id":"old-head","start_side":"RIGHT"}),
+    );
+    let id = fetched_id(fake.fetch(URL, None));
+    let mut store = fake.store();
+    let review = store.get_review(&id).unwrap().unwrap();
+    let backend = store.review_backend(&id).unwrap().unwrap();
+    let root = review
+        .read
+        .comments
+        .iter()
+        .find(|comment| comment.content.id.0 == mapped(&backend, "review_comment", "201"))
+        .unwrap();
+    let CommentTarget::Diff(anchor) = &root.target else {
+        panic!("anchor lost")
+    };
+    assert_eq!(
+        anchor.original.revision,
+        ReadCommentRevision::Commit {
+            head: "old-head".into()
+        }
+    );
+    assert_eq!(
+        anchor.current.as_ref().unwrap().revision,
+        ReadCommentRevision::Commit {
+            head: "head-sha".into()
+        }
+    );
+    assert_eq!(
+        anchor.original.position.range.as_ref().unwrap().start.side,
+        DiffSide::Head
+    );
+    let request = fs::read_to_string(fake.directory.path().join("requests")).unwrap();
+    assert_eq!(
+        request
+            .matches("repos/acme/repo/pulls/comments/201")
+            .count(),
+        1
+    );
+    let before = store.review_ids().unwrap();
+    assert!(!fake.fetch(URL, Some("anchor")).status.success());
+    assert_eq!(store.review_ids().unwrap(), before);
+}
+
+#[test]
+fn incomplete_changed_or_malformed_snapshots_never_save_partial_state() {
+    for scenario in [
+        "duplicate",
+        "count_changed",
+        "cursor_repeated",
+        "revision_changed",
+        "missing_id",
+        "partial_errors",
+        "missing_reaction_user_id",
+    ] {
+        let fake = FakeGh::new();
+        match scenario {
+            "duplicate" => {
+                let mut page = fake.read("graphql");
+                page["data"]["repository"]["pullRequest"]["files"]["nodes"][0]["path"] =
+                    json!("src/new.rs");
+                fake.write("graphql", page);
+            }
+            "count_changed" => {
+                let mut page = fake.read("graphql");
+                page["data"]["repository"]["pullRequest"]["files"]["totalCount"] = json!(3);
+                fake.write("graphql", page);
+            }
+            "cursor_repeated" => {
+                let mut page = fake.read("graphql");
+                page["data"]["repository"]["pullRequest"]["files"]["pageInfo"] =
+                    json!({"hasNextPage":true,"endCursor":"files-next"});
+                fake.write("graphql", page);
+            }
+            "revision_changed" => {
+                let mut pull = fake.read("pr");
+                pull["head"]["sha"] = json!("changed-head");
+                fake.write("pr", pull);
+            }
+            other => {
+                let mut snapshot = fake.read("snapshot");
+                match other {
+                    "missing_id" => {
+                        snapshot["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]["fullDatabaseId"] =
+                            Value::Null;
+                    }
+                    "partial_errors" => {
+                        snapshot["errors"] = json!([{"message":"partial result is forbidden"}]);
+                    }
+                    "missing_reaction_user_id" => {
+                        snapshot["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]["reactions"]
+                            ["nodes"][0]["user"]["databaseId"] = Value::Null;
+                    }
+                    _ => unreachable!(),
+                }
+                fake.write("snapshot", snapshot);
+            }
+        }
+        let failed = fake.fetch(URL, None);
+        assert!(!failed.status.success(), "{scenario}");
+        assert!(failed.stdout.is_empty());
+        fake.assert_no_store();
+    }
 }

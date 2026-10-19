@@ -22,6 +22,7 @@ fn snapshot() -> ReadState {
             body: String::new(),
             author: None,
             status: PullRequestStatus::Open,
+            source: None,
             revision: DiffRevision {
                 base: "base".into(),
                 head: "head".into(),

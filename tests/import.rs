@@ -20,6 +20,7 @@ fn snapshot() -> ReadState {
             body: "Snapshot without provider identities".into(),
             author: None,
             status: PullRequestStatus::Open,
+            source: None,
             revision: DiffRevision {
                 base: "base".into(),
                 head: "head".into(),
@@ -94,9 +95,11 @@ fn duplicate_core_or_remote_mapping_rolls_back_entire_import() {
     let project = tempdir().unwrap();
     let existing_id = ReviewId("existing".into());
     let batch_id = BatchId("existing-batch".into());
-    let event = Event::SetFileViewed {
-        path: "src/lib.rs".into(),
-        viewed: true,
+    let event = Event::SetReviewConclusion {
+        conclusion: ReviewConclusion {
+            outcome: ReviewOutcome::Approve,
+            body: None,
+        },
     };
     let mut store = Store::open(project.path()).unwrap();
     store

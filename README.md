@@ -1,8 +1,267 @@
 # buf-review
 
 An editor-independent review tool with a Rust domain model, SQLite persistence,
-local Git diffs and GitHub reading/writing through the `gh` CLI. The Neovim
-frontend is a separate next step.
+local Git diffs and GitHub reading/writing through the `gh` CLI. Its Neovim
+frontend uses immutable code buffers, local Markdown drafts and an individual
+comment checklist.
+
+## Neovim
+
+Install the CLI with `cargo install --path .`. Add this repository to Neovim's
+runtime path through your package manager or `pack/*/start` directory. Neovim
+0.10+, Git and authenticated `gh` are required; no setup call or Lua dependency
+is needed. The optional `vim.g.buf_review_executable` selects a different `pr`
+executable; otherwise it is found on PATH.
+
+Run `:Review` inside a Git repository. From source, the current branch's only
+open PR is selected; zero or multiple matches open the PR picker. Selecting a
+PR creates a session when none are unfinished, resumes its only unfinished session,
+or opens the session browser when several are unfinished. Use
+`:Review prs` to choose any PR, or `:Review sessions` to browse saved sessions
+grouped by PR. `:Review sessions new` creates another session for the selected
+or current PR. Each session is a batch with a stable ID; refresh and publication
+preserve it. Inside a review buffer, `:Review` returns to that bound session.
+
+Use `:Review pr master` to review the current branch against `master` before a
+GitHub PR exists. The command reuses an existing open PR for that exact source/
+target repository and branch pair, or creates a local PR intent before opening
+its review session. Existing session routing still creates, resumes or offers
+unfinished batches. Only committed changes enter the pinned diff; staged and
+unstaged source edits stay outside it.
+The base must name an available local branch; fetch/create it first when absent.
+
+For a local intent, Enter on the home title opens a Markdown composer: first
+line is the PR title, the rest its body. `:w` and `:wq` save locally. Publishing
+reuses a matching open PR or creates a draft PR, then sends the selected review
+changes. Push the reviewed commits with ordinary Git/Fugitive first; the plugin
+does not push them. Binding preserves logical PR, session and draft IDs plus
+comparison pins. A PR creation result survives later comment failures/restarts.
+Conflicting existing local PR identities block binding and retain both sessions.
+
+PR browsing leaves your checkout unchanged. Home shows the local branch, its
+relationship to the fetched PR head, and staged/modified/untracked file counts.
+Enter on `Checkout:` or run `:Review checkout` to switch to the PR branch.
+Unsaved source buffers and unfinished Git operations block switching. With disk
+changes, choose Cancel, Stash & switch, or Carry changes & switch. Stashes are
+ordinary named Git stashes; restore them through Git or Fugitive. Stashing includes
+untracked files but excludes `.review/` and ignored files. Existing local commits
+are preserved; successful checkout reloads unmodified source buffers. Review
+sessions and comparison pins stay fixed. Checkout orchestration belongs to Lua;
+Rust supplies its remote PR source metadata alongside review state.
+
+Use `:Review start` to make new inline comments part of a WIP review. Enter on a
+file opens the immutable base/head diff; Enter on code opens its existing-thread
+list, including a single thread, and does nothing when there are no threads.
+Enter on a list entry opens its discussion. `a` on code or in the location's
+thread list starts a new thread; `a` in a discussion replies to its root,
+including your own thread. Enter on your own comment edits it; other comments
+stay read-only. Visual `a` starts a range comment. `:w` saves the Markdown
+composer locally; `:wq` returns to its originating reader or code context.
+Existing source editing and navigation remain ordinary Neovim.
+
+Default normal-mode shortcuts use your configured leader: `<leader>rs` shows
+Review, `<leader>rr` refreshes, `<leader>rp` publishes, `<leader>rcc` concludes a
+review, and `<leader>rcs` inserts a suggestion in its comment composer. Set
+`mapleader` before loading the plugin. Existing user mappings take precedence.
+
+In the home buffer, `cc` chooses Comment, Approve or Request changes and opens
+the conclusion composer. `:wq` saves and submits; `:x`/`ZZ` submit only after a
+write during that opening. `:q` stays local, even after a save; `:q!` discards
+unsaved text while preserving previous saves. `:Review leave` preserves the
+WIP and returns new comments to standalone defaults. `:Review publish` sends
+standalone changes and progress independently.
+
+Publishing and conclusion submission wait for writes, then fetch and apply
+fresh PR state before completing. A preceding background refresh finishes first;
+the post-publication fetch starts after the writes. Refresh failure is reported
+separately and keeps confirmed publication results intact.
+
+Todo includes fetched remote comments without **your** thumbs-up, including
+individual replies and nonblank review summaries. `s` marks the selected fetched
+comment Done; `u` reopens it. On a file, the same keys mark viewed/unviewed.
+Marking keeps cursor and scroll position; `:Review next` and `:Review previous`
+navigate Todo separately. Local drafts are excluded until published and fetched.
+Your own fetched comments enter the same checklist.
+
+Overview file rows show `M +12 -3  path`: modified, added (`A`) or deleted (`D`),
+with added/removed line counts. Renames, copies and type changes use `M`.
+Status and counts use theme colors. Stats describe the pinned comparison;
+unavailable cached counts show `?`.
+
+In Review buffers, `]f`/`[f` navigate files, including viewed files, and `]r`/`[r`
+navigate comments, including Done comments. These motions never mark progress.
+`]F`/`[F` try marking the active file viewed, then open the next/previous unviewed
+file. `]R`/`[R` try marking the active comment Done, then open the next/previous
+Todo with its code. All four work throughout Review buffers. Opening or focusing
+a diff selects its file; opening or focusing a discussion selects its comment.
+Moving between code and discussion keeps the other selection. Mark only while
+the target is visible in the current tab; either diff side counts for a file.
+Without a visible active conversation, `]R` opens the first unfinished comment
+at the current diff line or picker location directly; `[R` opens the last.
+Replies count individually, including replies to Done roots. Later presses
+mark and advance in global Todo order, across threads on the same line.
+If the location has no Todo, ordinary Todo navigation supplies the next item.
+Hidden or closed means navigation only, even if another inactive target is
+visible. Already viewed/Done, local drafts and pending deletions advance without
+marking; mark failures are reported and still advance. Both skip finished items
+and stop at the ends. Unsaved composers block navigation. `s` continues marking
+without moving; lowercase `[c`/`]c` retain native diff navigation.
+
+Newer navigation wins over pending loads or automatic jumps. Pending marks still
+save. Opening another file closes its predecessor's managed discussion; same-file
+and PR-wide discussions remain, as do additional windows opened manually.
+Internal pane changes preserve the jumplist; ordinary user motions still record
+jumps normally.
+
+Comment navigation opens the relevant code in both diff panes. Historical comments
+show the referenced historical file on the left and its latest fetched PR-head
+version on the right, with the thread below. This shows changes since the comment,
+including renames; a deleted current file has an empty right pane labelled absent.
+Winbars show Historical / PR head and commit SHAs. Verified comment ranges are
+highlighted on the left. Unknown original base-side context is labelled
+Reconstructed and its lines are never guessed. Missing history shows the recorded
+hunk above the thread. Current-comment/file navigation restores the pinned
+comparison.
+Historical code is a reference: replies and Done work in the thread, while new
+inline comments and file-viewed marks require current code.
+PR-wide comments open their discussion without changing code.
+Readers reuse stable numbered buffers during navigation. A manual split keeps
+its existing target; navigation uses another slot when needed. Composers remain
+separate, and their return readers stay reserved until the composer closes.
+
+Inline markers show fetched comments with `[ ]` none Done, `[-]` partly Done,
+or `[x]` all Done, using your thumbs-up on each comment/reply. Local comments
+are counted separately without a completion badge. Opening or focusing a
+comment highlights its exact referenced range on the matching diff side while
+its pane is visible. Replies use the root's range; historical anchors never
+guess current lines. `BufReviewCommentRange` defaults to the theme's `Visual`.
+
+In home/thread lists and discussions, `dd`, `d{motion}`, `D`, `x` and visual
+`d`/`x` delete touched owned comments. Deletion stays local until publication;
+deleting an unpublished draft cancels its creation. Headings and dividers are inert.
+`u` restores a pending deletion, cancels a new unpublished comment or reply,
+or marks a fetched comment Todo or a file unviewed. Visual `u` applies the same
+action per object, with selected draft replies canceled before their parents.
+
+Home shows publication status, pending/published counts and publication history.
+Enter on a publication opens its saved operations, results and errors read-only.
+`:Review log` opens the session's complete event timeline, newest first, with
+readable action summaries and highlighted errors. Enter expands an event's
+details; its exact recorded JSON is in a nested fold. Native `zo`/`zc` work too.
+Generation numbers identify event order; the viewer does not change saved history.
+
+Review actions compose with native motions, macros, `:global`, `:vglobal` and
+ranged `:normal`. Reader buffers stay fixed while the command runs. Actions
+capture object IDs, enter one ordered session queue and execute as Rust action
+lists; readers rebuild at Neovim's safe boundary. Contextual `u` and grouped
+deletion resolve against the preceding actions' results. Reads, composer saves
+and session switches wait for earlier local writes; saves also complete their
+own write before returning. Pending local writes finish on editor exit.
+`a` supports complete insert/save/return sequences in native commands. Provider
+publication remains explicit and blocks until publication and its refresh
+complete; `:normal!` bypasses mappings.
+Background refresh fetches an immutable snapshot, then queues its local merge
+alongside writes. Local actions never wait for that network fetch.
+
+The selected session and saved drafts persist in the repository root's
+`.review/state.sqlite3`. Refresh preserves local intent, reports conflicts and
+never moves saved anchors or the pinned comparison implicitly. Commands,
+`<Plug>` mappings, composer behavior and original-context navigation are
+documented in `:help buf-review` (generate help tags with `:helptags` for a manual
+runtime-path installation). [SPEC.md](SPEC.md) records the complete UX contract.
+
+### Workspace protocol
+
+`pr workspace` reads one JSON request from stdin and returns JSON. It discovers
+the Git working-tree root, including when invoked from a subdirectory. For
+example, `{"op":"active"}` reads saved selection without contacting GitHub;
+`{"op":"list","state":"open","assignee":"@me"}` lists assigned PRs.
+`{"op":"get","workspace":"BATCH-ID"}` reads a specific saved session
+without changing selection or contacting GitHub.
+`{"op":"entry"}` routes the current branch; `{"op":"route","url":"PR-URL"}`
+routes a selected PR. Routing returns a batch ID, a filtered sessions browser,
+or the remote PR list. `{"op":"select","batch":"BATCH-ID"}` explicitly
+persists selection and returns its workspace view. `{"op":"sessions"}`
+lists saved sessions; `{"op":"new","workspace":"BATCH-ID"}` creates a
+new session for that PR. View IDs are canonical batch IDs. Backend projections
+provide pending/published counts and publication history; Lua does not infer
+session lifecycle from WIP activity.
+Mutations include the workspace ID and its expected `generation`; stale saves
+fail without replacing newer work. The Lua frontend uses this structured API;
+provider logic and storage remain in Rust.
+
+`{"op":"pr","base":"master"}` creates/selects the current branch's PR
+object and returns the same batch/session routing. Workspace views expose its
+canonical `pr`: logical `id`, metadata `revision`, `title`, `body`, and tagged
+`source` (`local_intent` with `branches`, or `remote` with `locator` and optional
+`branches`). Each branch has `repository` and `branch`. The immutable review
+snapshot retains its own PR metadata and comparison.
+
+Save intent metadata through the ordinary action list using
+`{"action":"pr_details","revision":0,"title":"Title","body":"Body"}`.
+Its revision is the PR object's revision, alongside the request's workspace
+generation. Metadata and its history commit together; stale or already-remote
+PR edits fail without replacing newer text. `publish`/`submit` resolve local
+PR intent before publishing their selected comment/progress plans.
+These CLI operations return local state with publication receipts. The Neovim
+plugin explicitly chains a subsequent fetch and reconciliation.
+
+`{"op":"log","workspace":"BATCH-ID"}` returns `log` entries newest first.
+Each has `generation`, `summary`, `details` (display lines), `level`
+(`info`/`success`/`error`) and `raw` (complete recorded JSON as display lines).
+
+Local actions accept an ordered list, including a one-element list for ordinary
+saves. For example:
+
+```json
+{"op":"actions","workspace":"BATCH-ID","generation":3,"actions":[{"action":"reaction","comment":"COMMENT-ID","present":true},{"action":"viewed","path":"src/main.rs","viewed":true}]}
+```
+
+The response contains one final `workspace` and an `applied` count. Each changed
+action retains its own generation and history entry. A domain validation failure
+commits the successful prefix and returns `error` and zero-based `failed_index`;
+clients apply the returned workspace before reporting the error. Publication and
+provider journal actions are excluded from this list. Malformed lists are
+rejected before applying any action.
+`undo` and `delete_comments` accept `comments` arrays. Rust preflights each
+selection and orders draft children before parents; execution failures retain
+successful children and stop the rest. Each changed child has a journal entry.
+
+Successful state responses contain `workspace`. Read/publication failures that
+also need to return updated state contain both `workspace` and `error`;
+clients must apply that generation before retry. Invalid requests and stale
+generations exit nonzero with an error on stderr. Snapshot and batch inspection
+commands below remain available independently. Local mutation input is always an
+`actions` array, including for one action; scalar mutation operations are rejected.
+
+Routing that fetched a new snapshot can return `fresh_review`. Pass it to
+`select`; the backend returns `fresh:true` only when it matches the selected
+snapshot. This skips a duplicate first refresh. Cached selections still refresh;
+later refreshes run in the background. Hidden readers rebuild when displayed,
+so local actions redraw only visible review buffers.
+
+Selection runs `{"op":"fetch_objects","workspace":"BATCH-ID"}` before showing
+review objects. Rust prepares pinned base/head history and latest fetched PR head
+first, then batch-checks all original comment commits in Git's local object
+database. Any remaining missing hashes fetch together. Already-local commits need
+no network, including
+commits outside current branch history. Later refreshes prepare newly discovered
+hashes while the existing view remains usable. Unavailable historical hashes
+produce explicit warnings and retain the recorded-hunk fallback; unavailable
+current pins produce an error. Git-object preparation never changes the current branch,
+worktree, index, refs or FETCH_HEAD.
+
+Git stores file contents; SQLite retains snapshots, anchors and publication
+receipts. Confirmed receipts restore our comments' exact original comparisons
+on later imports. Historical views read Git objects directly; after local pruning,
+preparation attempts to fetch missing objects again. No duplicate SQLite blob
+cache or background file-caching job is used.
+
+A refresh response with `refresh_deferred:true` preserves the current workspace
+when publication or a newer refresh makes its fetched snapshot obsolete. Clients
+must retain the previous freshness indicator and retry explicitly. Composer
+saves retry once after a cache read only when their saved target/content remain
+unchanged; concurrent edits still fail without replacing text.
 
 ## Fetch
 
@@ -13,9 +272,10 @@ cargo run --bin pr -- fetch https://github.com/OWNER/REPO/pull/NUMBER
 ```
 
 Or install with `cargo install --path .` and run `pr fetch <PR URL>`. The command
-accepts github.com PR URLs and prints the new local `ReviewId` on stdout. It saves
+accepts github.com PR URLs and prints the selected local `ReviewId` on stdout. It saves
 the fetched snapshot in the current directory's `.review/state.sqlite3` without
-creating a batch. Repeated fetches create independent immutable snapshots.
+creating a batch. An unchanged fetch reuses the matching immutable snapshot;
+changed remote state becomes the new baseline while local intent stays separate.
 
 The adapter reads PR metadata, revisions, changed files and the authenticated
 user's viewed flags, PR-wide comments, diff comments and replies, individual
@@ -31,7 +291,8 @@ not a server-side transaction, so other review activity can change during fetch.
 
 ## CLI workflow
 
-Commands use the current directory's `.review/state.sqlite3`. Review and batch
+The low-level commands below use the current directory's `.review/state.sqlite3`.
+Review and batch
 selection is explicit; opening a batch does not change any global active state.
 Install with `cargo install --path .`, or replace `pr` below with
 `cargo run --bin pr --`.
@@ -44,16 +305,28 @@ pr batch open "$batch"
 pr diff "$review"
 ```
 
-Append one JSON event at a time through stdin. The following marks a file viewed:
+Save local changes through the same action-list API used by Neovim. A new batch
+starts at generation zero:
 
 ```sh
-pr stage "$batch" <<'JSON'
-{"kind":"set_file_viewed","path":"src/lib.rs","viewed":true}
+pr workspace <<JSON
+{"op":"actions","workspace":"$batch","generation":0,"actions":[{"action":"save","body":"Review comment","target":{"kind":"pull_request"}}]}
 JSON
 pr state "$batch"
 pr plan "$batch"
-pr commit "$batch"
 ```
+
+Use the generation returned by the latest response when publishing:
+
+```sh
+pr workspace <<JSON
+{"op":"publish","workspace":"$batch","generation":1}
+JSON
+```
+
+`publish` sends eligible standalone changes and progress. `submit` publishes the
+saved WIP review and conclusion. Both use the same recorded-attempt workflow as
+Neovim.
 
 | Command | Output |
 | --- | --- |
@@ -63,52 +336,53 @@ pr commit "$batch"
 | `pr batch new <review-id>` | New batch ID, plain text |
 | `pr batch list <review-id>` | JSON array of batch IDs |
 | `pr batch open <batch-id>` | JSON batch and its complete ordered event log |
-| `pr stage <batch-id>` | Retained event JSON; input is one Event JSON on stdin |
 | `pr state <batch-id>` | JSON projection of snapshot and the complete event log |
 | `pr plan <batch-id>` | JSON pending net operations, accounting for saved results |
 | `pr diff <review-id> [--base <commit>] [--head <commit>] [--path <path>]` | Local Git diff |
-| `pr commit <batch-id>` | JSON array of all successful operation results for the batch |
+| `pr workspace` | Structured JSON response; reads one request from stdin |
 
-Errors go to stderr with a nonzero exit status. `stage` deserializes and retains
-events without cancelling or replacing earlier events. `state`, `plan` and
-`commit` validate their interpretation; invalid references or unsupported
-placements produce explicit errors.
+Invalid requests go to stderr with a nonzero exit status. Local action failures
+return the final saved workspace, successful-prefix count and failing index.
+Fetched replies remain independent resources when their root is deleted, while
+new replies require a live diff root. Delete unpublished replies before their
+parent; action order is preserved. Provider constraints are checked before
+publication.
 
 Diffs use two local commit objects, defaulting to the fetched base/head. Both
 overrides are independent. The command does not fetch missing commits or change
 the working tree. Paths are literal, and external diff/text conversion commands
 are disabled.
 
-### Events
+### Local actions
 
-`src/model.rs` defines the wire format. For example, create a PR-wide draft with
-a new logical ID and the `reviewer` object returned by `pr show`:
+`src/workspace.rs` defines actions. Rust assigns comment identities and ownership.
+For example, create a PR-wide draft:
 
 ```json
 {
-  "kind": "create_comment",
-  "comment": {
-    "id": "YOUR-NEW-LOGICAL-UUID",
-    "body": "Review comment",
-    "author": {"id": "REVIEWER-CORE-ID", "name": "reviewer"},
-    "target": {"kind": "pull_request"}
-  }
+  "action": "save",
+  "body": "Review comment",
+  "target": {"kind": "pull_request"}
 }
 ```
 
-The same ID targets subsequent operations:
+The saved comment ID targets later actions:
 
 ```json
-{"kind":"edit_comment","comment":"YOUR-NEW-LOGICAL-UUID","body":"Revised text"}
-{"kind":"delete_comment","comment":"YOUR-NEW-LOGICAL-UUID"}
-{"kind":"set_comment_reaction","comment":"COMMENT-CORE-ID","reaction":"👍","present":true}
-{"kind":"set_review_conclusion","conclusion":{"outcome":"approve","body":null}}
-{"kind":"dismiss_review","review":"REVIEW-RESOURCE-CORE-ID","message":"Superseded"}
+[
+  {"action":"save","comment":"COMMENT-ID","body":"Revised text"},
+  {"action":"delete","comment":"COMMENT-ID"},
+  {"action":"restore","comment":"COMMENT-ID"},
+  {"action":"reaction","comment":"FETCHED-COMMENT-ID","present":true},
+  {"action":"viewed","path":"src/lib.rs","viewed":true}
+]
 ```
 
-These are separate event examples; submit each as a separate `stage` invocation.
-Use `present:false` to remove a reaction and `viewed:false` to mark a file
-unviewed. Conclusions accept `comment`, `approve` or `request_changes`.
+Put actions in the request's `actions` array. `restore` restores an unsent
+deletion. Progress uses your thumbs-up on fetched comments; use
+`present:false` to reopen one and `viewed:false` to mark a file unviewed. `start`
+activates a WIP review; `summary` saves its conclusion, with outcome `comment`,
+`approve` or `request_changes`. The action log remains available through `log`.
 
 A diff draft's target contains the complete local comparison and a one-based,
 inclusive range on one side. A single line has equal endpoints; `range:null`
@@ -131,12 +405,11 @@ targets the file:
 Use `side:"base"` for the old side. Replies use
 `{"kind":"reply","target":"PARENT-COMMENT-CORE-ID"}` and require a diff
 thread. The parent may be fetched, a draft, or another reply in that thread.
-PR-wide comments have no replies in the core specification. Recreating a
-deleted draft requires a new ID.
+PR-wide comments have no replies in the core specification.
 
-## Commit and retry
+## Publication and retry
 
-The core projects the entire event log into intended state. At commit time it
+The core projects the entire event log into intended state. At publication it
 compares that state with the fetched snapshot plus successful operation results.
 The resulting `CommitState` contains only net operations. A create followed by a
 delete produces no server write; toggles back to their baseline cancel too.
@@ -148,39 +421,46 @@ Returned IDs are also installed in the separate provider mapping table. New
 comments retain their logical IDs, so later edits, replies, reactions and deletes
 can target the published resources.
 
-A failure stops the commit. Run `pr plan <batch-id>` to inspect remaining changes,
-then repeat `pr commit <batch-id>` to resume. Recorded effects are accounted for,
-so a successful creation is not repeated. Append new events to any old batch and
-commit it again. A later delete removes an already published draft even though
+A failure stops publication. Read the returned workspace or run
+`pr plan <batch-id>` to inspect remaining changes, then repeat `publish` or
+`submit` with the latest generation. Recorded effects are accounted for, so a
+successful creation is not repeated. Save new actions to a batch and publish
+again. A later delete removes an already published draft even though
 its original create/delete pair would have cancelled before publication. A
 successful conclusion is not repeated unless the intended conclusion changes.
 
 GitHub publishing validates known constraints for the whole plan before writing.
+Before publishing a nonempty plan, it also checks that the authenticated GitHub
+account matches the fetched reviewer. Empty plans make no GitHub requests.
 It supports PR-wide and diff comments, native diff replies, edits/deletes,
-viewed/unviewed files, all eight GitHub comment reactions, conclusions and
-dismissal with a reason. GitHub requires nonempty bodies for comment-only and
-request-changes conclusions; the core keeps optional text for all outcomes.
+viewed/unviewed files, thumbs-up progress and review conclusions. GitHub requires
+nonempty bodies for comment-only and request-changes conclusions; the core keeps
+optional text for all outcomes.
 Draft diff anchors retain their base/head pair, but GitHub accepts a reviewed
 head, path and location rather than an arbitrary comparison base. The adapter
 does not substitute a different anchor; GitHub validates whether the location
 exists in its diff. Permissions are also enforced by GitHub.
 
-Commit processes hold an OS lock on the existing SQLite file while preparing,
-publishing and recording results. This serializes commits within the project;
-the OS releases the lock when the process exits. It does not require a lock file
-or prevent other commands from staging events for the next commit.
+Publication processes hold an OS lock on `.review/publish.lock` while preparing,
+publishing and recording results; the OS releases it when the process exits.
+Local saves remain available during publication, subject to the frozen
+attempt's scope.
 
 Remote writes and SQLite commits cannot form a single transaction. If a remote
 write succeeds but its local result cannot be saved, the CLI reports that
-explicitly; repeating the operation can repeat the remote write. A lost server
-response has the same uncertainty.
+explicitly. The API records attempts before writing, reconciles uncertain results
+before retry, and keeps inconclusive operations blocked while unrelated changes
+can publish.
 
 ## Model
 
-Each local `ReviewId` owns a fetched `ReadState`. A globally unique `BatchId`
+Each local `ReviewId` owns an immutable `ReadState`, fetched or built from local
+committed changes. A globally unique `BatchId`
 identifies an editable `WriteState` and links it to one review. Multiple batches
 can share a review's fetched baseline. A `PullRequestId` identifies the PR;
 multiple local reviews can concern the same PR.
+The canonical PR object exists before its reviews and can start as a local
+intent. Binding it to GitHub retains its logical ID and all referencing batches.
 All resource identities are local domain identities. Backend adapters will map
 provider IDs and data types into this model rather than exposing them to the
 core. The caller assigns resource identities; the CLI generates review/batch IDs.
@@ -213,6 +493,8 @@ uses a new identity. There is no undo operation. The core interprets events
 and collapse net changes into commit state. A backend adapter consumes that
 post-processed state and writes it to the server; it does not interpret the raw
 event history. Provider mapping and server communication belong to the adapter.
+Comment creation order follows the persisted event sequence through projection,
+publication and refresh; UUIDs remain identities rather than ordering keys.
 The GitHub adapter uses `gh` for API access and authentication. Dismissal is a
 standard core operation; no backend capability framework has been added.
 
@@ -227,6 +509,17 @@ review metadata, fetched snapshots, batches and individual sequenced events in
 separate tables. The `batches` table links `batch_id` to `review_id`; event rows
 refer only to `batch_id`. Snapshots and event payloads use Serde JSON; SQLite owns
 transactions and event ordering. `src/schema.sql` defines the current schema.
+
+Fetched payloads are shared rather than copied into every workspace generation.
+Workspace records reference their review, event prefix and successful receipts;
+history stores field changes and reconstructs prior generations when needed.
+An ordinary progress mark therefore records local changes without another copy
+of the PR. Identical fetches reuse evidence only when reviewer and provider
+identities also match. Explicitly imported review IDs remain valid.
+
+Opening an older database migrates full workspace checkpoints transactionally,
+preserving drafts, history, pinned comparisons and publication recovery state.
+The completed migration compacts the database to release the redundant pages.
 
 `review_sources` and `id_mappings` hold backend metadata separately.
 `Store::import_review` saves a snapshot and its source/mappings atomically;
@@ -253,16 +546,23 @@ Snapshots, reviewers and ordered events are preserved. The original event table
 is retained as `legacy_write_events`; the old `committed` column is retained but
 no longer controls editing. Reopening the migrated store does not migrate again.
 
-To recover the original schema for an older binary, stop database users and,
-within one SQLite transaction, rename `write_events` to `batch_write_events`,
-then rename `legacy_write_events` to `write_events`. Original snapshots and logs
-are available to the old reader; newer batch data remains preserved in the
-batch tables but cannot be represented by the old API. Use a copy of the database
-for this recovery so the current store remains available.
+The compact workspace format requires the current binary. Running an older
+binary requires a database copy from before migration; renaming the retained
+event tables does not restore the older workspace format.
 
 ## Checks
 
 Run `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
 Rust 1.89 or newer is required. The existing Nix development shell supplies the
-Rust tools. GitHub integration tests use a fixture `gh` executable; they do not
-write to a live PR.
+Rust tools, Neovim and Python for fixture processes. Run the standalone UI
+workflows with:
+
+```sh
+nvim --headless -u NONE -c 'lua loadfile("tests/nvim/run.lua")("tests/nvim/workflows.lua")'
+```
+
+The test driver yields to the real event loop so native command boundaries and
+`SafeState` are exercised.
+`cargo test` also runs a headless Neovim workflow against the real cached CLI.
+GitHub integration tests use fixture `gh` executables; they do not write to a
+live PR.

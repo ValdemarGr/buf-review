@@ -24,6 +24,7 @@ fn baseline() -> ReadState {
             body: String::new(),
             author: None,
             status: PullRequestStatus::Open,
+            source: None,
             revision: DiffRevision {
                 base: "base".into(),
                 head: "head".into(),
@@ -33,6 +34,7 @@ fn baseline() -> ReadState {
             path: "file.rs".into(),
             previous_path: None,
             change: FileChange::Modified,
+            stats: None,
             viewed: false,
         }],
         comments: Vec::new(),
@@ -72,9 +74,31 @@ fn success(output: Output) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+fn project() -> tempfile::TempDir {
+    let project = tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(project.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    project
+}
+
+fn workspace(project: &Path, request: Value) -> Value {
+    serde_json::from_str(&success(run(
+        project,
+        &["workspace"],
+        Some(&request.to_string()),
+    )))
+    .unwrap()
+}
+
 #[test]
 fn explicit_batches_preserve_log_while_plans_collapse_cancelled_changes() {
-    let project = tempdir().unwrap();
+    let project = project();
     let id = ReviewId("review".into());
     Store::open(project.path())
         .unwrap()
@@ -101,16 +125,18 @@ fn explicit_batches_preserve_log_while_plans_collapse_cancelled_changes() {
             viewed: false,
         },
     ];
-    for event in &events {
-        let input = serde_json::to_string(event).unwrap();
-        let retained: Event = serde_json::from_str(&success(run(
-            project.path(),
-            &["stage", &first],
-            Some(&input),
-        )))
-        .unwrap();
-        assert_eq!(&retained, event);
-    }
+    let response = workspace(
+        project.path(),
+        json!({
+            "op":"actions", "workspace":first,"generation":0,
+            "actions":[
+                {"action":"viewed","path":"file.rs","viewed":true},
+                {"action":"viewed","path":"file.rs","viewed":false}
+            ]
+        }),
+    );
+    assert_eq!(response["applied"], 2);
+    assert!(response.get("error").is_none());
     let opened: Batch = serde_json::from_str(&success(run(
         project.path(),
         &["batch", "open", &first],
@@ -151,7 +177,7 @@ fn explicit_batches_preserve_log_while_plans_collapse_cancelled_changes() {
 
 #[test]
 fn bad_json_and_unknown_ids_fail_without_appending_events() {
-    let project = tempdir().unwrap();
+    let project = project();
     let review = ReviewId("review".into());
     let batch = BatchId("batch".into());
     let mut store = Store::open(project.path()).unwrap();
@@ -161,9 +187,9 @@ fn bad_json_and_unknown_ids_fail_without_appending_events() {
     store.create_batch(&batch, &review).unwrap();
     for input in [
         "{",
-        "{\"kind\":\"set_file_viewed\",\"path\":\"file.rs\",\"viewed\":true} {}",
+        "{\"op\":\"actions\",\"workspace\":\"batch\",\"generation\":0,\"actions\":[]} {}",
     ] {
-        let result = run(project.path(), &["stage", "batch"], Some(input));
+        let result = run(project.path(), &["workspace"], Some(input));
         assert!(!result.status.success());
         assert!(result.stdout.is_empty());
         assert!(!result.stderr.is_empty());
@@ -197,247 +223,112 @@ fn bad_json_and_unknown_ids_fail_without_appending_events() {
 }
 
 #[test]
-fn partial_commit_retry_skips_success_and_later_edit_uses_saved_mapping() {
-    use buf_review::store::{ReviewBackend, ReviewSource};
-    use std::{fs, os::unix::fs::PermissionsExt};
-
-    let project = tempdir().unwrap();
-    let tools = tempdir().unwrap();
-    let executable = tools.path().join("gh");
-    fs::write(
-        &executable,
-        r#"#!/bin/sh
-printf '%s\n' "$*" >> "$FAKE_GH_LOG"
-body=$(cat)
-printf '%s\n' "$body" >> "$FAKE_GH_LOG"
-case "$*" in
-  *"--method POST"*)
-    case "$body" in
-      *'"body":"First"'*) printf '{"id":101}\n' ;;
-      *'"body":"Second"'*)
-        if [ -f "$FAKE_GH_FAIL" ]; then printf 'second failed\n' >&2; exit 1; fi
-        printf '{"id":102}\n'
-        ;;
-      *) printf 'unexpected create\n' >&2; exit 1 ;;
-    esac
-    ;;
-  *"repos/acme/repo/issues/comments/101"*"--method PATCH"*) printf '{"id":101}\n' ;;
-  *) printf 'unexpected request\n' >&2; exit 1 ;;
-esac
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-    let log = tools.path().join("requests");
-    let fail = tools.path().join("fail");
-    fs::write(&fail, "").unwrap();
-    let path = std::env::join_paths(
-        std::iter::once(tools.path().to_path_buf())
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    let commit = || {
-        Command::new(env!("CARGO_BIN_EXE_pr"))
-            .current_dir(project.path())
-            .args(["commit", "batch"])
-            .env("PATH", &path)
-            .env("FAKE_GH_LOG", &log)
-            .env("FAKE_GH_FAIL", &fail)
-            .output()
-            .unwrap()
-    };
-    let id = ReviewId("review".into());
+fn invalid_event_is_rejected_and_batch_remains_usable() {
+    let project = project();
+    let review = ReviewId("review".into());
     let batch = BatchId("batch".into());
     let mut store = Store::open(project.path()).unwrap();
     store
-        .import_review(
-            &id,
-            &reviewer(),
-            &baseline(),
-            &ReviewBackend {
-                source: ReviewSource {
-                    backend: "github".into(),
-                    locator: "https://github.com/acme/repo/pull/7".into(),
-                },
-                mappings: Vec::new(),
-            },
-        )
+        .create_review(&review, &reviewer(), &baseline())
         .unwrap();
-    store.create_batch(&batch, &id).unwrap();
-    for (id, body) in [("first", "First"), ("second", "Second")] {
-        store
-            .append_event(
-                &batch,
-                &Event::CreateComment {
-                    comment: DraftComment {
-                        content: CommentContent {
-                            id: CommentId(id.into()),
-                            body: body.into(),
-                        },
-                        author: reviewer(),
-                        target: CommentTarget::PullRequest,
-                    },
-                },
-            )
-            .unwrap();
-    }
-    let failure = commit();
-    assert!(!failure.status.success());
-    assert!(failure.stdout.is_empty());
+    store.create_batch(&batch, &review).unwrap();
+    let output = workspace(
+        project.path(),
+        json!({
+            "op":"actions","workspace":"batch","generation":0,
+            "actions":[{"action":"save","comment":"missing","body":"Edit"}]
+        }),
+    );
+    assert_eq!(output["applied"], 0);
+    assert!(output["error"].as_str().unwrap().contains("does not exist"));
     assert!(
-        String::from_utf8(failure.stderr)
+        store
+            .get_batch(&batch)
             .unwrap()
-            .contains("second failed")
+            .unwrap()
+            .write
+            .events
+            .is_empty()
     );
-    let receipts = store.operation_results(&batch).unwrap();
-    assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].mappings[0].core_id, "first");
-    assert_eq!(receipts[0].mappings[0].remote_id, "101");
-    fs::remove_file(&fail).unwrap();
-    let successful: Value = serde_json::from_str(&success(commit())).unwrap();
-    assert_eq!(successful.as_array().unwrap().len(), 2);
-    let requests = fs::read_to_string(&log).unwrap();
-    assert_eq!(requests.matches("\"body\":\"First\"").count(), 1);
-    assert_eq!(requests.matches("\"body\":\"Second\"").count(), 2);
-    let before = requests;
-    success(commit());
-    assert_eq!(fs::read_to_string(&log).unwrap(), before);
-    store
-        .append_event(
-            &batch,
-            &Event::EditComment {
-                comment: CommentId("first".into()),
-                body: "Updated first".into(),
-            },
-        )
-        .unwrap();
-    let updated: Value = serde_json::from_str(&success(commit())).unwrap();
-    assert_eq!(updated.as_array().unwrap().len(), 3);
-    let requests = fs::read_to_string(&log).unwrap();
-    assert!(requests.contains("repos/acme/repo/issues/comments/101"));
-    assert_eq!(requests.matches("--method PATCH").count(), 1);
-    assert_eq!(
-        store.get_batch(&batch).unwrap().unwrap().write.events.len(),
-        3
+
+    let valid = Event::SetFileViewed {
+        path: "file.rs".into(),
+        viewed: true,
+    };
+    let response = workspace(
+        project.path(),
+        json!({
+            "op":"actions","workspace":"batch","generation":0,
+            "actions":[{"action":"viewed","path":"file.rs","viewed":true}]
+        }),
     );
+    assert_eq!(response["applied"], 1);
+    assert!(response.get("error").is_none());
+    let retained = store.get_batch(&batch).unwrap().unwrap();
+    assert_eq!(retained.write.events, vec![valid]);
+    let state: Value =
+        serde_json::from_str(&success(run(project.path(), &["state", "batch"], None))).unwrap();
+    assert_eq!(state["files"][0]["viewed"], true);
+    let plan: Value =
+        serde_json::from_str(&success(run(project.path(), &["plan", "batch"], None))).unwrap();
+    assert_eq!(plan["operations"].as_array().unwrap().len(), 1);
 }
 
 #[test]
-fn concurrent_commits_share_completed_receipt_before_second_publish() {
-    use buf_review::store::{ReviewBackend, ReviewSource};
-    use std::{
-        fs::{self, File, TryLockError},
-        os::unix::fs::PermissionsExt,
-        thread,
-        time::{Duration, Instant},
-    };
-
+fn cli_plan_after_editor_refresh_uses_current_delta_not_historical_receipts() {
     let project = tempdir().unwrap();
-    let tools = tempdir().unwrap();
-    let executable = tools.path().join("gh");
-    fs::write(
-        &executable,
-        r#"#!/bin/sh
-cat > "$FAKE_GH_BODY"
-printf '%s\n' "$*" >> "$FAKE_GH_LOG"
-: > "$FAKE_GH_READY"
-while [ ! -f "$FAKE_GH_GATE" ]; do sleep 0.01; done
-printf '{"id":101}\n'
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-    let log = tools.path().join("requests");
-    let ready = tools.path().join("ready");
-    let gate = tools.path().join("gate");
-    let path = std::env::join_paths(
-        std::iter::once(tools.path().to_path_buf())
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    let id = ReviewId("review".into());
-    let batch = BatchId("batch".into());
     let mut store = Store::open(project.path()).unwrap();
-    store
-        .import_review(
-            &id,
-            &reviewer(),
-            &baseline(),
-            &ReviewBackend {
-                source: ReviewSource {
-                    backend: "github".into(),
-                    locator: "https://github.com/acme/repo/pull/7".into(),
-                },
-                mappings: Vec::new(),
-            },
-        )
-        .unwrap();
-    store.create_batch(&batch, &id).unwrap();
+    let old = ReviewId("old".into());
+    store.create_review(&old, &reviewer(), &baseline()).unwrap();
+    let batch = BatchId("batch".into());
+    store.create_batch(&batch, &old).unwrap();
+    let comment = DraftComment {
+        content: CommentContent {
+            id: CommentId("own".into()),
+            body: "sent".into(),
+        },
+        author: reviewer(),
+        target: CommentTarget::PullRequest,
+    };
     store
         .append_event(
             &batch,
             &Event::CreateComment {
-                comment: DraftComment {
-                    content: CommentContent {
-                        id: CommentId("draft".into()),
-                        body: "Only once".into(),
-                    },
-                    author: reviewer(),
-                    target: CommentTarget::PullRequest,
-                },
+                comment: comment.clone(),
             },
         )
         .unwrap();
-    let spawn = || {
-        Command::new(env!("CARGO_BIN_EXE_pr"))
-            .current_dir(project.path())
-            .args(["commit", "batch"])
-            .env("PATH", &path)
-            .env("FAKE_GH_BODY", tools.path().join("body"))
-            .env("FAKE_GH_LOG", &log)
-            .env("FAKE_GH_READY", &ready)
-            .env("FAKE_GH_GATE", &gate)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
-    };
-    let mut first = spawn();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !ready.exists() {
-        if Instant::now() >= deadline || first.try_wait().unwrap().is_some() {
-            fs::write(&gate, "").unwrap();
-            first.kill().ok();
-            panic!("first commit did not reach paused provider request");
-        }
-        thread::sleep(Duration::from_millis(5));
+    let w = store.workspace(&batch.0).unwrap().unwrap();
+    let operation = &w.pending().unwrap().operations[0];
+    store
+        .record_operation_result(&batch, operation, &[], &json!({"id":1}))
+        .unwrap();
+    let w = store.workspace(&batch.0).unwrap().unwrap();
+    let fresh = ReviewId("fresh".into());
+    let mut read = baseline();
+    read.comments.push(ReadComment {
+        content: comment.content,
+        author: Some(reviewer()),
+        target: CommentTarget::PullRequest,
+    });
+    store.create_review(&fresh, &reviewer(), &read).unwrap();
+    store
+        .refresh_workspace(&w.id, w.generation, &fresh)
+        .unwrap();
+    let plan: Value =
+        serde_json::from_str(&success(run(project.path(), &["plan", &batch.0], None))).unwrap();
+    assert_eq!(plan["operations"], json!([]));
+    success(run(project.path(), &["state", &batch.0], None));
+}
+
+#[test]
+fn removed_write_commands_are_rejected_before_opening_the_database() {
+    for command in ["stage", "commit"] {
+        let project = tempdir().unwrap();
+        let result = run(project.path(), &[command, "batch"], Some("{}"));
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("unrecognized subcommand"));
+        assert!(!project.path().join(".review").exists());
     }
-    let lock_probe = File::open(project.path().join(".review/state.sqlite3")).unwrap();
-    let locked = lock_probe.try_lock();
-    if !matches!(locked, Err(TryLockError::WouldBlock)) {
-        fs::write(&gate, "").unwrap();
-        first.kill().ok();
-        panic!("first commit must hold database OS lock across provider request");
-    }
-    let mut second = spawn();
-    let second_running = second.try_wait().unwrap().is_none();
-    let receipts = store.operation_results(&batch).unwrap();
-    fs::write(&gate, "").unwrap();
-    assert!(second_running);
-    assert!(receipts.is_empty());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while first.try_wait().unwrap().is_none() || second.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            first.kill().ok();
-            second.kill().ok();
-            panic!("concurrent commit processes did not finish");
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    let first: Value = serde_json::from_str(&success(first.wait_with_output().unwrap())).unwrap();
-    let second: Value = serde_json::from_str(&success(second.wait_with_output().unwrap())).unwrap();
-    assert_eq!(first, second);
-    assert_eq!(first.as_array().unwrap().len(), 1);
-    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
-    assert_eq!(store.operation_results(&batch).unwrap().len(), 1);
 }

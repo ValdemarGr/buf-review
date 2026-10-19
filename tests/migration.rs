@@ -38,6 +38,7 @@ fn legacy_reviews() -> Vec<LegacyReview> {
                             body: "Original snapshot".into(),
                             author: Some(reviewer),
                             status: PullRequestStatus::Open,
+                            source: None,
                             revision: DiffRevision {
                                 base: "base".into(),
                                 head: format!("{name}-head"),
@@ -192,6 +193,10 @@ fn migration_preserves_snapshots_and_logs_and_both_batches_remain_editable() {
         assert_eq!(
             store.get_batch(&batch_id).unwrap(),
             Some(Batch {
+                revision: buf_review::model::BatchRevision {
+                    number: 0,
+                    namespace: Some(batch_id.0.clone())
+                },
                 id: batch_id.clone(),
                 review: legacy.review.id.clone(),
                 write: WriteState {
@@ -201,9 +206,11 @@ fn migration_preserves_snapshots_and_logs_and_both_batches_remain_editable() {
         );
         assert_original_data(&connection, legacy);
 
-        let event = Event::SetFileViewed {
-            path: "src/model.rs".into(),
-            viewed: true,
+        let event = Event::SetReviewConclusion {
+            conclusion: ReviewConclusion {
+                outcome: ReviewOutcome::Approve,
+                body: None,
+            },
         };
         store.append_event(&batch_id, &event).unwrap();
         let mut expected = legacy.events.clone();
@@ -224,9 +231,11 @@ fn reopening_preserves_new_batches_and_does_not_repeat_legacy_migration() {
     let reviews = legacy_reviews();
     let connection = seed_legacy(project.path(), &reviews);
     let new_id = BatchId("second-batch".into());
-    let event = Event::SetFileViewed {
-        path: "src/store.rs".into(),
-        viewed: false,
+    let event = Event::SetReviewConclusion {
+        conclusion: ReviewConclusion {
+            outcome: ReviewOutcome::Approve,
+            body: None,
+        },
     };
     {
         let mut store = Store::open(project.path()).unwrap();
@@ -238,6 +247,10 @@ fn reopening_preserves_new_batches_and_does_not_repeat_legacy_migration() {
     assert_eq!(
         reopened.get_batch(&new_id).unwrap(),
         Some(Batch {
+            revision: buf_review::model::BatchRevision {
+                number: 0,
+                namespace: Some(new_id.0.clone())
+            },
             id: new_id.clone(),
             review: reviews[1].review.id.clone(),
             write: WriteState {
@@ -443,4 +456,191 @@ fn original_comment_and_submitted_review_json_remains_readable() {
         )
         .unwrap();
     assert_eq!(raw, (SNAPSHOT.into(), EVENT.into()));
+}
+
+#[test]
+fn workspace_migration_preserves_legacy_operation_namespaces_journals_and_aliases() {
+    use buf_review::{
+        core,
+        store::OperationResult,
+        workspace::{Destination, PublicationAttempt, Workspace},
+    };
+    let project = tempdir().unwrap();
+    let review = legacy_reviews().remove(0).review;
+    let directory = project.path().join(".review");
+    fs::create_dir(&directory).unwrap();
+    let connection = Connection::open(directory.join("state.sqlite3")).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    // The immediate predecessor schema: one workspace per PR/account, unversioned logs.
+    connection.execute_batch("CREATE TABLE reviews(review_id TEXT PRIMARY KEY,reviewer TEXT NOT NULL);CREATE TABLE read_states(review_id TEXT PRIMARY KEY REFERENCES reviews(review_id),snapshot TEXT NOT NULL);CREATE TABLE batches(batch_id TEXT PRIMARY KEY,review_id TEXT NOT NULL REFERENCES reviews(review_id));CREATE TABLE write_events(batch_id TEXT REFERENCES batches(batch_id),sequence INTEGER,event TEXT,PRIMARY KEY(batch_id,sequence));CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,reviewer_id TEXT,pull_request_id TEXT,locator TEXT,generation INTEGER,state TEXT,UNIQUE (reviewer_id, pull_request_id));").unwrap();
+    connection
+        .execute_batch(include_str!("../src/schema.sql"))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO reviews VALUES (?1,?2)",
+            (
+                &review.id.0,
+                serde_json::to_string(&review.reviewer).unwrap(),
+            ),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO read_states VALUES (?1,?2)",
+            (&review.id.0, serde_json::to_string(&review.read).unwrap()),
+        )
+        .unwrap();
+    let mut first = Workspace::new(review.clone());
+    first.id = "old-workspace".into();
+    first.batch.id = BatchId("old-log".into());
+    first.batch.write.events = vec![Event::CreateComment {
+        comment: DraftComment {
+            content: CommentContent {
+                id: CommentId("root".into()),
+                body: "original".into(),
+            },
+            author: review.reviewer.clone(),
+            target: CommentTarget::PullRequest,
+        },
+    }];
+    let unknown = core::prepare(&review, &first.batch, &[])
+        .unwrap()
+        .operations
+        .remove(0);
+    let mut current = first.clone();
+    current.generation = 1;
+    current.batch.id = BatchId("current-log".into());
+    current.batch.write.events.push(Event::EditComment {
+        comment: CommentId("root".into()),
+        body: "saved".into(),
+    });
+    current.suspended_attempts.push(PublicationAttempt {
+        id: "unknown-attempt".into(),
+        destination: Destination::Standalone,
+        operations: vec![unknown.clone()],
+        uncertain: true,
+        provider: serde_json::json!({"inflight":format!("operation {}",unknown.id)}),
+        wip: None,
+    });
+    // A receipt for a separate resource is history, not an outstanding baseline delta.
+    let receipt = OperationResult {
+        operation: core::Operation {
+            id: "known-progress".into(),
+            change: Event::SetFileViewed {
+                path: "old.rs".into(),
+                viewed: true,
+            },
+        },
+        mappings: vec![],
+        response: serde_json::json!({"ok":true}),
+    };
+    current.results.push(receipt.clone());
+    for ws in [&first, &current] {
+        connection
+            .execute(
+                "INSERT INTO batches VALUES (?1,?2)",
+                (&ws.batch.id.0, &review.id.0),
+            )
+            .unwrap();
+        for (i, event) in ws.batch.write.events.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO write_events VALUES (?1,?2,?3)",
+                    (
+                        &ws.batch.id.0,
+                        (i + 1) as i64,
+                        serde_json::to_string(event).unwrap(),
+                    ),
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO workspace_history VALUES (?1,?2,?3,?4)",
+                (
+                    &first.id,
+                    ws.generation as i64,
+                    serde_json::to_string(ws).unwrap(),
+                    r#"{"action":"provider_update"}"#,
+                ),
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO operation_results VALUES (?1,?2,1,?3,'[]',?4)",
+            (
+                &current.batch.id.0,
+                &receipt.operation.id,
+                serde_json::to_string(&receipt.operation).unwrap(),
+                serde_json::to_string(&receipt.response).unwrap(),
+            ),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO workspaces VALUES (?1,?2,?3,NULL,1,?4)",
+            (
+                &first.id,
+                &review.reviewer.id.0,
+                &review.read.pull_request.id.0,
+                serde_json::to_string(&current).unwrap(),
+            ),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO workspace_active VALUES (?1,?2,1)",
+            (&review.reviewer.id.0, &first.id),
+        )
+        .unwrap();
+    drop(connection);
+    let mut store = Store::open(project.path()).unwrap();
+    let migrated = store.workspace("old-workspace").unwrap().unwrap();
+    assert_eq!(migrated.id, "current-log");
+    assert_eq!(migrated.batch.id.0, "current-log");
+    assert_eq!(migrated.suspended_attempts, current.suspended_attempts);
+    assert!(migrated.completed.is_empty());
+    assert_eq!(migrated.results, vec![receipt]);
+    assert_eq!(
+        store
+            .active_workspace(&review.reviewer.id)
+            .unwrap()
+            .unwrap()
+            .id,
+        "current-log"
+    );
+    assert_eq!(
+        store
+            .get_batch(&BatchId("old-log".into()))
+            .unwrap()
+            .unwrap(),
+        migrated.batch
+    );
+    let old = store
+        .batch_revision(&migrated.batch.id, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        core::prepare(&review, &old, &[]).unwrap().operations[0].id,
+        unknown.id
+    );
+    assert_eq!(store.batch_history(&migrated.batch.id).unwrap().len(), 2);
+    assert_eq!(store.batch_workspaces().unwrap().len(), 1);
+    let another = store.create_batch_workspace(&review.id).unwrap();
+    assert_ne!(another.id, migrated.id);
+    drop(store);
+    let reopened = Store::open(project.path()).unwrap();
+    assert_eq!(reopened.batch_workspaces().unwrap().len(), 2);
+    assert_eq!(
+        reopened
+            .workspace("old-workspace")
+            .unwrap()
+            .unwrap()
+            .suspended_attempts,
+        migrated.suspended_attempts
+    );
 }

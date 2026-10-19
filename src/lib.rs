@@ -1,5 +1,10 @@
+pub mod context;
 pub mod core;
 pub mod diff;
 pub mod github;
+pub mod log;
 pub mod model;
+pub mod sessions;
 pub mod store;
+pub mod workspace;
+pub mod workspace_cli;

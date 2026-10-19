@@ -3,6 +3,46 @@ use std::num::NonZeroU32;
 use buf_review::core::{Change, CoreError, ProjectedComment, prepare, project};
 use buf_review::model::*;
 
+#[test]
+fn cached_pull_request_without_branch_source_remains_readable() {
+    let cached = serde_json::to_value(review().read.pull_request).unwrap();
+    assert!(cached.get("source").is_none());
+    let mut pull: PullRequest = serde_json::from_value(cached.clone()).unwrap();
+    assert_eq!(pull.source, None);
+    assert_eq!(serde_json::to_value(&pull).unwrap(), cached);
+    pull.source = Some(BranchSource {
+        repository: "https://github.com/contributor/repo".into(),
+        branch: "feature/review".into(),
+    });
+    assert_eq!(
+        serde_json::from_value::<PullRequest>(serde_json::to_value(&pull).unwrap()).unwrap(),
+        pull
+    );
+}
+
+#[test]
+fn changed_file_without_cached_stats_remains_unknown_and_zero_counts_round_trip() {
+    let cached = serde_json::json!({
+        "path": "src/lib.rs", "previous_path": null, "change": "modified", "viewed": false
+    });
+    let mut file: ChangedFile = serde_json::from_value(cached.clone()).unwrap();
+    assert_eq!(file.stats, None);
+    assert_eq!(serde_json::to_value(&file).unwrap(), cached);
+    file.stats = Some(FileStats {
+        additions: 0,
+        deletions: 0,
+    });
+    let serialized = serde_json::to_value(&file).unwrap();
+    assert_eq!(
+        serialized["stats"],
+        serde_json::json!({"additions": 0, "deletions": 0})
+    );
+    assert_eq!(
+        serde_json::from_value::<ChangedFile>(serialized).unwrap(),
+        file
+    );
+}
+
 fn user() -> User {
     User {
         id: UserId("me".into()),
@@ -44,12 +84,14 @@ fn review() -> Review {
                 body: String::new(),
                 author: None,
                 status: PullRequestStatus::Open,
+                source: None,
                 revision: location().revision,
             },
             files: vec![ChangedFile {
                 path: "src/lib.rs".into(),
                 previous_path: None,
                 change: FileChange::Modified,
+                stats: None,
                 viewed: false,
             }],
             comments: vec![
@@ -102,6 +144,7 @@ fn review() -> Review {
 }
 fn batch(events: Vec<Event>) -> Batch {
     Batch {
+        revision: Default::default(),
         id: BatchId("batch".into()),
         review: ReviewId("review".into()),
         write: WriteState { events },
@@ -148,6 +191,62 @@ fn conclusion(outcome: ReviewOutcome) -> Event {
             body: None,
         },
     }
+}
+
+#[test]
+fn projection_and_publication_preserve_interleaved_creation_chronology() {
+    let mut review = review();
+    review.read.comments[0].content.id = id("z-fetched-first");
+    review.read.comments[1].content.id = id("a-fetched-second");
+    review.read.reactions.clear();
+    let created = [
+        "z-root", "y-reply", "x-root", "w-reply", "v-reply", "u-nested",
+    ];
+    let batch = batch(vec![
+        create(created[0], CommentTarget::Diff(location())),
+        create(created[1], CommentTarget::Reply(id(created[0]))),
+        create(created[2], CommentTarget::Diff(location())),
+        create(created[3], CommentTarget::Reply(id(created[0]))),
+        create(created[4], CommentTarget::Reply(id(created[2]))),
+        create(created[5], CommentTarget::Reply(id(created[1]))),
+        edit(created[0], "edited without changing creation order"),
+    ]);
+    let projected = project(&review, &batch).unwrap();
+    assert_eq!(
+        projected
+            .comments
+            .iter()
+            .map(|c| c.content().id.0.as_str())
+            .collect::<Vec<_>>(),
+        ["z-fetched-first", "a-fetched-second"]
+            .into_iter()
+            .chain(created)
+            .collect::<Vec<_>>()
+    );
+    let plan = prepare(&review, &batch, &[]).unwrap();
+    assert_eq!(
+        plan.operations
+            .iter()
+            .map(|op| match &op.change {
+                Change::CreateComment { comment } => comment.content.id.0.as_str(),
+                other => panic!("unexpected operation: {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        created
+    );
+    // Partial delivery must retain both remaining order and operation identities.
+    assert_eq!(
+        prepare(&review, &batch, &plan.operations[..2])
+            .unwrap()
+            .operations,
+        plan.operations[2..]
+    );
+    assert!(
+        prepare(&review, &batch, &plan.operations)
+            .unwrap()
+            .operations
+            .is_empty()
+    );
 }
 
 #[test]
@@ -538,5 +637,73 @@ fn incomplete_fetched_reply_ancestry_is_preserved_without_restricting_existing_o
             &[]
         )
         .is_err()
+    );
+}
+
+#[test]
+fn deleting_fetched_root_preserves_independent_fetched_replies() {
+    let mut read = review();
+    read.read.comments.push(ReadComment {
+        content: CommentContent {
+            id: id("remote-reply"),
+            body: "Keep this reply".into(),
+        },
+        author: None,
+        target: CommentTarget::Reply(id("diff")),
+    });
+    let deletion = batch(vec![delete("diff")]);
+    let projected = project(&read, &deletion).unwrap();
+    assert!(
+        projected
+            .comments
+            .iter()
+            .any(|comment| comment.content().id == id("remote-reply"))
+    );
+    let plan = prepare(&read, &deletion, &[]).unwrap();
+    assert_eq!(plan.operations.len(), 1);
+    assert!(
+        matches!(&plan.operations[0].change,Change::DeleteComment{comment} if *comment==id("diff"))
+    );
+    assert!(
+        prepare(&read, &deletion, &plan.operations)
+            .unwrap()
+            .operations
+            .is_empty()
+    );
+    let invalid = batch(vec![
+        delete("diff"),
+        create("new", CommentTarget::Reply(id("remote-reply"))),
+    ]);
+    assert!(project(&read, &invalid).is_err());
+}
+
+#[test]
+fn internal_revision_namespace_preserves_legacy_receipts_and_separates_rewritten_logs() {
+    let review = review();
+    let legacy = batch(vec![create("draft", CommentTarget::PullRequest)]);
+    let original = prepare(&review, &legacy, &[]).unwrap().operations[0]
+        .id
+        .clone();
+    let mut migrated = legacy.clone();
+    migrated.id = BatchId("canonical-batch".into());
+    migrated.revision = BatchRevision {
+        number: 3,
+        namespace: Some(legacy.id.0.clone()),
+    };
+    assert_eq!(
+        prepare(&review, &migrated, &[]).unwrap().operations[0].id,
+        original
+    );
+    migrated.revision = BatchRevision {
+        number: 4,
+        namespace: Some("canonical-batch:revision:4".into()),
+    };
+    let rewritten = prepare(&review, &migrated, &[]).unwrap().operations[0]
+        .id
+        .clone();
+    assert_ne!(rewritten, original);
+    assert_eq!(
+        prepare(&review, &migrated, &[]).unwrap().operations[0].id,
+        rewritten
     );
 }

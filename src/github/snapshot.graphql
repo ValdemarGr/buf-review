@@ -1,0 +1,54 @@
+fragment ActorIdentity on Actor {
+  login
+  ... on User { databaseId }
+  ... on Bot { databaseId }
+  ... on Organization { databaseId }
+  ... on Mannequin { databaseId }
+  ... on EnterpriseUserAccount { user { login databaseId } }
+}
+fragment ReactionPage on ReactionConnection {
+  totalCount
+  nodes { id content user { login databaseId } }
+  pageInfo { hasNextPage endCursor }
+}
+fragment FilePage on PullRequestChangedFileConnection {
+  totalCount
+  nodes { path changeType viewerViewedState }
+  pageInfo { hasNextPage endCursor }
+}
+fragment IssueCommentPage on IssueCommentConnection {
+  totalCount
+  nodes {
+    id fullDatabaseId body createdAt author { ...ActorIdentity }
+    reactions(first:20) { ...ReactionPage }
+  }
+  pageInfo { hasNextPage endCursor }
+}
+fragment ReviewPage on PullRequestReviewConnection {
+  totalCount
+  nodes {
+    id fullDatabaseId body state submittedAt author { ...ActorIdentity }
+    reactions(first:20) { ...ReactionPage }
+  }
+  pageInfo { hasNextPage endCursor }
+}
+fragment ReviewCommentPage on PullRequestReviewCommentConnection {
+  totalCount
+  nodes {
+    id fullDatabaseId body createdAt author { ...ActorIdentity }
+    replyTo { fullDatabaseId }
+    pullRequestReview { fullDatabaseId }
+    commit { oid } originalCommit { oid }
+    path line startLine originalLine originalStartLine subjectType diffHunk outdated state
+    reactions(first:20) { ...ReactionPage }
+  }
+  pageInfo { hasNextPage endCursor }
+}
+fragment ThreadPage on PullRequestReviewThreadConnection {
+  totalCount
+  nodes {
+    id diffSide startDiffSide
+    comments(first:50) { ...ReviewCommentPage }
+  }
+  pageInfo { hasNextPage endCursor }
+}

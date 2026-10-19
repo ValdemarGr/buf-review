@@ -29,7 +29,7 @@ pub enum ProjectedComment {
 }
 
 impl ProjectedComment {
-    fn content(&self) -> &CommentContent {
+    pub fn content(&self) -> &CommentContent {
         match self {
             Self::Read(comment) => &comment.content,
             Self::Draft(comment) => &comment.content,
@@ -100,6 +100,8 @@ pub enum CoreError {
 struct Projection {
     state: ProjectedState,
     comments: BTreeMap<CommentId, ProjectedComment>,
+    // Snapshot order followed by creation events in persisted log sequence.
+    comment_order: Vec<CommentId>,
     identities: BTreeSet<CommentId>,
 }
 
@@ -119,6 +121,12 @@ impl Projection {
         }
         Ok(Self {
             identities: comments.keys().cloned().collect(),
+            comment_order: review
+                .read
+                .comments
+                .iter()
+                .map(|comment| comment.content.id.clone())
+                .collect(),
             comments,
             state: ProjectedState {
                 pull_request: review.read.pull_request.clone(),
@@ -153,6 +161,7 @@ impl Projection {
                     comment.content.id.clone(),
                     ProjectedComment::Draft(comment.clone()),
                 );
+                self.comment_order.push(comment.content.id.clone());
             }
             Change::EditComment { comment, body } => {
                 self.comments
@@ -262,17 +271,12 @@ impl Projection {
 
     fn validate(&self) -> Result<(), CoreError> {
         for comment in self.comments.values() {
-            if let Some(parent) = comment.parent() {
-                // Preserve incomplete fetched ancestry, but never introduce a
-                // dangling thread by deleting a parent known to this batch.
-                if !self.comments.contains_key(parent) && self.identities.contains(parent) {
-                    return Err(CoreError::MissingComment(parent.clone()));
-                }
-                if matches!(comment, ProjectedComment::Draft(_)) {
-                    let root = self.root(&comment.content().id)?;
-                    if !self.comments[&root].is_diff() {
-                        return Err(CoreError::Invalid("replies require a diff thread".into()));
-                    }
+            if comment.parent().is_some() && matches!(comment, ProjectedComment::Draft(_)) {
+                // Fetched replies remain independent remote resources after a
+                // root is deleted. New replies still require a live diff root.
+                let root = self.root(&comment.content().id)?;
+                if !self.comments[&root].is_diff() {
+                    return Err(CoreError::Invalid("replies require a diff thread".into()));
                 }
             }
         }
@@ -280,7 +284,11 @@ impl Projection {
     }
 
     fn finish(mut self) -> ProjectedState {
-        self.state.comments = self.comments.into_values().collect();
+        self.state.comments = self
+            .comment_order
+            .into_iter()
+            .filter_map(|id| self.comments.remove(&id))
+            .collect();
         self.state
     }
 }
@@ -304,7 +312,7 @@ fn validate_location(location: &DiffLocation) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn desired(review: &Review, batch: &Batch) -> Result<Projection, CoreError> {
+fn replay(review: &Review, batch: &Batch) -> Result<Projection, CoreError> {
     if batch.review != review.id {
         return Err(CoreError::ReviewMismatch(batch.id.clone()));
     }
@@ -312,6 +320,17 @@ fn desired(review: &Review, batch: &Batch) -> Result<Projection, CoreError> {
     for event in &batch.write.events {
         projection.apply(&review.reviewer.id, event)?;
     }
+    Ok(projection)
+}
+
+/// Check ordered events without requiring the final thread structure yet.
+/// Deleting a parent before its replies is a valid staging sequence.
+pub(crate) fn validate_events(review: &Review, batch: &Batch) -> Result<(), CoreError> {
+    replay(review, batch).map(|_| ())
+}
+
+fn desired(review: &Review, batch: &Batch) -> Result<Projection, CoreError> {
+    let projection = replay(review, batch)?;
     projection.validate()?;
     Ok(projection)
 }
@@ -334,16 +353,14 @@ pub fn prepare(
     }
     delivered.validate()?;
     let mut operations = Vec::new();
-    let mut create = Vec::new();
     for (id, comment) in &desired.comments {
         match delivered.comments.get(id) {
             None => {
-                let ProjectedComment::Draft(comment) = comment else {
+                let ProjectedComment::Draft(_) = comment else {
                     return Err(CoreError::Invalid(
                         "a deleted fetched comment cannot be recreated".into(),
                     ));
                 };
-                create.push((desired.depth(id), comment.clone()));
             }
             Some(previous) if previous.content().body != comment.content().body => {
                 operations.push(operation(
@@ -357,14 +374,17 @@ pub fn prepare(
             _ => {}
         }
     }
-    create.sort_by(|(left_depth, left), (right_depth, right)| {
-        left_depth
-            .cmp(right_depth)
-            .then_with(|| left.content.id.cmp(&right.content.id))
-    });
-    let mut creates = create
-        .into_iter()
-        .map(|(_, comment)| operation(batch, Change::CreateComment { comment }))
+    // Valid replay already requires a reply's parent to exist. Keeping creation
+    // event order therefore preserves both chronology and parent-first writes.
+    let mut creates = desired
+        .comment_order
+        .iter()
+        .filter(|id| !delivered.comments.contains_key(*id))
+        .filter_map(|id| match desired.comments.get(id) {
+            Some(ProjectedComment::Draft(comment)) => Some(comment.clone()),
+            _ => None,
+        })
+        .map(|comment| operation(batch, Change::CreateComment { comment }))
         .collect::<Result<Vec<_>, _>>()?;
     creates.append(&mut operations);
     operations = creates;
@@ -525,8 +545,12 @@ fn operation(batch: &Batch, change: Change) -> Result<Operation, CoreError> {
         Change::DismissReview { .. } => "dismiss_review",
         Change::SetCommentReaction { .. } => "set_comment_reaction",
     };
-    let name = serde_json::to_vec(&(&batch.id, source, kind))
-        .expect("strings and event sequence serialize");
+    let name = serde_json::to_vec(&(
+        batch.revision.namespace.as_deref().unwrap_or(&batch.id.0),
+        source,
+        kind,
+    ))
+    .expect("strings and event sequence serialize");
     Ok(Operation {
         id: Uuid::new_v5(&Uuid::NAMESPACE_URL, &name).to_string(),
         change,

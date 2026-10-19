@@ -39,7 +39,8 @@ impl<L> From<&CommentTarget<L>> for Target {
     }
 }
 
-/// Validates the entire processed plan before the first provider write.
+/// Validates the entire processed plan, then verifies the authenticated reviewer
+/// before the first provider write. Empty plans do not contact GitHub.
 /// Provider permissions and whether an anchor occurs in GitHub's diff remain
 /// server-side checks; preflight never substitutes a different anchor.
 pub fn preflight(
@@ -70,7 +71,7 @@ pub fn preflight(
         .filter(|mapping| {
             matches!(
                 mapping.resource.as_str(),
-                "issue_comment" | "review_comment"
+                "issue_comment" | "review_comment" | "review_summary"
             )
         })
         .map(|mapping| {
@@ -110,6 +111,9 @@ pub fn preflight(
             }
             Change::DeleteComment { comment } => {
                 require_comment(&available, comment)?;
+                if comment_remote(backend, comment)?.0 == "review_summary" {
+                    return Err(unsupported("submitted review summaries cannot be deleted"));
+                }
                 available.remove(comment);
             }
             Change::SetCommentReaction {
@@ -119,6 +123,17 @@ pub fn preflight(
             } => {
                 require_comment(&available, comment)?;
                 reaction_content(reaction)?;
+                if backend.mappings.iter().any(|mapping| {
+                    mapping.resource == "review_summary" && mapping.core_id == comment.0
+                }) && !backend.mappings.iter().any(|mapping| {
+                    mapping.resource == "review_node"
+                        && mapping.core_id == comment.0
+                        && !mapping.remote_id.is_empty()
+                }) {
+                    return Err(unsupported(
+                        "review summary lacks its provider node identity",
+                    ));
+                }
                 if !present {
                     remote(backend, "user", &review.reviewer.id.0)?;
                 }
@@ -143,6 +158,15 @@ pub fn preflight(
                     "review dismissal reason",
                 )?;
             }
+        }
+    }
+    if !commit.operations.is_empty() {
+        let reviewer = remote(backend, "user", &review.reviewer.id.0)?;
+        let user: RestUser = api("user", &["--method", "GET"])?;
+        if user.id != reviewer {
+            return Err(unsupported(
+                "authenticated user differs from the fetched reviewer",
+            ));
         }
     }
     Ok(())
@@ -172,7 +196,6 @@ pub fn publish(
                         "commit_id": location.revision.head, "path": location.position.path});
                     match &location.position.range {
                         Some(range) => {
-                            body["subject_type"] = json!("line");
                             body["line"] = json!(range.end.line);
                             body["side"] = json!(side(range.end.side));
                             if range.start != range.end {
@@ -217,16 +240,32 @@ pub fn publish(
             mappings.push(created_mapping(resource, &comment.content.id.0, &response)?);
             response
         }
-        Change::EditComment { comment, body } => request(
-            &comment_endpoint(&repository, backend, comment)?,
-            "PATCH",
-            &json!({"body":body}),
-        )?,
-        Change::DeleteComment { comment } => request(
-            &comment_endpoint(&repository, backend, comment)?,
-            "DELETE",
-            &Value::Null,
-        )?,
+        Change::EditComment { comment, body } => {
+            let (resource, id) = comment_remote(backend, comment)?;
+            if resource == "review_summary" {
+                request(
+                    &format!("{pull}/reviews/{id}"),
+                    "PUT",
+                    &json!({"body":body}),
+                )?
+            } else {
+                request(
+                    &comment_endpoint(&repository, backend, comment)?,
+                    "PATCH",
+                    &json!({"body":body}),
+                )?
+            }
+        }
+        Change::DeleteComment { comment } => {
+            if comment_remote(backend, comment)?.0 == "review_summary" {
+                return Err(unsupported("submitted review summaries cannot be deleted"));
+            }
+            request(
+                &comment_endpoint(&repository, backend, comment)?,
+                "DELETE",
+                &Value::Null,
+            )?
+        }
         Change::SetFileViewed { path, viewed } => {
             let pull_response: Value = api(&pull, &["--method", "GET"])?;
             let node = pull_response
@@ -294,6 +333,38 @@ pub fn publish(
             reaction,
             present,
         } => {
+            if comment_remote(backend, comment)?.0 == "review_summary" {
+                let node = backend
+                    .mappings
+                    .iter()
+                    .find(|mapping| {
+                        mapping.resource == "review_node" && mapping.core_id == comment.0
+                    })
+                    .ok_or_else(|| {
+                        unsupported("review summary lacks its provider node identity")
+                    })?;
+                let mutation = if *present {
+                    "addReaction"
+                } else {
+                    "removeReaction"
+                };
+                let content = super::workspace::graphql_reaction(reaction)?;
+                let query = format!(
+                    "mutation($input: {}Input!) {{ {mutation}(input:$input) {{ clientMutationId }} }}",
+                    if *present {
+                        "AddReaction"
+                    } else {
+                        "RemoveReaction"
+                    }
+                );
+                let response = request(
+                    "graphql",
+                    "POST",
+                    &json!({"query":query,"variables":{"input":{"subjectId":node.remote_id,"content":content,"clientMutationId":operation.id}}}),
+                )?;
+                super::workspace::graphql_data(&response, mutation)?;
+                return Ok(PublishResult { mappings, response });
+            }
             let endpoint = format!(
                 "{}/reactions",
                 comment_endpoint(&repository, backend, comment)?
@@ -429,7 +500,7 @@ fn comment_remote<'a>(
             mapping.core_id == comment.0
                 && matches!(
                     mapping.resource.as_str(),
-                    "issue_comment" | "review_comment"
+                    "issue_comment" | "review_comment" | "review_summary"
                 )
         })
         .ok_or_else(|| unsupported(format!("missing comment mapping for {}", comment.0)))?;
@@ -506,7 +577,7 @@ struct RemoteReplyParent {
     in_reply_to_id: Option<u64>,
 }
 
-fn request(endpoint: &str, method: &str, body: &Value) -> Result<Value, PublishError> {
+pub(super) fn request(endpoint: &str, method: &str, body: &Value) -> Result<Value, PublishError> {
     let bytes = serde_json::to_vec(body).map_err(FetchError::from)?;
     let mut child = Command::new("gh")
         .args([
@@ -527,7 +598,40 @@ fn request(endpoint: &str, method: &str, body: &Value) -> Result<Value, PublishE
     let output = child.wait_with_output().map_err(FetchError::from)?;
     written.map_err(FetchError::from)?;
     if !output.status.success() {
-        return Err(FetchError::Gh(String::from_utf8_lossy(&output.stderr).trim().into()).into());
+        let mut details = vec![String::from_utf8_lossy(&output.stderr).trim().to_owned()];
+        if let Ok(response) = serde_json::from_slice::<Value>(&output.stdout) {
+            if let Some(message) = response.get("message").and_then(Value::as_str) {
+                details.push(message.into());
+            }
+            if let Some(errors) = response.get("errors").and_then(Value::as_array) {
+                for error in errors {
+                    match error {
+                        Value::String(message) => details.push(message.clone()),
+                        Value::Object(fields) => {
+                            let mut fields = fields.clone();
+                            let message = fields
+                                .remove("message")
+                                .and_then(|message| message.as_str().map(str::to_owned));
+                            if let Some(message) = message {
+                                details.push(message);
+                            }
+                            if !fields.is_empty() {
+                                details.push(Value::Object(fields).to_string());
+                            }
+                        }
+                        other => details.push(other.to_string()),
+                    }
+                }
+            }
+        }
+        return Err(FetchError::Gh(
+            details
+                .into_iter()
+                .filter(|detail| !detail.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .into());
     }
     if output.stdout.iter().all(u8::is_ascii_whitespace) {
         Ok(Value::Null)
