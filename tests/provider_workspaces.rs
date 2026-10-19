@@ -59,6 +59,14 @@ fn progress_failure_preserves_prepared_comments_and_blocks_conclusion() {
     run("progress");
 }
 #[test]
+fn viewed_files_reuse_one_pull_request_lookup_and_keep_ordered_receipts() {
+    run("viewed_cache");
+}
+#[test]
+fn failed_viewed_write_stops_and_retry_reuses_the_confirmed_lookup() {
+    run("viewed_cache_failure");
+}
+#[test]
 fn uncertain_submission_reconciles_without_second_submit() {
     run("uncertain_submit");
 }
@@ -309,6 +317,13 @@ case "$endpoint" in
       printf '%s' "$body" | python3 "$PROVIDER_ROOT/review.py" thread ;;
     *updatePullRequestReviewComment*) printf '{"data":{"updatePullRequestReviewComment":{"pullRequestReviewComment":{"id":"C201","body":"Root edited"}}}}' ;;
     *markFileAsViewed*)
+      if [ "$PROVIDER_CASE" = viewed_cache_failure ]; then
+        count=0
+        if [ -f "$PROVIDER_ROOT/viewed-count" ]; then count=$(cat "$PROVIDER_ROOT/viewed-count"); fi
+        count=$((count + 1))
+        printf '%s' "$count" > "$PROVIDER_ROOT/viewed-count"
+        if [ "$count" -eq 2 ]; then printf 'HTTP 422 viewed state rejected' >&2; exit 1; fi
+      fi
       if { [ "$PROVIDER_CASE" = progress ] || [ "$PROVIDER_CASE" = bulk_boundary_failure ]; } && [ ! -f "$PROVIDER_ROOT/progress" ]; then touch "$PROVIDER_ROOT/progress"; printf 'HTTP 422 viewed state rejected' >&2; exit 1; fi
       if [ "$PROVIDER_CASE" = uncertain_progress ] && [ ! -f "$PROVIDER_ROOT/progress" ]; then touch "$PROVIDER_ROOT/progress"; printf 'connection lost after setting viewed state' >&2; exit 1; fi
       printf '{"data":{"markFileAsViewed":{"clientMutationId":"done"}}}' ;;
@@ -473,6 +488,14 @@ fn provider_child() {
             },
         ],
     };
+    if matches!(case.as_str(), "viewed_cache" | "viewed_cache_failure") {
+        read.files = (0..20)
+            .map(|index| ChangedFile {
+                path: format!("file-{index:02}.rs"),
+                ..read.files[0].clone()
+            })
+            .collect();
+    }
     if matches!(case.as_str(), "reply_first" | "reply_lookup_fail") {
         read.pull_request.revision.head = "new-head".into();
         let CommentTarget::Diff(anchor) = location("old-head") else {
@@ -557,6 +580,119 @@ fn provider_child() {
         .import_review(&ReviewId("snapshot".into()), &reviewer, &read, &backend)
         .unwrap();
     let mut workspace = store.open_workspace(&ReviewId("snapshot".into())).unwrap();
+    if matches!(case.as_str(), "viewed_cache" | "viewed_cache_failure") {
+        let paths = workspace
+            .review
+            .read
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        for path in &paths {
+            workspace = store
+                .mutate_workspace(
+                    &workspace.id,
+                    workspace.generation,
+                    Action::Viewed {
+                        path: path.clone(),
+                        viewed: true,
+                    },
+                )
+                .unwrap();
+        }
+        let operations = workspace.publication_plan().unwrap().operations;
+        if case == "viewed_cache_failure" {
+            let error =
+                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("viewed state rejected"),
+                "{error}"
+            );
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+            assert_eq!(workspace.results.len(), 1);
+            assert_eq!(workspace.results[0].operation, operations[0]);
+            let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let attempted_paths = requests
+                .iter()
+                .filter_map(|request| request["body"]["variables"]["input"]["path"].as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(attempted_paths, paths[..2]);
+            drop(store);
+            store = Store::open(&root).unwrap();
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+        }
+        workspace =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                .unwrap();
+        assert!(workspace.pending().unwrap().operations.is_empty());
+        assert_eq!(workspace.completed, operations);
+        assert_eq!(
+            workspace
+                .results
+                .iter()
+                .map(|result| &result.operation)
+                .collect::<Vec<_>>(),
+            operations.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            workspace.results[0].mappings,
+            vec![IdMapping {
+                resource: "pull_request_node".into(),
+                core_id: "pull".into(),
+                remote_id: "PR1".into(),
+            }]
+        );
+        assert!(
+            workspace.results[1..]
+                .iter()
+                .all(|result| result.mappings.is_empty())
+        );
+        let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["endpoint"] == "repos/owner/repo/pulls/1"
+                    && request["method"] == "GET")
+                .count(),
+            1
+        );
+        let writes = requests
+            .iter()
+            .filter(|request| {
+                request["body"]["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("MarkFileAsViewedInput"))
+            })
+            .collect::<Vec<_>>();
+        let mut expected_paths = paths.clone();
+        if case == "viewed_cache_failure" {
+            expected_paths.insert(1, paths[1].clone());
+        }
+        assert_eq!(
+            writes
+                .iter()
+                .map(|request| request["body"]["variables"]["input"]["path"]
+                    .as_str()
+                    .unwrap())
+                .collect::<Vec<_>>(),
+            expected_paths
+        );
+        assert!(
+            writes
+                .iter()
+                .all(|request| request["body"]["variables"]["input"]["pullRequestId"] == "PR1")
+        );
+        return;
+    }
     if case == "legacy_standalone" {
         workspace = store
             .mutate_workspace(

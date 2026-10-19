@@ -255,11 +255,28 @@ pub fn publish(
             )?
         }
         Change::SetFileViewed { path, viewed } => {
-            let pull_response: Value = api(&pull, &["--method", "GET"])?;
-            let node = pull_response
-                .get("node_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| unsupported("pull request response lacks node_id"))?;
+            let node = match backend.mappings.iter().find(|mapping| {
+                mapping.resource == "pull_request_node"
+                    && mapping.core_id == review.read.pull_request.id.0
+                    && !mapping.remote_id.is_empty()
+            }) {
+                Some(mapping) => mapping.remote_id.clone(),
+                None => {
+                    let pull_response: Value = api(&pull, &["--method", "GET"])?;
+                    let node = pull_response
+                        .get("node_id")
+                        .and_then(Value::as_str)
+                        .filter(|node| !node.is_empty())
+                        .ok_or_else(|| unsupported("pull request response lacks node_id"))?
+                        .to_owned();
+                    mappings.push(IdMapping {
+                        resource: "pull_request_node".into(),
+                        core_id: review.read.pull_request.id.0.clone(),
+                        remote_id: node.clone(),
+                    });
+                    node
+                }
+            };
             let mutation = if *viewed {
                 "markFileAsViewed"
             } else {
