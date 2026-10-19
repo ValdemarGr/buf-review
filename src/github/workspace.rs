@@ -752,6 +752,44 @@ fn apply_publication(
         .ok_or_else(|| unsupported("publication attempt disappeared"))?
         .id
         .clone();
+    if let Action::RecordResult { result } = &action
+        && matches!(result.operation.change, Change::CreateComment { .. })
+    {
+        let backend = store
+            .review_backend(&workspace.review.id)?
+            .ok_or_else(|| unsupported("workspace lacks provider metadata"))?;
+        let fetched_identity = result.mappings.iter().any(|mapping| {
+            backend.mappings.iter().any(|existing| {
+                existing.resource == mapping.resource
+                    && existing.remote_id == mapping.remote_id
+                    && existing.core_id != mapping.core_id
+                    && workspace
+                        .review
+                        .read
+                        .comments
+                        .iter()
+                        .any(|comment| comment.content.id.0 == existing.core_id)
+            })
+        });
+        if fetched_identity {
+            // A refresh may observe a sent comment before its receipt is known.
+            // The durable preparation now supplies its original local identity;
+            // reuse normal snapshot reconciliation before installing that receipt.
+            apply_publication(store, workspace, Action::SuspendPublication)?;
+            *workspace = store.refresh_workspace(
+                &workspace.id,
+                workspace.generation,
+                &workspace.review.id,
+            )?;
+            *workspace = store.mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::ResumePublication {
+                    attempt_id: attempt.clone(),
+                },
+            )?;
+        }
+    }
     *workspace = store.mutate_publication(&workspace.id, &attempt, action)?;
     Ok(())
 }
@@ -1423,6 +1461,97 @@ fn conclusion_state(conclusion: &ReviewConclusion) -> &'static str {
     }
 }
 
+/// Pending review comments can expose only legacy diff positions through REST.
+/// Read their line/range anchors from the corresponding GraphQL thread roots.
+fn hydrate_review_comment_anchors(
+    backend: &ReviewBackend,
+    comments: &mut [Value],
+) -> Result<(), PublishError> {
+    let mut missing = comments
+        .iter()
+        .filter(|comment| {
+            comment.get("side").is_none_or(Value::is_null)
+                || (comment.get("line").is_none_or(Value::is_null)
+                    && comment.get("original_line").is_none_or(Value::is_null))
+        })
+        .map(|comment| {
+            comment
+                .get("node_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(String::from)
+                .ok_or_else(|| unsupported("created review comment lacks node ID"))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let address = Address::from_url(
+        &Url::parse(&backend.source.locator).map_err(|_| FetchError::InvalidUrl)?,
+    )?;
+    let mut cursor = Value::Null;
+    let mut seen = BTreeSet::new();
+    loop {
+        let response = request(
+            "graphql",
+            "POST",
+            &json!({"query":"query BulkReviewCommentAnchors($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{id diffSide startDiffSide comments(first:1){nodes{id body path line startLine originalLine originalStartLine commit{oid} originalCommit{oid}}}} pageInfo{hasNextPage endCursor}}}}}","variables":{"owner":address.owner,"name":address.repo,"number":address.number,"cursor":cursor}}),
+        )?;
+        let connection = graphql_data(&response, "repository")?
+            .pointer("/pullRequest/reviewThreads")
+            .ok_or_else(|| unsupported("review thread connection missing"))?;
+        for thread in connection
+            .get("nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| unsupported("review threads missing"))?
+        {
+            let Some(root) = thread.pointer("/comments/nodes/0") else {
+                continue;
+            };
+            let Some(node) = root.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !missing.remove(node) {
+                continue;
+            }
+            let remote = comments
+                .iter_mut()
+                .find(|comment| comment.get("node_id").and_then(Value::as_str) == Some(node))
+                .expect("missing anchors belong to a known REST comment");
+            for (rest, graphql) in [
+                ("body", "/body"),
+                ("path", "/path"),
+                ("line", "/line"),
+                ("start_line", "/startLine"),
+                ("original_line", "/originalLine"),
+                ("original_start_line", "/originalStartLine"),
+                ("commit_id", "/commit/oid"),
+                ("original_commit_id", "/originalCommit/oid"),
+            ] {
+                remote[rest] = root.pointer(graphql).cloned().unwrap_or(Value::Null);
+            }
+            remote["side"] = thread.get("diffSide").cloned().unwrap_or(Value::Null);
+            remote["start_side"] = thread.get("startDiffSide").cloned().unwrap_or(Value::Null);
+        }
+        if missing.is_empty()
+            || connection
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                == Some(false)
+        {
+            return Ok(());
+        }
+        cursor = connection
+            .pointer("/pageInfo/endCursor")
+            .filter(|cursor| cursor.is_string())
+            .cloned()
+            .ok_or_else(|| unsupported("review thread cursor missing"))?;
+        if !seen.insert(cursor.to_string()) {
+            return Err(unsupported("review thread pagination repeated a cursor"));
+        }
+    }
+}
+
 /// Recover individual identities from the native bulk operation before advancing.
 /// The frozen group and review identity survive a failed discovery read.
 fn record_created_review(
@@ -1448,6 +1577,7 @@ fn record_created_review(
     } else {
         vec![]
     };
+    hydrate_review_comment_anchors(backend, &mut comments)?;
     comments.sort_by_key(|comment| comment.get("id").and_then(Value::as_u64));
     for operation in preparation.creating.clone() {
         let result = match &operation.change {

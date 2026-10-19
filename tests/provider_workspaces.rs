@@ -143,6 +143,34 @@ fn historical_bulk_receipts_match_original_anchors() {
     run("bulk_old_anchor");
 }
 #[test]
+fn pending_bulk_receipts_recover_single_line_head_anchors() {
+    run("bulk_null_head");
+}
+#[test]
+fn pending_bulk_receipts_recover_single_line_base_anchors() {
+    run("bulk_null_base");
+}
+#[test]
+fn pending_bulk_receipts_recover_multiline_anchors() {
+    run("bulk_null_multiline");
+}
+#[test]
+fn pending_bulk_receipts_find_anchors_on_later_thread_pages() {
+    run("bulk_null_pages");
+}
+#[test]
+fn pending_bulk_receipts_reject_mismatched_graphql_anchors() {
+    run("bulk_null_mismatch");
+}
+#[test]
+fn failed_pending_anchor_read_retries_existing_review_without_duplicate_writes() {
+    run("bulk_null_retry");
+}
+#[test]
+fn fetched_pending_comments_reconcile_with_later_bulk_receipts() {
+    run("bulk_refresh_collision");
+}
+#[test]
 fn reply_lookup_failure_is_retryable_without_an_uncertain_write() {
     run("reply_lookup_fail");
 }
@@ -164,7 +192,7 @@ if sys.argv[1] == "thread":
     counter.write_text(str(count + 1))
     print(json.dumps({"data": {"addPullRequestReviewThread": {"thread": {"id": "T" + str(identity), "comments": {"nodes": [{"id": "C" + str(identity), "databaseId": identity}]}}}}}))
 elif sys.argv[1] == "comments":
-    if case == "bulk_receipts" and not (root / "discovery").exists():
+    if case in ("bulk_receipts", "bulk_refresh_collision") and not (root / "discovery").exists():
         (root / "discovery").touch()
         sys.stderr.write("HTTP 503 review comments temporarily unavailable")
         sys.exit(1)
@@ -175,7 +203,34 @@ elif sys.argv[1] == "comments":
             comment["original_line"] = comment["line"]
             comment["original_start_line"] = comment.get("start_line")
             comment.update(commit_id="new-head", line=None, start_line=None)
+    if case.startswith("bulk_null_"):
+        for comment in comments:
+            comment["original_commit_id"] = comment["commit_id"]
+            comment["position"] = 1
+            comment.update(line=None, original_line=None, side=None,
+                           start_line=None, original_start_line=None, start_side=None)
     print(json.dumps([comments]))
+elif sys.argv[1] == "anchors":
+    body = json.load(sys.stdin)
+    if case == "bulk_null_retry" and not (root / "anchor-read").exists():
+        (root / "anchor-read").touch()
+        sys.stderr.write("HTTP 503 review thread anchors temporarily unavailable")
+        sys.exit(1)
+    comments = json.loads((root / "review-comments.json").read_text())
+    nodes = []
+    for comment in comments:
+        line = comment["line"] + (1 if case == "bulk_null_mismatch" else 0)
+        nodes.append(dict(id="T" + str(comment["id"]), diffSide=comment["side"],
+                          startDiffSide=comment.get("start_side"),
+                          comments=dict(nodes=[dict(id=comment["node_id"], body=comment["body"],
+                              path=comment["path"], line=line, originalLine=line,
+                              startLine=comment.get("start_line"), originalStartLine=comment.get("start_line"),
+                              commit=dict(oid=comment["commit_id"]), originalCommit=dict(oid=comment["commit_id"]))])))
+    next_page = case == "bulk_null_pages" and body["variables"].get("cursor") is None
+    if case == "bulk_null_pages":
+        nodes = nodes[:1] if next_page else nodes[1:]
+    print(json.dumps(dict(data=dict(repository=dict(pullRequest=dict(reviewThreads=dict(
+        nodes=nodes, pageInfo=dict(hasNextPage=next_page, endCursor="second" if next_page else None))))))))
 else:
     body = json.load(sys.stdin)
     if case == "anchor_rejection" or (case == "schema_rejection" and not (root / "rejected").exists()):
@@ -238,6 +293,7 @@ case "$endpoint" in
    if [ "$method" != DELETE ]; then printf '{"id":201,"body":"Root edited"}'; fi ;;
  graphql)
    case "$body" in
+    *BulkReviewCommentAnchors*) printf '%s' "$body" | python3 "$PROVIDER_ROOT/review.py" anchors ;;
     *ReviewSnapshot*)
       if [ "$PROVIDER_CASE" = alias_edit ] && [ -f "$PROVIDER_ROOT/alias" ]; then text=Local; else text=Original; fi
       case "$PROVIDER_CASE" in alias_*) comments="{\"totalCount\":1,\"nodes\":[{\"id\":\"IC300\",\"fullDatabaseId\":\"300\",\"body\":\"$text\",\"createdAt\":\"2026-01-01T00:00:00Z\",\"author\":{\"databaseId\":7,\"login\":\"reviewer\"},\"reactions\":{\"totalCount\":0,\"nodes\":[],\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null}}}],\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null}}" ;;
@@ -618,13 +674,31 @@ fn provider_child() {
     if case.starts_with("bulk") {
         let mut ids = Vec::new();
         for body in ["First bulk root", "Second bulk root"] {
+            let mut target = location("old-head");
+            if matches!(case.as_str(), "bulk_null_head" | "bulk_null_base") {
+                let CommentTarget::Diff(location) = &mut target else {
+                    unreachable!()
+                };
+                let line = DiffLine {
+                    side: if case == "bulk_null_base" {
+                        DiffSide::Base
+                    } else {
+                        DiffSide::Head
+                    },
+                    line: NonZeroU32::new(80).unwrap(),
+                };
+                location.position.range = Some(DiffRange {
+                    start: line.clone(),
+                    end: line,
+                });
+            }
             workspace = store
                 .mutate_workspace(
                     &workspace.id,
                     workspace.generation,
                     Action::Save {
                         comment: None,
-                        target: Some(location("old-head")),
+                        target: Some(target),
                         body: body.into(),
                         destination: None,
                     },
@@ -673,7 +747,11 @@ fn provider_child() {
                 )
                 .unwrap();
         }
-        if case == "bulk_receipts" {
+        let mut resumed_publication = None;
+        if matches!(
+            case.as_str(),
+            "bulk_receipts" | "bulk_null_retry" | "bulk_refresh_collision"
+        ) {
             let error =
                 github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
                     .unwrap_err();
@@ -681,6 +759,138 @@ fn provider_child() {
             workspace = store.workspace(&workspace.id).unwrap().unwrap();
             assert!(workspace.completed.is_empty());
             assert_eq!(workspace.suspended_attempts.len(), 1);
+            assert!(workspace.suspended_attempts[0].uncertain);
+            assert_eq!(
+                workspace.suspended_attempts[0].provider["pending"]["id"],
+                100
+            );
+            resumed_publication = Some(workspace.suspended_attempts[0].id.clone());
+        }
+        let mut refreshed_snapshot = None;
+        if case == "bulk_refresh_collision" {
+            let mut fresh = workspace.review.read.clone();
+            fresh.comments = workspace
+                .pending()
+                .unwrap()
+                .operations
+                .iter()
+                .filter_map(|operation| {
+                    let Event::CreateComment { comment } = &operation.change else {
+                        return None;
+                    };
+                    let CommentTarget::Diff(location) = &comment.target else {
+                        return None;
+                    };
+                    Some(ReadComment {
+                        content: CommentContent {
+                            id: CommentId(format!("fetched-{}", comment.content.id.0)),
+                            body: comment.content.body.clone(),
+                        },
+                        author: Some(comment.author.clone()),
+                        draft: true,
+                        target: CommentTarget::Diff(ReadDiffLocation {
+                            original: ReadCommentAnchor {
+                                revision: ReadCommentRevision::Comparison(
+                                    location.revision.clone(),
+                                ),
+                                position: location.position.clone(),
+                            },
+                            current: None,
+                            subject: Some(CommentSubject::Line),
+                            diff_hunk: None,
+                            outdated: Some(false),
+                        }),
+                    })
+                })
+                .collect();
+            fresh.comments.push(ReadComment {
+                content: CommentContent {
+                    id: CommentId("fetched-reply".into()),
+                    body: "Reply fetched before receipt recovery".into(),
+                },
+                author: Some(reviewer.clone()),
+                draft: true,
+                target: CommentTarget::Reply(fresh.comments[0].content.id.clone()),
+            });
+            fresh.reactions.push(CommentReaction {
+                comment: fresh.comments[0].content.id.clone(),
+                author: Some(reviewer.id.clone()),
+                reaction: "+1".into(),
+            });
+            fresh.reviews.push(ReadReview {
+                id: Some(ReviewResourceId("fetched-review".into())),
+                author: Some(reviewer.clone()),
+                state: ReadReviewState::Inactive {
+                    state: InactiveReviewState::Pending,
+                    body: None,
+                },
+            });
+            let mut fetched_backend = backend.clone();
+            fetched_backend.mappings.push(IdMapping {
+                resource: "review".into(),
+                core_id: "fetched-review".into(),
+                remote_id: "100".into(),
+            });
+            for (index, comment) in fresh.comments.iter().enumerate() {
+                for (resource, remote_id) in [
+                    ("review_comment", (201 + index).to_string()),
+                    ("review_comment_node", format!("C{}", 201 + index)),
+                    ("review_member:100", (201 + index).to_string()),
+                ] {
+                    fetched_backend.mappings.push(IdMapping {
+                        resource: resource.into(),
+                        core_id: comment.content.id.0.clone(),
+                        remote_id,
+                    });
+                }
+            }
+            let snapshot = ReviewId("pending-before-receipts".into());
+            store
+                .import_review(&snapshot, &reviewer, &fresh, &fetched_backend)
+                .unwrap();
+            workspace = store
+                .refresh_workspace(&workspace.id, workspace.generation, &snapshot)
+                .unwrap();
+            assert!(workspace.completed.is_empty());
+            assert_eq!(
+                workspace.suspended_attempts[0].id,
+                *resumed_publication.as_ref().unwrap()
+            );
+            refreshed_snapshot = Some((snapshot, fresh));
+        }
+        if case == "bulk_null_mismatch" {
+            for _ in 0..2 {
+                let error = github::publish_workspace(
+                    &mut store,
+                    &workspace.id,
+                    workspace.generation,
+                    false,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("identity unconfirmed"));
+                workspace = store.workspace(&workspace.id).unwrap().unwrap();
+                assert!(workspace.completed.is_empty());
+                assert_eq!(workspace.suspended_attempts.len(), 1);
+                assert!(workspace.suspended_attempts[0].uncertain);
+                if let Some(publication) = &resumed_publication {
+                    assert_eq!(&workspace.suspended_attempts[0].id, publication);
+                }
+                resumed_publication = Some(workspace.suspended_attempts[0].id.clone());
+            }
+            let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+            let creates = requests
+                .lines()
+                .filter(|line| {
+                    let request: Value = serde_json::from_str(line).unwrap();
+                    request["method"] == "POST"
+                        && request["endpoint"] == "repos/owner/repo/pulls/1/reviews"
+                })
+                .count();
+            assert_eq!(
+                creates, 1,
+                "unconfirmed identity must never recreate review"
+            );
+            return;
         }
         if case == "bulk_boundary_failure" {
             let error =
@@ -696,9 +906,37 @@ fn provider_child() {
             github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
                 .unwrap();
         assert!(workspace.pending().unwrap().operations.is_empty());
+        if let Some((snapshot, original)) = refreshed_snapshot {
+            assert_eq!(store.get_review(&snapshot).unwrap().unwrap().read, original);
+            for id in &ids {
+                assert!(
+                    workspace
+                        .review
+                        .read
+                        .comments
+                        .iter()
+                        .any(|comment| comment.content.id == *id)
+                );
+            }
+            assert_eq!(workspace.review.read.comments.len(), 3);
+            assert_eq!(
+                workspace.review.read.comments[2].target,
+                CommentTarget::Reply(ids[0].clone())
+            );
+            assert_eq!(workspace.review.read.reactions[0].comment, ids[0]);
+            let history = store.publication_history(&workspace).unwrap();
+            let publication = resumed_publication.as_ref().unwrap();
+            let entry = history
+                .iter()
+                .find(|entry| &entry.summary.id == publication)
+                .unwrap();
+            assert_eq!(entry.summary.published.total, 2);
+        }
         assert_eq!(
             workspace.completed.len(),
-            if case == "bulk_conclude" {
+            if case == "bulk_refresh_collision" {
+                0
+            } else if case == "bulk_conclude" {
                 3
             } else if case.starts_with("bulk_boundary") {
                 5
@@ -744,9 +982,27 @@ fn provider_child() {
             creates[0]["body"]["comments"][1]["body"],
             "Second bulk root"
         );
-        assert_eq!(creates[0]["body"]["comments"][0]["line"], 4);
-        assert_eq!(creates[0]["body"]["comments"][0]["start_line"], 2);
-        assert_eq!(creates[0]["body"]["comments"][0]["side"], "RIGHT");
+        let single_line = matches!(case.as_str(), "bulk_null_head" | "bulk_null_base");
+        assert_eq!(
+            creates[0]["body"]["comments"][0]["line"],
+            if single_line { 80 } else { 4 }
+        );
+        assert_eq!(
+            creates[0]["body"]["comments"][0]["start_line"],
+            if single_line {
+                Value::Null
+            } else {
+                Value::from(2)
+            }
+        );
+        assert_eq!(
+            creates[0]["body"]["comments"][0]["side"],
+            if case == "bulk_null_base" {
+                "LEFT"
+            } else {
+                "RIGHT"
+            }
+        );
         assert_eq!(
             creates[0]["body"]["event"].as_str(),
             (case == "bulk_conclude").then_some("COMMENT")
@@ -762,8 +1018,46 @@ fn provider_child() {
                 .filter(|request| request["endpoint"]
                     == "repos/owner/repo/pulls/1/reviews/100/comments?per_page=100")
                 .count(),
-            if case == "bulk_receipts" { 2 } else { 1 }
+            if matches!(
+                case.as_str(),
+                "bulk_receipts" | "bulk_null_retry" | "bulk_refresh_collision"
+            ) {
+                2
+            } else {
+                1
+            }
         );
+        if case.starts_with("bulk_null_") {
+            let anchors = requests
+                .iter()
+                .filter(|request| {
+                    request["body"]["query"]
+                        .as_str()
+                        .is_some_and(|query| query.contains("BulkReviewCommentAnchors"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                anchors.len(),
+                if matches!(case.as_str(), "bulk_null_pages" | "bulk_null_retry") {
+                    2
+                } else {
+                    1
+                }
+            );
+            if case == "bulk_null_pages" {
+                assert_eq!(anchors[0]["body"]["variables"]["cursor"], Value::Null);
+                assert_eq!(anchors[1]["body"]["variables"]["cursor"], "second");
+            }
+            if let Some(publication) = resumed_publication {
+                let history = store.publication_history(&workspace).unwrap();
+                let entry = history
+                    .iter()
+                    .find(|entry| entry.summary.id == publication)
+                    .unwrap();
+                assert_eq!(entry.summary.planned.total, 2);
+                assert_eq!(entry.summary.published.total, 2);
+            }
+        }
         if case.starts_with("bulk_boundary") {
             let viewed = requests
                 .iter()
