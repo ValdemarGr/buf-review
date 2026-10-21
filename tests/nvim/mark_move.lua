@@ -20,6 +20,13 @@ local function records(name, op)
   return result
 end
 local function requests(op) return records('requests.jsonl', op) end
+local function code_requests()
+  local result = {}
+  for _, request in ipairs(requests()) do
+    if request.op == 'code' or request.op == 'historical_code' then result[#result + 1] = request end
+  end
+  return result
+end
 local function state() return read('state.json') end
 local function kind() return vim.b.buf_review and vim.b.buf_review.kind end
 local function text() return table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n') end
@@ -131,7 +138,10 @@ end
 local function file_focus(path, side)
   for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
     local meta = vim.b[api.nvim_win_get_buf(win)].buf_review
-    if meta and meta.kind == 'diff' and meta.path == path and meta.side == (side or 'head') then
+    local displayed = meta and meta.side
+    if meta and meta.comment_role == 'original_base' then displayed = 'base'
+    elseif meta and meta.comment_role == 'comment' and meta.revision.base == revision.head then displayed = 'head' end
+    if meta and meta.kind == 'diff' and meta.path == path and displayed == (side or 'head') then
       api.nvim_set_current_win(win); return win
     end
   end
@@ -153,16 +163,17 @@ for _, marked_items in ipairs({ false, true }) do
       end)
       local start = direction > 0 and 'a' or 'e'
       if target == 'file' then open_file_at('src/' .. start .. '.rs') else open(start) end
-      local before, code, historical = actions_before(), #requests('code'), #requests('historical_code')
+      local before, code, historical = actions_before(), #code_requests(), #requests('historical_code')
       local saved = state()
       local key = tostring(marked_items and 7 or 4) .. (direction > 0 and ']' or '[') .. (target == 'file' and 'f' or 'r')
       local destination = marked_items and 'c' or (direction > 0 and 'e' or 'a')
       input(key)
       wait(function() return target == 'file' and file('src/' .. destination .. '.rs') or target == 'comment' and thread(destination) end,
         key .. ' ignored count, marked exclusion, or cyclic order')
-      local loads = requests('code')
-      assert(#loads == code + 1 and loads[#loads].path == 'src/' .. destination .. '.rs'
-        and #requests('historical_code') == historical, key .. ' loaded intermediate destinations')
+      local loads = code_requests()
+      assert(#loads == code + 1 and (target == 'file' and loads[#loads].path == 'src/' .. destination .. '.rs'
+        or target == 'comment' and loads[#loads].comment == destination)
+        and #requests('historical_code') == historical + (target == 'comment' and 1 or 0), key .. ' loaded intermediate destinations')
       no_mark(before, key .. ' staged progress')
       assert(vim.deep_equal(saved.files, state().files) and vim.deep_equal(saved.comments, state().comments), key .. ' mutated progress')
     end
@@ -172,10 +183,10 @@ end
 -- From code, entering the local comment is step one; later steps are global.
 for _, direction in ipairs({ 1, -1 }) do
   reset(); open_file_at('src/c.rs'); api.nvim_win_set_cursor(0, { 2, 0 })
-  local before, code = actions_before(), #requests('code')
+  local before, code = actions_before(), #code_requests()
   input(direction > 0 and '2]r' or '2[r')
   wait(function() return thread(direction > 0 and 'e' or 'a') end, 'count repeated code-location entry instead of advancing globally')
-  assert(#requests('code') == code + 1, 'counted code entry loaded intermediate discussion')
+  assert(#code_requests() == code + 1, 'counted code entry loaded intermediate discussion')
   no_mark(before)
 end
 
@@ -188,11 +199,11 @@ for _, target in ipairs({ 'file', 'comment' }) do
       for _, item in ipairs(value.files) do item.viewed = item.path ~= 'src/c.rs' end
     end)
     command('log'); wait(function() return kind() == 'log' end, 'counted navigation log missing')
-    local before, code = actions_before(), #requests('code')
+    local before, code = actions_before(), #code_requests()
     input('9' .. (direction > 0 and ']' or '[') .. (target == 'file' and 'f' or 'r'))
     wait(function() return target == 'file' and file('src/c.rs') or target == 'comment' and thread('c') end,
       'remaining count discarded sole destination after finding it')
-    assert(#requests('code') == code + 1, 'count reopened sole destination')
+    assert(#code_requests() == code + 1, 'count reopened sole destination')
     no_mark(before)
   end
 end
@@ -237,10 +248,10 @@ for _, target in ipairs({ 'comment', 'file' }) do
     for _, item in ipairs(value.files) do item.viewed = true end
   end)
   if target == 'comment' then open('c') else open_file_at('src/c.rs') end
-  local before, code = actions_before(), #requests('code')
+  local before, code = actions_before(), #code_requests()
   for _, direction in ipairs({ ']', '[' }) do
     input('9' .. direction .. (target == 'comment' and 'r' or 'f'))
-    assert((target == 'comment' and thread('c') or target == 'file' and file('src/c.rs')) and #requests('code') == code,
+    assert((target == 'comment' and thread('c') or target == 'file' and file('src/c.rs')) and #code_requests() == code,
       'no eligible destination reopened or moved current item')
     no_mark(before, 'already marked item sent redundant mutation')
   end
@@ -254,10 +265,10 @@ for _, target in ipairs({ 'comment', 'file' }) do
     for _, item in ipairs(value.files) do item.viewed = item.path ~= 'src/c.rs' end
   end)
   row(target == 'comment' and 'Feedback c' or 'src/c.rs', target == 'file')
-  local before, code = actions_before(), #requests('code')
+  local before, code = actions_before(), #code_requests()
   for _, direction in ipairs({ ']', '[' }) do
     input('9' .. direction .. (target == 'comment' and 'r' or 'f'))
-    assert(kind() == 'home' and #requests('code') == code, 'navigation returned current row as destination')
+    assert(kind() == 'home' and #code_requests() == code, 'navigation returned current row as destination')
     no_mark(before, 'home row was marked')
   end
 end
@@ -321,11 +332,16 @@ local function diff_pair(path, head_line, historical)
     local buf = api.nvim_win_get_buf(win)
     local meta = vim.b[buf].buf_review
     if meta and meta.kind == 'diff' then
-      assert(meta.path == path and vim.deep_equal(meta.revision, historical and { base = 'old-head', head = revision.head } or revision), 'comment navigation changed path/comparison incorrectly')
-      local expected = meta.side == 'base' and { 'one', historical and 'historical head' or 'two', 'three' }
-        or { 'one', historical and 'latest PR head' or 'changed', 'three' }
+      local role = meta.comment_role
+      local source = role == 'original_base' and (historical and 'old-base' or revision.base)
+        or (historical and 'old-head' or revision.head)
+      assert(meta.path == path and vim.deep_equal(meta.revision, { base = source, head = revision.head }), 'comment navigation changed path/comparison incorrectly')
+      local expected = { 'one', role == 'original_base' and (historical and 'historical base' or 'two')
+        or (role == 'comment' and historical and 'historical head' or 'changed'), 'three' }
       assert(vim.deep_equal(api.nvim_buf_get_lines(buf, 0, -1, false), expected), 'comment navigation did not load pinned file content')
-      sides[meta.side] = win
+      local side = role == 'original_base' and (historical and 'original_base' or 'base')
+        or (role == 'comment' and (historical and 'base' or 'head') or 'head')
+      sides[side] = win
     end
   end
   assert(sides.base and sides.head, 'comment navigation did not open both diff sides')
@@ -352,7 +368,7 @@ diff_pair('src/c.rs', 3)
 command('previous todo'); wait(function() return thread('c') end, 'ordinary previous did not open historical comment')
 diff_pair('src/e.rs', 3, true)
 
--- Replies follow the root file and use its current anchor, not their own nonexistent range.
+-- Replies follow the root file and original anchor, not their own nonexistent range.
 reset(function(value)
   value.comments[1].comment.comment.target.target.path = 'src/a.rs'
   value.comments[1].comment.comment.target.target.range.start.line = 2
@@ -360,9 +376,9 @@ reset(function(value)
   value.comments[3].comment.comment.target = { kind = 'reply', target = 'a' }
 end)
 open('a'); diff_pair('src/a.rs', 2)
-local code = #requests('code')
+local code = #code_requests()
 before = actions_before(); input(']r')
-wait(function() return #requests('code') > code and thread('a') and api.nvim_win_get_cursor(0)[1] > 5 end, 'reply navigation lost its root discussion')
+wait(function() return #code_requests() > code and thread('a') and api.nvim_win_get_cursor(0)[1] > 5 end, 'reply navigation lost its root discussion')
 diff_pair('src/a.rs', 2)
 before = actions_before(); input(']r')
 wait(function() return thread('e') end, 'reply did not retain selected comment identity')
@@ -380,7 +396,7 @@ wait(function() return thread('a') end, 'historical reply did not open root disc
 diff_pair('src/a.rs', 3, true)
 assert(text():find('Historical location', 1, true), 'historical reply lost location label')
 
--- Historical paths absent from current files still open original code; PR-wide/current missing paths preserve existing diff.
+-- Original paths absent from current files still open original code; PR-wide comments preserve existing diff.
 for _, mode in ipairs({ 'missing-historical', 'missing-current', 'wide' }) do
   reset(function(value)
     cross_file(value)
@@ -391,10 +407,12 @@ for _, mode in ipairs({ 'missing-historical', 'missing-current', 'wide' }) do
     else value.comments[3].comment.comment.target = { kind = 'pull_request' } end
   end)
   open('a'); diff_pair('src/a.rs', 1)
-  code = #requests('code')
+  code = #code_requests()
   command('next todo'); wait(function() return thread('c') end, mode .. ' comment did not open')
-  assert(#requests('code') == code, mode .. ' comment requested unavailable or unrelated code')
-  if mode == 'missing-historical' then diff_pair('removed.rs', 3, true) else diff_pair('src/a.rs', 1) end
+  assert(#code_requests() == code + (mode == 'wide' and 0 or 1), mode .. ' comment requested unavailable or unrelated code')
+  if mode == 'missing-historical' then diff_pair('removed.rs', 3, true)
+  elseif mode == 'missing-current' then diff_pair('removed.rs', 3)
+  else diff_pair('src/a.rs', 1) end
 end
 
 no_mark(history_actions, 'historical/reply navigation staged progress')
@@ -471,11 +489,11 @@ end
 for _, target in ipairs({ 'comment', 'base', 'head' }) do
   reset(); open('c')
   if target ~= 'comment' then file_focus('src/c.rs', target); api.nvim_win_set_cursor(0, { 2, 0 }) end
-  local buffer, window, cursor, code = api.nvim_get_current_buf(), api.nvim_get_current_win(), api.nvim_win_get_cursor(0), #requests('code')
+  local buffer, window, cursor, code = api.nvim_get_current_buf(), api.nvim_get_current_win(), api.nvim_win_get_cursor(0), #code_requests()
   before = actions_before(); input('s')
   marked(before, target == 'comment' and 'reaction' or 'viewed', target == 'comment' and 'c' or 'src/c.rs')
   assert(api.nvim_get_current_buf() == buffer and api.nvim_get_current_win() == window
-    and vim.deep_equal(api.nvim_win_get_cursor(0), cursor) and #requests('code') == code, 's navigated or moved cursor')
+    and vim.deep_equal(api.nvim_win_get_cursor(0), cursor) and #code_requests() == code, 's navigated or moved cursor')
   assert(target == 'comment' and state().comments[3].done and not state().files[3].viewed
     or target ~= 'comment' and state().files[3].viewed and not state().comments[3].done,
     's staged background pane instead of focused context')
@@ -519,12 +537,12 @@ reset(); row('Feedback c'); command('reply')
 assert(kind() == 'composer', 'reply composer missing')
 navigation_maps()
 api.nvim_buf_set_lines(0, 0, -1, false, { 'Unsaved reply' })
-local current_buf, code = api.nvim_get_current_buf(), #requests('code')
+local current_buf, code = api.nvim_get_current_buf(), #code_requests()
 before = actions_before()
 for _, key in ipairs({ ']r', '[r', ']f', '[f' }) do
   input(key)
   assert(api.nvim_get_current_buf() == current_buf and api.nvim_get_current_line() == 'Unsaved reply'
-    and vim.bo.modified and #requests('code') == code, key .. ' discarded unsaved composer')
+    and vim.bo.modified and #code_requests() == code, key .. ' discarded unsaved composer')
   no_mark(before)
 end
 input(':q!<CR>')

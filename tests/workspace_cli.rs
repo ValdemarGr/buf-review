@@ -603,7 +603,7 @@ fn renamed_base_context_uses_recorded_path_after_comparison_moves() {
 }
 
 #[test]
-fn historical_base_diff_compares_recorded_source_to_latest_head_without_mutating_pin() {
+fn historical_base_diff_compares_recorded_source_to_selected_head_without_mutating_pin() {
     let (root, id) = fixture();
     let mut store = Store::open(root.path()).unwrap();
     let workspace = store.workspace(&id).unwrap().unwrap();
@@ -670,6 +670,10 @@ fn historical_base_diff_compares_recorded_source_to_latest_head_without_mutating
     store
         .refresh_workspace(&id, refreshed.generation, &latest)
         .unwrap();
+    let selected = store.workspace(&id).unwrap().unwrap();
+    store
+        .mutate_workspace(&id, selected.generation, Action::CompareLatest)
+        .unwrap();
     drop(store);
     let before = api(root.path(), json!({"op":"get","workspace":id}));
     let log_before = api(root.path(), json!({"op":"log","workspace":id}));
@@ -687,6 +691,13 @@ fn historical_base_diff_compares_recorded_source_to_latest_head_without_mutating
         assert_eq!(response["code"]["base_content"], historical_source);
         assert_eq!(response["code"]["head_content"], latest_content);
         assert_eq!(response["code"]["historical"], true);
+        assert_eq!(
+            response["code"]["original_base"],
+            json!({
+                "commit":historical.base,"path":"file.rs","content":historical_source,
+                "missing":false,"provenance":"recorded",
+            })
+        );
         assert_eq!(response["code"]["provenance"], "recorded");
         assert_eq!(
             response["code"]["location"]["range"]["start"]["side"],
@@ -710,9 +721,9 @@ fn historical_base_diff_compares_recorded_source_to_latest_head_without_mutating
     );
     let current = api(
         root.path(),
-        json!({"op":"code","workspace":id,"path":"file.rs"}),
+        json!({"op":"code","workspace":id,"path":"renamed.rs"}),
     );
-    assert_eq!(current["code"]["head_content"], "after\n");
+    assert_eq!(current["code"]["head_content"], latest_content);
     assert_eq!(
         current["code"]["revision"],
         before["workspace"]["comparison"]
@@ -720,7 +731,7 @@ fn historical_base_diff_compares_recorded_source_to_latest_head_without_mutating
 }
 
 #[test]
-fn historical_head_diff_follows_rename_to_fetched_head_and_preserves_original_anchor() {
+fn historical_head_diff_follows_rename_to_selected_head_and_preserves_original_anchor() {
     let (root, id) = fixture();
     let mut store = Store::open(root.path()).unwrap();
     let workspace = store.workspace(&id).unwrap().unwrap();
@@ -770,10 +781,16 @@ fn historical_head_diff_follows_rename_to_fetched_head_and_preserves_original_an
     store
         .refresh_workspace(&id, workspace.generation, &snapshot)
         .unwrap();
+    let selected = store.workspace(&id).unwrap().unwrap();
+    store
+        .mutate_workspace(&id, selected.generation, Action::CompareLatest)
+        .unwrap();
     drop(store);
-    // The local checkout and pinned comparison both differ from the fetched PR head.
-    fs::write(root.path().join("renamed.rs"), "local unrelated\n").unwrap();
+    // Historical code follows checked-out HEAD while preserving its original anchor.
+    let local_content = format!("{latest_content}local unrelated\n");
+    fs::write(root.path().join("renamed.rs"), &local_content).unwrap();
     git(root.path(), &["commit", "--quiet", "-am", "Local only"]);
+    let local_head = git(root.path(), &["rev-parse", "HEAD"]);
     let before = api(root.path(), json!({"op":"get","workspace":id}));
     let log_before = api(root.path(), json!({"op":"log","workspace":id}));
     for comment in ["root", "reply"] {
@@ -783,12 +800,19 @@ fn historical_head_diff_follows_rename_to_fetched_head_and_preserves_original_an
         );
         assert_eq!(
             response["code"]["revision"],
-            json!({"base":original.head,"head":read.pull_request.revision.head})
+            json!({"base":original.head,"head":local_head})
         );
         assert_eq!(response["code"]["base_path"], "file.rs");
         assert_eq!(response["code"]["path"], "renamed.rs");
         assert_eq!(response["code"]["base_content"], original_content);
-        assert_eq!(response["code"]["head_content"], latest_content);
+        assert_eq!(response["code"]["head_content"], local_content);
+        assert_eq!(
+            response["code"]["original_base"],
+            json!({
+                "commit":original.base,"path":"file.rs","content":"before\n",
+                "missing":false,"provenance":"recorded",
+            })
+        );
         assert_eq!(response["code"]["head_missing"], false);
         assert_eq!(response["code"]["provenance"], "recorded");
         assert_eq!(
@@ -813,11 +837,9 @@ fn historical_head_diff_follows_rename_to_fetched_head_and_preserves_original_an
         without_original_base["code"]["base_content"],
         original_content
     );
-    assert_eq!(
-        without_original_base["code"]["head_content"],
-        latest_content
-    );
+    assert_eq!(without_original_base["code"]["head_content"], local_content);
     assert_eq!(without_original_base["code"]["provenance"], "recorded");
+    assert!(without_original_base["code"]["original_base"].is_null());
     assert_eq!(
         without_original_base["code"]["location"]["range"]["start"]["side"],
         "base"
@@ -830,7 +852,7 @@ fn historical_head_diff_follows_rename_to_fetched_head_and_preserves_original_an
 }
 
 #[test]
-fn historical_diff_keeps_source_when_file_deleted_from_latest_pr_head() {
+fn historical_diff_keeps_source_when_file_deleted_from_selected_head() {
     let (root, id) = fixture();
     let mut store = Store::open(root.path()).unwrap();
     let workspace = store.workspace(&id).unwrap().unwrap();
@@ -853,6 +875,10 @@ fn historical_diff_keeps_source_when_file_deleted_from_latest_pr_head() {
         .unwrap();
     store
         .refresh_workspace(&id, workspace.generation, &snapshot)
+        .unwrap();
+    let selected = store.workspace(&id).unwrap().unwrap();
+    store
+        .mutate_workspace(&id, selected.generation, Action::CompareLatest)
         .unwrap();
     drop(store);
     let before = api(root.path(), json!({"op":"get","workspace":id}));
@@ -879,15 +905,26 @@ fn historical_diff_keeps_source_when_file_deleted_from_latest_pr_head() {
 fn pruned_historical_objects_fall_back_to_recorded_hunk_without_mutating_session() {
     let (root, id) = fixture();
     let before = api(root.path(), json!({"op":"get","workspace":id}));
-    // Make the original comparison unreachable: Git, rather than SQLite, owns file bytes.
+    let saved = Store::open(root.path())
+        .unwrap()
+        .workspace(&id)
+        .unwrap()
+        .unwrap();
+    // Prune the old head while retaining the current base and replacement HEAD.
     let old_branch = git(root.path(), &["branch", "--show-current"]);
     git(
         root.path(),
-        &["checkout", "--quiet", "--orphan", "replacement"],
+        &[
+            "checkout",
+            "--quiet",
+            "--detach",
+            before["workspace"]["comparison"]["base"].as_str().unwrap(),
+        ],
     );
     fs::write(root.path().join("file.rs"), "replacement\n").unwrap();
     git(root.path(), &["add", "file.rs"]);
     git(root.path(), &["commit", "--quiet", "-m", "Replacement"]);
+    let head = git(root.path(), &["rev-parse", "HEAD"]);
     git(root.path(), &["branch", "-D", &old_branch]);
     git(root.path(), &["reflog", "expire", "--expire=now", "--all"]);
     git(root.path(), &["gc", "--prune=now"]);
@@ -905,7 +942,18 @@ fn pruned_historical_objects_fall_back_to_recorded_hunk_without_mutating_session
     assert_eq!(context["context"]["available"], false);
     assert!(context["context"]["content"].is_null());
     assert_eq!(context["context"]["diff_hunk"], response["diff_hunk"]);
-    assert_eq!(api(root.path(), json!({"op":"get","workspace":id})), before);
+    assert_eq!(
+        api(root.path(), json!({"op":"get","workspace":id}))["workspace"]["comparison"]["head"],
+        head
+    );
+    assert_eq!(
+        Store::open(root.path())
+            .unwrap()
+            .workspace(&id)
+            .unwrap()
+            .unwrap(),
+        saved
+    );
 }
 
 #[test]
@@ -1030,6 +1078,13 @@ fn reconstructed_historical_diff_labels_provenance_and_never_guesses_base_range(
         );
         assert_eq!(response["code"]["head_content"], "later\n");
         assert_eq!(
+            response["code"]["original_base"],
+            json!({
+                "commit":original.base,"path":"file.rs","content":"before\n",
+                "missing":false,"provenance":"reconstructed",
+            })
+        );
+        assert_eq!(
             response["anchor"]["revision"],
             json!({"head":original.head})
         );
@@ -1060,6 +1115,182 @@ fn reconstructed_historical_diff_labels_provenance_and_never_guesses_base_range(
     assert_eq!(context["context"]["available"], false);
     assert!(context["context"]["content"].is_null());
     assert_eq!(api(root.path(), json!({"op":"get","workspace":id})), before);
+}
+
+#[test]
+fn historical_code_returns_original_base_comment_source_and_selected_head() {
+    let (root, id) = fixture();
+    let mut store = Store::open(root.path()).unwrap();
+    let workspace = store.workspace(&id).unwrap().unwrap();
+    let original = workspace.review.read.pull_request.revision.clone();
+    let backend = store.review_backend(&workspace.review.id).unwrap().unwrap();
+    let mut read = workspace.review.read.clone();
+    let mut file_comment = read.comments[0].clone();
+    file_comment.content.id = CommentId("file-comment".into());
+    if let CommentTarget::Diff(location) = &mut file_comment.target {
+        location.original.position.range = None;
+        location.subject = Some(CommentSubject::File);
+    }
+    read.comments.push(file_comment);
+    fs::write(root.path().join("file.rs"), "selected head\n").unwrap();
+    git(root.path(), &["commit", "--quiet", "-am", "Selected head"]);
+    let selected_head = git(root.path(), &["rev-parse", "HEAD"]);
+    read.pull_request.revision.head = selected_head.clone();
+    let selected = ReviewId("selected-history".into());
+    store
+        .import_review(&selected, &workspace.review.reviewer, &read, &backend)
+        .unwrap();
+    let refreshed = store
+        .refresh_workspace(&id, workspace.generation, &selected)
+        .unwrap();
+    let selected = store
+        .mutate_workspace(&id, refreshed.generation, Action::CompareLatest)
+        .unwrap();
+    fs::write(root.path().join("file.rs"), "newer fetched head\n").unwrap();
+    git(
+        root.path(),
+        &["commit", "--quiet", "-am", "Newer fetched head"],
+    );
+    let fetched_head = git(root.path(), &["rev-parse", "HEAD"]);
+    read.pull_request.revision.head = fetched_head.clone();
+    if let CommentTarget::Diff(location) = &mut read.comments[0].target {
+        location.current = Some(ReadCommentAnchor {
+            revision: ReadCommentRevision::Commit { head: fetched_head },
+            position: location.original.position.clone(),
+        });
+    }
+    let latest = ReviewId("newer-fetched-history".into());
+    store
+        .import_review(&latest, &workspace.review.reviewer, &read, &backend)
+        .unwrap();
+    store
+        .refresh_workspace(&id, selected.generation, &latest)
+        .unwrap();
+    drop(store);
+    let before = api(root.path(), json!({"op":"get","workspace":id}));
+    let log_before = api(root.path(), json!({"op":"log","workspace":id}));
+    let response = api(
+        root.path(),
+        json!({"op":"historical_code","workspace":id,"comment":"root"}),
+    );
+    assert_eq!(
+        response["code"]["original_base"],
+        json!({
+            "commit":original.base,"path":"file.rs","content":"before\n",
+            "missing":false,"provenance":"recorded",
+        })
+    );
+    assert_eq!(
+        response["code"]["revision"],
+        json!({"base":original.head,"head":read.pull_request.revision.head})
+    );
+    assert_eq!(response["code"]["base_content"], "after\n");
+    assert_eq!(response["code"]["head_content"], "newer fetched head\n");
+    assert_eq!(response["anchor"]["revision"], json!(original));
+    assert_eq!(response["code"]["location"]["range"]["start"]["line"], 1);
+    let file_comment = api(
+        root.path(),
+        json!({"op":"historical_code","workspace":id,"comment":"file-comment"}),
+    );
+    assert_eq!(
+        file_comment["code"]["revision"],
+        response["code"]["revision"]
+    );
+    assert_eq!(
+        file_comment["code"]["original_base"],
+        response["code"]["original_base"]
+    );
+    assert_eq!(file_comment["code"]["base_content"], "after\n");
+    assert_eq!(file_comment["code"]["head_content"], "newer fetched head\n");
+    assert!(file_comment["code"]["location"].is_null());
+    assert_eq!(api(root.path(), json!({"op":"get","workspace":id})), before);
+    assert_eq!(
+        api(root.path(), json!({"op":"log","workspace":id})),
+        log_before
+    );
+}
+
+#[test]
+fn historical_original_base_distinguishes_absent_empty_and_binary_files() {
+    let (root, id) = fixture();
+    let mut store = Store::open(root.path()).unwrap();
+    let workspace = store.workspace(&id).unwrap().unwrap();
+    let backend = store.review_backend(&workspace.review.id).unwrap().unwrap();
+    let mut read = workspace.review.read.clone();
+    fs::write(root.path().join("empty.rs"), "").unwrap();
+    fs::write(root.path().join("binary.rs"), b"\0original binary\n").unwrap();
+    git(root.path(), &["add", "empty.rs", "binary.rs"]);
+    git(root.path(), &["commit", "--quiet", "-m", "Original bases"]);
+    let base = git(root.path(), &["rev-parse", "HEAD"]);
+    for path in ["added.rs", "empty.rs", "binary.rs"] {
+        fs::write(root.path().join(path), "comment source\n").unwrap();
+    }
+    git(root.path(), &["add", "added.rs", "empty.rs", "binary.rs"]);
+    git(root.path(), &["commit", "--quiet", "-m", "Comment sources"]);
+    let head = git(root.path(), &["rev-parse", "HEAD"]);
+    let original = DiffRevision {
+        base: base.clone(),
+        head: head.clone(),
+    };
+    read.pull_request.revision = original.clone();
+    let comment = read.comments[0].clone();
+    read.comments = ["added.rs", "empty.rs", "binary.rs"]
+        .into_iter()
+        .map(|path| {
+            let mut comment = comment.clone();
+            comment.content.id = CommentId(path.into());
+            if let CommentTarget::Diff(location) = &mut comment.target {
+                location.original.revision = ReadCommentRevision::Comparison(original.clone());
+                location.original.position.path = path.into();
+            }
+            comment
+        })
+        .collect();
+    let file = read.files[0].clone();
+    read.files = ["added.rs", "empty.rs", "binary.rs"]
+        .into_iter()
+        .map(|path| ChangedFile {
+            path: path.into(),
+            change: if path == "added.rs" {
+                FileChange::Added
+            } else {
+                FileChange::Modified
+            },
+            ..file.clone()
+        })
+        .collect();
+    let snapshot = ReviewId("original-file-variants".into());
+    store
+        .import_review(&snapshot, &workspace.review.reviewer, &read, &backend)
+        .unwrap();
+    let refreshed = store
+        .refresh_workspace(&id, workspace.generation, &snapshot)
+        .unwrap();
+    store
+        .mutate_workspace(&id, refreshed.generation, Action::CompareLatest)
+        .unwrap();
+    drop(store);
+    for (path, missing, binary) in [
+        ("added.rs", true, false),
+        ("empty.rs", false, false),
+        ("binary.rs", false, true),
+    ] {
+        let response = api(
+            root.path(),
+            json!({"op":"historical_code","workspace":id,"comment":path}),
+        );
+        assert_eq!(response["code"]["original_base"]["commit"], base);
+        assert_eq!(response["code"]["original_base"]["path"], path);
+        assert_eq!(response["code"]["original_base"]["missing"], missing);
+        assert_eq!(
+            response["code"]["original_base"]["content"],
+            if binary { "\0original binary\n" } else { "" }
+        );
+        assert_eq!(response["code"]["base_content"], "comment source\n");
+        assert_eq!(response["code"]["head_content"], "comment source\n");
+        assert_eq!(response["code"]["binary"], binary);
+        assert_eq!(response["code"]["location"].is_null(), binary);
+    }
 }
 
 #[test]
@@ -1136,13 +1367,83 @@ fn prepared_refresh_leaves_local_writes_available_and_unchanged_until_apply() {
 }
 
 #[test]
-fn split_compare_updates_pin_preserves_draft_anchor_and_defers_changed_pin() {
+fn explicit_comparison_operations_are_rejected_without_changing_saved_work() {
+    let (root, id) = fixture();
+    let store = Store::open(root.path()).unwrap();
+    let before = store.workspace(&id).unwrap().unwrap();
+    for operation in ["compare_latest", "compare_saved"] {
+        let output = command(
+            root.path(),
+            &json!({"op":operation,"workspace":id,"generation":before.generation,"commit":before.comparison.head}),
+        );
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unknown workspace operation"));
+    }
+    let output = command(
+        root.path(),
+        &json!({"op":"actions","workspace":id,"generation":before.generation,"actions":[{"action":"start"},{"action":"compare_latest"}]}),
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("comparison follows Git HEAD"));
+    assert_eq!(store.workspace(&id).unwrap().unwrap(), before);
+}
+
+#[test]
+fn canonical_cli_uses_git_head_filters_viewed_marks_and_reports_local_edits() {
+    let (root, id) = fixture();
+    let staged = api(
+        root.path(),
+        json!({"op":"actions","workspace":id,"generation":0,"actions":[{"action":"viewed","path":"file.rs","viewed":true}]}),
+    );
+    assert!(staged["workspace"]["files"][0]["viewed"].as_bool().unwrap());
+    let store = Store::open(root.path()).unwrap();
+    let saved = store.workspace(&id).unwrap().unwrap();
+    fs::write(root.path().join("file.rs"), "committed local head\n").unwrap();
+    git(root.path(), &["commit", "--quiet", "-am", "Local head"]);
+    let head = git(root.path(), &["rev-parse", "HEAD"]);
+    let current = api(root.path(), json!({"op":"get","workspace":id}));
+    assert_eq!(current["workspace"]["comparison"]["head"], head);
+    assert_eq!(current["workspace"]["files"][0]["viewed"], false);
+    assert_eq!(current["workspace"]["pending"], json!([]));
+    assert_eq!(current["workspace"]["generation"], saved.generation);
+    assert_eq!(store.workspace(&id).unwrap().unwrap(), saved);
+
+    let committed = api(
+        root.path(),
+        json!({"op":"code","workspace":id,"path":"file.rs"}),
+    );
+    assert_eq!(committed["code"]["revision"]["head"], head);
+    assert_eq!(
+        committed["workspace"]["comparison"],
+        committed["code"]["revision"]
+    );
+    assert_eq!(committed["code"]["head_content"], "committed local head\n");
+    assert_eq!(committed["code"]["local_dirty"], false);
+    assert_eq!(
+        committed["code"]["local_path"],
+        root.path().join("file.rs").to_str().unwrap()
+    );
+
+    fs::write(root.path().join("file.rs"), "uncommitted local edit\n").unwrap();
+    let dirty = api(
+        root.path(),
+        json!({"op":"code","workspace":id,"path":"file.rs"}),
+    );
+    assert_eq!(dirty["code"]["local_dirty"], true);
+    assert_eq!(dirty["code"]["head_content"], "committed local head\n");
+    assert_eq!(store.workspace(&id).unwrap().unwrap(), saved);
+}
+
+#[test]
+fn split_refresh_uses_checked_out_head_and_preserves_saved_draft_anchor() {
     let (root, id) = fixture();
     let mut store = Store::open(root.path()).unwrap();
     let original = store.workspace(&id).unwrap().unwrap();
     let backend = store.review_backend(&original.review.id).unwrap().unwrap();
     let mut read = original.review.read.clone();
-    read.pull_request.revision.head = "c".repeat(40);
+    fs::write(root.path().join("file.rs"), "new comparison\n").unwrap();
+    git(root.path(), &["commit", "--quiet", "-am", "New comparison"]);
+    read.pull_request.revision.head = git(root.path(), &["rev-parse", "HEAD"]);
     let snapshot = ReviewId("new-comparison".into());
     store
         .import_review(&snapshot, &original.review.reviewer, &read, &backend)
@@ -1169,32 +1470,38 @@ fn split_compare_updates_pin_preserves_draft_anchor_and_defers_changed_pin() {
     let draft = staged.saved_comment.clone().unwrap();
     let response = api(
         root.path(),
-        json!({"op":"apply_refresh","workspace":id,"generation":staged.generation,"compare_latest":true,"prepared_refresh":{"workspace":id,"generation":original.generation,"review":snapshot}}),
+        json!({"op":"apply_refresh","workspace":id,"generation":staged.generation,"prepared_refresh":{"workspace":id,"generation":original.generation,"review":snapshot}}),
     );
     assert!(response["error"].is_null());
     let compared = store.workspace(&id).unwrap().unwrap();
-    assert_eq!(compared.comparison, read.pull_request.revision);
+    assert_eq!(
+        response["workspace"]["comparison"],
+        json!(read.pull_request.revision)
+    );
+    assert_eq!(compared.comparison, original.comparison);
     assert!(compared.pending().unwrap().operations.iter().any(|operation| matches!(&operation.change, Event::CreateComment { comment } if comment.content.id == draft && comment.target == target)));
 
-    read.pull_request.revision.head = "d".repeat(40);
-    let newer = ReviewId("later-comparison".into());
-    store
-        .import_review(&newer, &original.review.reviewer, &read, &backend)
-        .unwrap();
-    let unpinned = store
-        .refresh_workspace(&id, compared.generation, &newer)
-        .unwrap();
-    let moved = store
-        .mutate_workspace(&id, unpinned.generation, Action::CompareLatest)
-        .unwrap();
-    let history = store.workspace_log(&id).unwrap();
-    let deferred = api(
+    fs::write(root.path().join("file.rs"), "later comparison\n").unwrap();
+    git(
         root.path(),
-        json!({"op":"apply_refresh","workspace":id,"generation":moved.generation,"compare_latest":true,"prepared_refresh":{"workspace":id,"generation":unpinned.generation,"review":newer}}),
+        &["commit", "--quiet", "-am", "Later comparison"],
     );
-    assert_eq!(deferred["refresh_deferred"], true);
-    assert_eq!(store.workspace(&id).unwrap().unwrap(), moved);
-    assert_eq!(store.workspace_log(&id).unwrap(), history);
+    let later_head = git(root.path(), &["rev-parse", "HEAD"]);
+    let reopened = api(
+        root.path(),
+        json!({"op":"apply_refresh","workspace":id,"generation":compared.generation,"prepared_refresh":{"workspace":id,"generation":compared.generation,"review":snapshot}}),
+    );
+    assert!(reopened["error"].is_null());
+    assert_ne!(reopened["refresh_deferred"], true);
+    assert_eq!(reopened["workspace"]["comparison"]["head"], later_head);
+    assert_eq!(
+        reopened["workspace"]["review"]["read"]["pull_request"]["revision"],
+        json!(read.pull_request.revision)
+    );
+    assert_eq!(
+        store.workspace(&id).unwrap().unwrap().batch.write,
+        compared.batch.write
+    );
 }
 
 #[test]
@@ -1217,7 +1524,10 @@ fn prepared_refresh_rejects_other_sessions_and_defers_superseded_baselines() {
     );
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("another workspace"));
-    assert_eq!(store.workspace(&other.id).unwrap().unwrap(), other);
+    assert_eq!(
+        serde_json::to_value(store.workspace(&other.id).unwrap().unwrap()).unwrap(),
+        serde_json::to_value(other).unwrap()
+    );
     let missing = command(
         root.path(),
         &json!({"op":"apply_refresh","workspace":id,"generation":original.generation,"prepared_refresh":{"workspace":id,"generation":999,"review":prepared_id}}),

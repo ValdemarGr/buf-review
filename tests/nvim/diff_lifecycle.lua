@@ -42,18 +42,24 @@ write('routes.json', { entry = { route = 'batch', batch = view.id, fresh_review 
 local main_windows
 local function pair(expected_path, expected_kind)
   local result, windows = {}, {}
-  for _, win in ipairs(expected_kind == 'context' and api.nvim_tabpage_list_wins(0) or main_windows or api.nvim_tabpage_list_wins(0)) do
+  local comment_panes = expected_kind == 'comment'
+  for _, win in ipairs((expected_kind == 'context' or comment_panes) and api.nvim_tabpage_list_wins(0) or main_windows or api.nvim_tabpage_list_wins(0)) do
     local buf = api.nvim_win_get_buf(win)
     local meta = vim.b[buf].buf_review
-    if meta and meta.kind == (expected_kind or 'diff') then
+    if meta and meta.kind == (expected_kind == 'context' and 'context' or 'diff') and (not comment_panes or meta.comment_role) then
       assert(not expected_path or meta.path == expected_path, 'managed pair retained wrong file')
       assert(vim.wo[win].diff, 'native diff disabled: ' .. api.nvim_buf_get_name(buf))
       result[#result + 1], windows[#windows + 1] = buf, win
-      if expected_kind ~= 'context' then assert(vim.deep_equal(meta.revision, revision), 'file navigation changed pin') end
+      if comment_panes then
+        assert(meta.comment_role == 'original_base' or meta.comment_role == 'comment', 'unchanged selected side was not collapsed')
+        assert(meta.revision.base == (meta.comment_role == 'comment' and revision.head or revision.base)
+          and meta.revision.head == revision.head, 'comment source does not preserve original/selected revisions')
+      elseif expected_kind ~= 'context' then assert(vim.deep_equal(meta.revision, revision), 'file navigation changed pin') end
     end
   end
   assert(#result == 2, 'expected native diff pair: ' .. vim.inspect(result))
-  if not main_windows and expected_kind ~= 'context' then main_windows = windows end
+  if not main_windows and not expected_kind then main_windows = windows end
+  assert(vim.deep_equal(vim.json.decode(table.concat(vim.fn.readfile(fixture .. '/state.json'), '\n')).comparison, revision), 'source navigation changed comparison pin')
   assert(not vim.v.errmsg:find('E96', 1, true), vim.v.errmsg)
   return result
 end
@@ -122,7 +128,7 @@ end
 for index = 1, 12 do
   command('next comment')
   wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'comment-' .. index end, 'comment navigation stalled ' .. index)
-  local current = pair(path(index))
+  local current = pair(path(index), 'comment')
   assert(owned_count() <= 4, 'comment navigation retained hidden code buffers')
   previous = current
 end
@@ -149,21 +155,21 @@ vim.cmd('tabclose')
 api.nvim_set_current_tabpage(review_tab)
 command('previous comment')
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'comment-11' end, 'return from original context failed')
-pair(path(11))
+pair(path(11), 'comment')
 assert(api.nvim_buf_is_valid(ordinary), 'ordinary user buffer was deleted')
 api.nvim_win_close(extra_window, true)
 api.nvim_set_current_tabpage(other_tab); vim.cmd('tabclose')
 api.nvim_set_current_tabpage(review_tab)
 command('previous comment')
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'comment-10' end, 'navigation after retained readers closed failed')
-pair(path(10))
+pair(path(10), 'comment')
 assert(api.nvim_buf_is_valid(preserved_extra) and api.nvim_buf_is_valid(preserved_other), 'hidden reader slots were wiped instead of retained for reuse')
 assert(owned_count() <= 6, 'closed snapshots allocated more reader slots')
 assert(api.nvim_buf_is_valid(ordinary) and vim.wo[ordinary_window].diff, 'ordinary user diff was not preserved')
 api.nvim_win_close(ordinary_window, true)
 command('previous comment')
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'comment-9' end, 'navigation with hidden user buffer failed')
-pair(path(9))
+pair(path(9), 'comment')
 assert(api.nvim_buf_is_valid(ordinary) and api.nvim_buf_get_lines(ordinary, 0, -1, false)[1] == 'ordinary user buffer',
   'hidden ordinary user buffer was deleted or changed')
 print('Neovim diff lifecycle workflows passed')

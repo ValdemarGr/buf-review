@@ -221,3 +221,249 @@ fn batch_commit_checks_reject_record_separators() {
         ));
     }
 }
+
+#[test]
+fn commit_summaries_show_only_fetched_tail_newest_first() {
+    let project = tempdir().unwrap();
+    let revision = revisions(project.path());
+    git(
+        project.path(),
+        &["commit", "--quiet", "--allow-empty", "-m", "Newest subject"],
+    );
+    let fetched = git(project.path(), &["rev-parse", "HEAD"]);
+    let summaries =
+        diff::missing_commits_summary(project.path(), &revision.base, &fetched).unwrap();
+    assert_eq!(
+        summaries,
+        vec![
+            diff::CommitSummary {
+                id: fetched.clone(),
+                subject: "Newest subject".into()
+            },
+            diff::CommitSummary {
+                id: revision.head.clone(),
+                subject: "Head".into()
+            },
+        ]
+    );
+    assert!(
+        diff::missing_commits_summary(project.path(), &fetched, &fetched)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        diff::missing_commits_summary(project.path(), &fetched, &revision.head)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn viewed_history_detects_reverts_and_preserves_unrelated_paths_in_both_directions() {
+    let project = tempdir().unwrap();
+    let revision = revisions(project.path());
+    fs::write(project.path().join("file.rs"), "changed again\n").unwrap();
+    git(project.path(), &["commit", "--quiet", "-am", "Change file"]);
+    fs::write(project.path().join("file.rs"), "after\n").unwrap();
+    git(project.path(), &["commit", "--quiet", "-am", "Revert file"]);
+    let latest = git(project.path(), &["rev-parse", "HEAD"]);
+    assert!(
+        diff::files(
+            project.path(),
+            &DiffRevision {
+                base: revision.head.clone(),
+                head: latest.clone()
+            }
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let paths = vec!["file.rs".into(), ":(glob)*".into()];
+    for (marked, selected) in [(&revision.head, &latest), (&latest, &revision.head)] {
+        assert_eq!(
+            diff::unchanged_paths(project.path(), marked, selected, &paths).unwrap(),
+            [":(glob)*".into()].into()
+        );
+    }
+    assert_eq!(
+        diff::unchanged_paths(project.path(), &revision.head, &revision.head, &paths).unwrap(),
+        paths.into_iter().collect()
+    );
+}
+
+#[test]
+fn viewed_history_treats_rename_paths_literally_and_preserves_dirty_files() {
+    let project = tempdir().unwrap();
+    let revision = revisions(project.path());
+    let renamed = "renamed\tfile\nλ.rs";
+    fs::rename(
+        project.path().join(":(glob)*"),
+        project.path().join(renamed),
+    )
+    .unwrap();
+    git(project.path(), &["--literal-pathspecs", "add", "."]);
+    git(project.path(), &["commit", "--quiet", "-m", "Rename"]);
+    let latest = git(project.path(), &["rev-parse", "HEAD"]);
+    fs::write(project.path().join("file.rs"), "staged\n").unwrap();
+    git(project.path(), &["add", "file.rs"]);
+    fs::write(project.path().join("file.rs"), "unstaged\n").unwrap();
+    let status = git(project.path(), &["status", "--porcelain"]);
+    let paths = vec![":(glob)*".into(), renamed.into(), "file.rs".into()];
+    assert_eq!(
+        diff::unchanged_paths(project.path(), &revision.head, &latest, &paths).unwrap(),
+        ["file.rs".into()].into()
+    );
+    assert_eq!(git(project.path(), &["status", "--porcelain"]), status);
+    assert_eq!(
+        fs::read_to_string(project.path().join("file.rs")).unwrap(),
+        "unstaged\n"
+    );
+}
+
+#[test]
+fn viewed_history_checks_both_divergent_branches() {
+    let project = tempdir().unwrap();
+    let revision = revisions(project.path());
+    fs::write(project.path().join("file.rs"), "first branch\n").unwrap();
+    git(
+        project.path(),
+        &["commit", "--quiet", "-am", "First branch"],
+    );
+    let first = git(project.path(), &["rev-parse", "HEAD"]);
+    git(
+        project.path(),
+        &["checkout", "--quiet", "--detach", &revision.head],
+    );
+    fs::write(project.path().join(":(glob)*"), "second branch\n").unwrap();
+    git(
+        project.path(),
+        &["commit", "--quiet", "-am", "Second branch"],
+    );
+    let second = git(project.path(), &["rev-parse", "HEAD"]);
+    let paths = vec!["file.rs".into(), ":(glob)*".into(), "untouched.rs".into()];
+    assert_eq!(
+        diff::unchanged_paths(project.path(), &first, &second, &paths).unwrap(),
+        ["untouched.rs".into()].into()
+    );
+}
+
+#[test]
+fn viewed_history_includes_merge_parent_changes() {
+    let project = tempdir().unwrap();
+    let revision = revisions(project.path());
+    git(project.path(), &["checkout", "--quiet", "-b", "side"]);
+    fs::write(project.path().join("file.rs"), "side branch\n").unwrap();
+    git(project.path(), &["commit", "--quiet", "-am", "Side change"]);
+    let side = git(project.path(), &["rev-parse", "HEAD"]);
+    git(
+        project.path(),
+        &["checkout", "--quiet", "--detach", &revision.head],
+    );
+    fs::write(project.path().join(":(glob)*"), "main branch\n").unwrap();
+    git(project.path(), &["commit", "--quiet", "-am", "Main change"]);
+    let marked = git(project.path(), &["rev-parse", "HEAD"]);
+    git(
+        project.path(),
+        &["merge", "--quiet", "--no-ff", "-m", "Merge side", &side],
+    );
+    let selected = git(project.path(), &["rev-parse", "HEAD"]);
+    let paths = vec!["file.rs".into(), ":(glob)*".into()];
+    assert!(
+        !diff::unchanged_paths(project.path(), &marked, &selected, &paths)
+            .unwrap()
+            .contains("file.rs")
+    );
+}
+
+#[test]
+fn history_queries_reject_missing_revisions_and_shallow_history() {
+    let project = tempdir().unwrap();
+    let revision = revisions(project.path());
+    for missing in ["missing-commit", "--help"] {
+        assert!(diff::missing_commits_summary(project.path(), missing, &revision.head).is_err());
+        assert!(
+            diff::unchanged_paths(project.path(), missing, &revision.head, &["file.rs".into()])
+                .is_err()
+        );
+    }
+    fs::write(
+        project.path().join(".git/shallow"),
+        format!("{}\n", revision.head),
+    )
+    .unwrap();
+    assert!(diff::missing_commits_summary(project.path(), &revision.head, &revision.head).is_err());
+    assert!(
+        diff::unchanged_paths(
+            project.path(),
+            &revision.head,
+            &revision.head,
+            &["file.rs".into()]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn history_queries_fail_when_an_intermediate_commit_is_missing() {
+    let project = tempdir().unwrap();
+    let revision = revisions(project.path());
+    git(
+        project.path(),
+        &["commit", "--quiet", "--allow-empty", "-m", "Latest"],
+    );
+    let latest = git(project.path(), &["rev-parse", "HEAD"]);
+    fs::remove_file(
+        project
+            .path()
+            .join(".git/objects")
+            .join(&revision.head[..2])
+            .join(&revision.head[2..]),
+    )
+    .unwrap();
+    assert!(diff::missing_commits_summary(project.path(), &revision.base, &latest).is_err());
+    assert!(
+        diff::unchanged_paths(project.path(), &revision.base, &latest, &["file.rs".into()])
+            .is_err()
+    );
+}
+
+#[test]
+fn fetch_all_updates_each_remote_without_changing_checkout_or_dirty_worktree() {
+    let source = tempdir().unwrap();
+    let revision = revisions(source.path());
+    let project = tempdir().unwrap();
+    git(
+        project.path(),
+        &["clone", "--quiet", source.path().to_str().unwrap(), "."],
+    );
+    git(
+        project.path(),
+        &["remote", "add", "backup", source.path().to_str().unwrap()],
+    );
+    let branch = git(source.path(), &["branch", "--show-current"]);
+    fs::write(project.path().join("file.rs"), "staged\n").unwrap();
+    git(project.path(), &["add", "file.rs"]);
+    fs::write(project.path().join("file.rs"), "unstaged\n").unwrap();
+    let status = git(project.path(), &["status", "--porcelain"]);
+    git(
+        source.path(),
+        &["commit", "--quiet", "--allow-empty", "-m", "Remote change"],
+    );
+    let remote_head = git(source.path(), &["rev-parse", "HEAD"]);
+    diff::fetch_all(project.path()).unwrap();
+    for remote in ["origin", "backup"] {
+        assert_eq!(
+            git(
+                project.path(),
+                &["rev-parse", &format!("refs/remotes/{remote}/{branch}")]
+            ),
+            remote_head
+        );
+    }
+    assert_eq!(git(project.path(), &["rev-parse", "HEAD"]), revision.head);
+    assert_eq!(git(project.path(), &["status", "--porcelain"]), status);
+    assert_eq!(
+        fs::read_to_string(project.path().join("file.rs")).unwrap(),
+        "unstaged\n"
+    );
+}

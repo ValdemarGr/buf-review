@@ -610,12 +610,12 @@ fn migration_preserves_authoritative_refresh_local_intent_and_every_historical_g
     for _ in 0..2 {
         let mut reopened = Store::open(legacy.path()).unwrap();
         assert_eq!(
-            reopened.workspace(&workspace.id).unwrap().unwrap(),
-            workspace
+            serde_json::to_value(reopened.workspace(&workspace.id).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&workspace).unwrap()
         );
         assert_eq!(
-            reopened.last_active_workspace().unwrap().unwrap(),
-            workspace
+            serde_json::to_value(reopened.last_active_workspace().unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&workspace).unwrap()
         );
         assert_eq!(reopened.workspace_log(&workspace.id).unwrap(), actions);
         assert_eq!(
@@ -632,16 +632,20 @@ fn migration_preserves_authoritative_refresh_local_intent_and_every_historical_g
             assert_eq!(actual.generation, expected.generation);
             assert_eq!(actual.action, expected.action);
             assert_eq!(
-                actual.state, expected.state,
+                serde_json::to_value(actual.state).unwrap(),
+                serde_json::to_value(&expected.state).unwrap(),
                 "generation {}",
                 expected.generation
             );
             assert_eq!(
-                reopened
-                    .workspace_at_generation(&workspace.id, expected.generation)
-                    .unwrap()
-                    .unwrap(),
-                expected.state
+                serde_json::to_value(
+                    reopened
+                        .workspace_at_generation(&workspace.id, expected.generation)
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&expected.state).unwrap()
             );
         }
         let explicit_null = reopened
@@ -753,21 +757,33 @@ fn history_deltas_capture_provider_binding_before_the_next_local_save() {
     let reopened = Store::open(project.path()).unwrap();
     assert_eq!(reopened.workspace(&current.id).unwrap().unwrap(), current);
     assert_eq!(
-        reopened
-            .workspace_at_generation(&current.id, current.generation)
-            .unwrap()
-            .unwrap(),
-        current
+        serde_json::to_value(
+            reopened
+                .workspace_at_generation(&current.id, current.generation)
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&current).unwrap()
     );
     assert_eq!(
-        reopened
-            .workspace_at_generation(&initial.id, initial.generation)
-            .unwrap()
-            .unwrap(),
-        initial
+        serde_json::to_value(
+            reopened
+                .workspace_at_generation(&initial.id, initial.generation)
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&initial).unwrap()
     );
     let history = reopened.batch_history(&current.batch.id).unwrap();
     assert_eq!(history.len(), 2);
-    assert_eq!(history[0].state, initial);
-    assert_eq!(history[1].state, current);
+    assert_eq!(
+        serde_json::to_value(&history[0].state).unwrap(),
+        serde_json::to_value(initial).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&history[1].state).unwrap(),
+        serde_json::to_value(current).unwrap()
+    );
 }

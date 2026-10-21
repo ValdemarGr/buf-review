@@ -30,6 +30,8 @@ if not resume then
   git('add', 'app.txt')
   git('commit', '-m', 'Feature')
   git('remote', 'add', 'origin', 'https://github.com/acme/repo.git')
+  git('remote', 'set-url', '--push', 'origin', 'https://github.com/acme/repo.git')
+  git('remote', 'set-url', 'origin', project)
   vim.fn.writefile({ 'dirty file must stay outside review' }, project .. '/app.txt')
   vim.fn.writefile({ 'unsaved to Git' }, project .. '/notes.txt')
   vim.fn.writefile({ 'untracked contents' }, project .. '/untracked.txt')
@@ -81,12 +83,16 @@ local function row(needle)
   end
   error('Missing row: ' .. needle .. '\n' .. text())
 end
+local active_id
 local function active()
-  local result = vim.system({ executable, 'workspace' }, { cwd = project, stdin = vim.json.encode({ op = 'active' }), text = true }):wait()
+  local request = active_id and { op = 'get', workspace = active_id } or { op = 'active' }
+  local result = vim.system({ executable, 'workspace' }, { cwd = project, stdin = vim.json.encode(request), text = true }):wait()
   assert(result.code == 0, result.stderr)
   local response = vim.json.decode(result.stdout, { luanil = { object = true, array = true } })
   assert(not response.error, response.error)
-  return assert(response.workspace, result.stdout)
+  local view = assert(response.workspace, result.stdout)
+  if not active_id then active_id = view.id; return active() end
+  return view
 end
 local function home()
   vim.cmd('Review')
@@ -130,8 +136,19 @@ wait(function() return kind() ~= 'composer' end, 'Actual metadata :wq failed')
 assert(active().pr.title == 'Actual CLI title' and active().pr.body == 'Body saved through native Neovim')
 home()
 row('M +1 -1  app.txt'); input('<CR>')
+wait(function() return api.nvim_buf_get_name(0) == project .. '/app.txt' end, 'Dirty file did not open as native right pane')
+assert(kind() == nil and vim.bo.modifiable and not vim.bo.readonly, 'Dirty right pane became a Review buffer')
+assert(text() == 'dirty file must stay outside review' and vim.fn.maparg('a', 'n') == '', 'Dirty file lost native contents or editing')
+assert(git('status', '--porcelain') == status and git('rev-parse', 'HEAD') == head, 'Opening local pane changed Git work')
+api.nvim_buf_set_lines(0, 0, -1, false, { 'one', 'new committed change', 'three' })
+vim.cmd.write()
+git('add', 'app.txt'); git('commit', '-m', 'Commit edited review file')
+head, status = git('rev-parse', 'HEAD'), git('status', '--porcelain')
+assert(kind() == nil, 'Commit silently converted native pane to Review buffer')
+home()
+row('M +1 -1  app.txt'); input('<CR>')
 wait(function() return kind() == 'diff' end, 'Actual committed diff missing')
-assert(text() == 'one\ncommitted change\nthree' and vim.bo.readonly and not vim.bo.modifiable)
+assert(text() == 'one\nnew committed change\nthree' and vim.bo.readonly and not vim.bo.modifiable)
 api.nvim_win_set_cursor(0, { 2, 0 }); input('a')
 wait(function() return kind() == 'composer' end, 'Actual inline comment composer missing')
 api.nvim_buf_set_lines(0, 0, -1, false, { 'Actual CLI draft' })
@@ -151,8 +168,8 @@ local restarted = vim.system({ vim.v.progpath, '--headless', '-u', 'NONE', '-c',
 } }):wait()
 assert(restarted.code == 0, restarted.stderr .. restarted.stdout)
 
--- Refresh resolves the saved source branch, independent of current checkout.
-vim.fn.writefile({ 'one', 'committed change', 'three' }, project .. '/app.txt')
+-- Refresh retains saved PR evidence while the visible diff follows Git checkout.
+vim.fn.writefile({ 'one', 'new committed change', 'three' }, project .. '/app.txt')
 git('switch', '-c', 'unrelated', 'main')
 vim.fn.writefile({ 'another branch' }, project .. '/unrelated.txt')
 git('add', 'unrelated.txt'); git('commit', '-m', 'Unrelated work')
@@ -162,10 +179,11 @@ local generation = active().generation
 home()
 vim.cmd('Review refresh')
 wait(function() return active().generation > generation end, 'Actual local refresh did not complete')
-assert(active().comparison.head == head and active().review.read.pull_request.revision.head == head, 'Refresh used current checkout instead of saved source')
-row('M +1 -1  app.txt'); input('<CR>')
-wait(function() return kind() == 'diff' end, 'Saved branch diff did not reopen')
-assert(text() == 'one\ncommitted change\nthree', 'Refresh replaced local review with unrelated branch')
+assert(active().comparison.head == unrelated and active().review.read.pull_request.revision.head == head, 'Refresh mixed checked-out HEAD with saved PR source')
+assert(draft(active()).target.target.revision.head == head, 'Checkout rewrote existing draft anchor')
+row('A +1 -0  unrelated.txt'); input('<CR>')
+wait(function() return kind() == 'diff' end, 'Checked-out branch diff did not open')
+assert(text() == 'another branch', 'Diff ignored checked-out branch')
 home()
 
 -- Unpushed publication gives Git guidance without sending any provider writes.
@@ -182,7 +200,7 @@ assert(after.pr.title == before.pr.title and after.pr.body == before.pr.body and
 local before_changes, after_changes = {}, {}
 for _, operation in ipairs(before.pending) do before_changes[#before_changes + 1] = operation.change end
 for _, operation in ipairs(after.pending) do after_changes[#after_changes + 1] = operation.change end
-assert(vim.deep_equal(after_changes, before_changes) and after.comparison.head == head, 'Unpushed publication consumed local changes')
+assert(vim.deep_equal(after_changes, before_changes) and after.comparison.head == unrelated, 'Unpushed publication consumed local changes or changed checkout projection')
 assert(git('branch', '--show-current') == 'unrelated' and git('rev-parse', 'HEAD') == unrelated)
 assert(table.concat(vim.fn.readfile(project .. '/notes.txt'), '\n') == 'unsaved to Git')
 local branch_checked = false

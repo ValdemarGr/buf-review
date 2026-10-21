@@ -214,10 +214,16 @@ fn fetches_pinned_objects_without_changing_git_or_workspace_state() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        json!({"revision":revision})
+        response["revision"],
+        json!({"base":revision.base,"head":git(local.path(), &["rev-parse", "HEAD"])})
     );
+    assert_eq!(response["workspace"], {
+        let mut runtime = Store::open(local.path()).unwrap();
+        runtime.enable_worktree_context();
+        serde_json::to_value(runtime.workspace_view(&id).unwrap()).unwrap()
+    });
     assert_eq!(git(local.path(), &["show-ref"]), refs);
     assert_eq!(git(local.path(), &["symbolic-ref", "HEAD"]), branch);
     assert_eq!(git(local.path(), &["rev-parse", "HEAD"]), checkout);
@@ -470,17 +476,26 @@ fn prepares_pins_then_fetches_only_distinct_missing_historical_commits_together(
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(state(), before);
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        json!({"revision": revision})
+        response["revision"],
+        json!({"base":revision.base,"head":git(local.path(), &["rev-parse", "HEAD"])})
     );
+    assert_eq!(response["workspace"], {
+        let mut runtime = Store::open(local.path()).unwrap();
+        runtime.enable_worktree_context();
+        serde_json::to_value(runtime.workspace_view(&id).unwrap()).unwrap()
+    });
     let log = fs::read_to_string(&trace).unwrap();
     let fetches = log
         .lines()
         .filter(|line| line.contains("built-in: git ") && line.contains(" fetch "))
         .collect::<Vec<_>>();
     assert_eq!(fetches.len(), 2, "{log}");
-    assert!(fetches[0].contains(&revision.head), "{log}");
+    assert!(
+        !fetches[0].contains(&revision.head),
+        "saved head arrives with fetched ancestry: {log}"
+    );
     assert!(fetches[0].contains(&latest_head), "{log}");
     assert!(
         !fetches[0].contains(&revision.base),
@@ -590,7 +605,10 @@ fn unavailable_historical_commits_warn_without_mutating_git_or_workspace_state()
         String::from_utf8_lossy(&output.stderr)
     );
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(response["revision"], json!(revision));
+    assert_eq!(
+        response["revision"],
+        json!({"base":revision.base,"head":git(local.path(), &["rev-parse", "HEAD"])})
+    );
     let warnings = response["warnings"].to_string();
     assert!(warnings.contains(&unavailable), "{response}");
     assert!(warnings.contains(&other_unavailable), "{response}");

@@ -184,6 +184,7 @@ fn viewed(value: bool) -> Event {
     Event::SetFileViewed {
         path: "src/lib.rs".into(),
         viewed: value,
+        commit: None,
     }
 }
 fn conclusion(outcome: ReviewOutcome) -> Event {
@@ -731,6 +732,7 @@ fn ordered_plan_preserves_surviving_event_order_and_terminal_conclusion() {
         Event::SetFileViewed {
             path: "src/lib.rs".into(),
             viewed: true,
+            commit: None,
         },
         Event::EditComment {
             comment: id("root"),

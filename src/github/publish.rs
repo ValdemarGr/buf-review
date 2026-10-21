@@ -254,7 +254,7 @@ pub fn publish(
                 &Value::Null,
             )?
         }
-        Change::SetFileViewed { path, viewed } => {
+        Change::SetFileViewed { path, viewed, .. } => {
             let node = match backend.mappings.iter().find(|mapping| {
                 mapping.resource == "pull_request_node"
                     && mapping.core_id == review.read.pull_request.id.0

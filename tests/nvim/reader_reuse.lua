@@ -114,7 +114,8 @@ command('next comment')
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'b' end, 'Second thread missing')
 assert(api.nvim_get_current_buf() == thread and text():find('Feedback b', 1, true) and not text():find('Feedback a', 1, true), 'Thread reader identity or object was stale')
 open('historical')
-assert(vim.deep_equal(pair('a.lua'), slots), 'Historical pair allocated new reader buffers')
+local historical_slots = pair('a.lua')
+assert(historical_slots.base == slots.base and historical_slots.head == slots.head, 'Historical pair allocated new reader buffers')
 assert(vim.b[slots.base].buf_review.historical, 'Historical setup lost source identity')
 
 -- Refreshing original context keeps a manually retained source snapshot visible.

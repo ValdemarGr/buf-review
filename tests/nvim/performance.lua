@@ -148,9 +148,11 @@ wait(function() return kind() == 'thread' end, 'discussion missing before return
 local head
 for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
   local marker = vim.b[api.nvim_win_get_buf(win)].buf_review
-  if marker and marker.kind == 'diff' and marker.side == 'head' then head = win end
+  if marker and marker.kind == 'diff' and marker.comment_role == 'comment' then head = win end
 end
-api.nvim_set_current_win(assert(head))
+assert(head, 'current commented version missing')
+api.nvim_set_current_win(head)
+assert(vim.b.buf_review.revision.base == revision.head, 'reader return used wrong comment version')
 api.nvim_win_set_cursor(0, { 1, 0 })
 input('<CR>')
 assert(kind() == 'threads')

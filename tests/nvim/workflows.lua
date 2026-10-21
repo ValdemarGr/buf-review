@@ -41,9 +41,6 @@ local function requests(op)
   end
   return result
 end
-local function compare_requests()
-  return vim.tbl_filter(function(value) return value.compare_latest end, requests('apply_refresh'))
-end
 local function wait(predicate, reason)
   assert(ReviewTest.wait(5000, predicate, 10), (reason or 'timed out') .. '\n' .. vim.inspect(messages) .. '\n' .. table.concat(vim.fn.filereadable(fixture .. '/requests.jsonl') == 1 and vim.fn.readfile(fixture .. '/requests.jsonl') or {}, '\n'))
   ReviewTest.wait(30)
@@ -199,7 +196,7 @@ assert(vim.bo.readonly and not vim.bo.modifiable)
 assert(api.nvim_buf_get_lines(0, 0, 1, false)[1]:find(initial.locator, 1, true))
 local home_lines = table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n')
 assert(home_lines:find('Todo %(2%)') and home_lines:find('Unpublished changes %(0%)'))
-assert(home_lines:find('Pull request:', 1, true) and home_lines:find('Reviewer:', 1, true) and home_lines:find('Comparison:', 1, true) and home_lines:find('Freshness:', 1, true), 'home header lost labeled context')
+assert(home_lines:find('Pull request:', 1, true) and home_lines:find('Reviewer:', 1, true) and home_lines:find('Git:', 1, true) and home_lines:find('HEAD', 1, true) and home_lines:find('Freshness:', 1, true), 'home header lost labeled context')
 assert(home_lines:find(revision.base:sub(1, 10), 1, true) and home_lines:find(revision.head:sub(1, 10), 1, true), 'home comparison omitted short hashes')
 assert(not home_lines:find(revision.base, 1, true) and not home_lines:find(revision.head, 1, true), 'home comparison kept full hashes')
 assert(not home_lines:find('{{{1', 1, true), 'home exposed fold markers')
@@ -1079,21 +1076,19 @@ wait(function() return kind() == 'diff' and api.nvim_buf_line_count(0) == 1 and 
 require('buf_review').enter()
 assert(kind() == 'diff' and messages[#messages]:find('no source lines', 1, true), 'empty head accepted line comment')
 
--- A deferred comparison is not a successful pin change or a reason to reload code.
+-- Removed comparison commands cannot reload code or alter existing panes.
 local compared_panes = {}
 for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
   local buf = api.nvim_win_get_buf(win)
   compared_panes[win] = { buffer = buf, revision = vim.b[buf].buf_review.revision }
 end
 local pinned_before = vim.deepcopy(state().comparison)
-local before_deferred, before_code, before_notice = #compare_requests(), #requests('code'), #messages
-vim.fn.writefile({ '' }, fixture .. '/defer_compare')
+local before_refresh, before_code, before_notice = #requests('apply_refresh'), #requests('code'), #messages
 command('compare latest')
-wait(function() return #compare_requests() > before_deferred and #messages > before_notice end)
-assert(messages[#messages]:find('deferred', 1, true) and messages[#messages]:find(':Review compare latest', 1, true), 'deferred comparison falsely reported success')
-assert(#requests('code') == before_code and vim.deep_equal(state().comparison, pinned_before), 'deferred comparison reloaded or repinned code')
+assert(#messages > before_notice and messages[#messages]:find('Unknown Review command', 1, true), 'removed comparison command accepted')
+assert(#requests('apply_refresh') == before_refresh and #requests('code') == before_code and vim.deep_equal(state().comparison, pinned_before), 'removed comparison command reloaded or reanchored code')
 for win, pane in pairs(compared_panes) do
-  assert(api.nvim_win_is_valid(win) and api.nvim_win_get_buf(win) == pane.buffer and vim.deep_equal(vim.b[pane.buffer].buf_review.revision, pane.revision), 'deferred comparison replaced an existing pane')
+  assert(api.nvim_win_is_valid(win) and api.nvim_win_get_buf(win) == pane.buffer and vim.deep_equal(vim.b[pane.buffer].buf_review.revision, pane.revision), 'removed comparison command replaced an existing pane')
 end
 vim.cmd('tabnew')
 assert(vim.fn.maparg('<CR>', 'n') == '' and vim.fn.maparg('s', 'n') == '' and vim.fn.maparg('cc', 'n') == '')
@@ -1640,7 +1635,7 @@ end
 
 local first_failure = run('workflows', { BUF_REVIEW_FIRST_FAILURE = '1' })
 assert(first_failure.code == 0, first_failure.stderr)
-for _, name in ipairs({ 'sessions', 'append', 'performance', 'object_fetch', 'historical_panes', 'mark_move', 'diff_lifecycle', 'annotations', 'navigation', 'log', 'native_commands', 'composer_native', 'append_native', 'action_queue', 'overview_stats', 'diff_scroll', 'checkout_git', 'checkout_ui', 'local_pr', 'local_pr_cli', 'post_publish', 'mappings', 'jumplist', 'reader_reuse', 'review_queue' }) do
+for _, name in ipairs({ 'sessions', 'append', 'performance', 'object_fetch', 'commit_comparison', 'historical_panes', 'comment_panes', 'local_panes', 'mark_move', 'diff_lifecycle', 'annotations', 'navigation', 'log', 'native_commands', 'composer_native', 'append_native', 'action_queue', 'overview_stats', 'diff_scroll', 'checkout_git', 'checkout_ui', 'local_pr', 'local_pr_cli', 'post_publish', 'mappings', 'jumplist', 'reader_reuse', 'review_queue' }) do
   local child = run(name)
   assert(child.code == 0, name .. ': ' .. child.stderr)
 end

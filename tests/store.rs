@@ -125,10 +125,12 @@ fn reopening_preserves_baseline_and_uncollapsed_ordered_history() {
         Event::SetFileViewed {
             path: "src/model.rs".into(),
             viewed: true,
+            commit: None,
         },
         Event::SetFileViewed {
             path: "src/model.rs".into(),
             viewed: false,
+            commit: None,
         },
         Event::DismissReview {
             review: ReviewResourceId("fetched-review".into()),
@@ -419,6 +421,7 @@ fn invalid_events_are_rejected_without_poisoning_the_log() {
         Event::SetFileViewed {
             path: "missing.rs".into(),
             viewed: true,
+            commit: None,
         },
         Event::DismissReview {
             review: ReviewResourceId("missing".into()),

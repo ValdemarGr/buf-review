@@ -70,11 +70,25 @@ impl Fixture {
             root,
             &["remote", "add", "origin", "git@github.com:fork/repo.git"],
         );
+        git(
+            root,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "git@github.com:fork/repo.git",
+            ],
+        );
+        git(
+            root,
+            &["remote", "set-url", "origin", root.to_str().unwrap()],
+        );
         git(root, &["config", "push.default", "simple"]);
         fs::create_dir(root.join("bin")).unwrap();
         let executable = root.join("bin/gh");
         fs::write(&executable, r#"#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, subprocess, sys
 root = pathlib.Path(os.environ['INTENT_ROOT'])
 state_path = root / 'provider.json'
 state = json.loads(state_path.read_text())
@@ -97,6 +111,8 @@ elif endpoint.startswith('repos/target/repo/pulls?'):
 elif endpoint.startswith('repos/fork/repo/branches/'):
  if state.get('missing'):
   print('HTTP 404',file=sys.stderr);sys.exit(1)
+ if state.get('checkout_head'):
+  subprocess.run(['git','-C',str(root),'checkout','--quiet','--detach',state['checkout_head']],check=True)
  print(json.dumps({'commit':{'sha':state['head']}}))
 elif endpoint=='repos/target/repo/pulls' and method=='POST':
  mode=state.get('mode','')
@@ -235,7 +251,11 @@ fn local_entry_is_committed_only_resumes_and_refreshes_saved_branch() {
     let refreshed = fixture
         .call(json!({"op":"refresh","workspace":view["id"],"generation":view["generation"]}));
     assert!(refreshed["error"].is_null(), "{refreshed}");
-    assert_eq!(refreshed["workspace"]["comparison"]["head"], fixture.head);
+    assert_eq!(refreshed["workspace"]["comparison"]["head"], fixture.base);
+    assert_eq!(
+        refreshed["workspace"]["review"]["read"]["pull_request"]["revision"]["head"],
+        fixture.head
+    );
     assert_eq!(git(fixture.root(), &["branch", "--show-current"]), "master");
 }
 
@@ -373,7 +393,8 @@ fn missing_title_unpushed_commits_wrong_user_and_rejections_keep_intent() {
         let error = response["error"].as_str().unwrap();
         let expected = match case {
             "title" => "title",
-            "missing" | "unpushed" => "push",
+            "missing" => "push",
+            "unpushed" => "not at remote head",
             "user" => "user",
             _ => "HTTP 403",
         };
@@ -461,7 +482,11 @@ fn custom_push_ref_and_switched_head_refresh_use_saved_source() {
     let refreshed = fixture
         .call(json!({"op":"refresh","workspace":view["id"],"generation":view["generation"]}));
     assert!(refreshed["error"].is_null(), "{refreshed}");
-    assert_eq!(refreshed["workspace"]["comparison"]["head"], fixture.head);
+    assert_eq!(refreshed["workspace"]["comparison"]["head"], fixture.base);
+    assert_eq!(
+        refreshed["workspace"]["review"]["read"]["pull_request"]["revision"]["head"],
+        fixture.head
+    );
     assert_eq!(git(fixture.root(), &["branch", "--show-current"]), "master");
 }
 
@@ -485,7 +510,10 @@ fn reused_remote_pr_also_requires_reviewed_commits_pushed() {
     fixture.change("pulls", json!([pull]));
     let response = fixture.publish(&view);
     assert!(
-        response["error"].as_str().unwrap().contains("push"),
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("not at remote head"),
         "{response}"
     );
     assert_eq!(
@@ -495,7 +523,54 @@ fn reused_remote_pr_also_requires_reviewed_commits_pushed() {
 }
 
 #[test]
-fn newer_remote_source_head_is_fetched_without_checkout_or_ref_changes() {
+fn checkout_change_during_source_lookup_cannot_create_a_pr() {
+    let fixture = Fixture::new();
+    let view = fixture.details(&fixture.open());
+    fs::write(fixture.root().join("file"), "replacement checkout\n").unwrap();
+    git(
+        fixture.root(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "--quiet",
+            "-am",
+            "Replacement",
+        ],
+    );
+    let replacement = git(fixture.root(), &["rev-parse", "HEAD"]);
+    git(fixture.root(), &["reset", "--hard", &fixture.head]);
+    fixture.change("checkout_head", json!(replacement));
+    let response = fixture.publish(&view);
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("Git HEAD changed while preparing publication"),
+        "{response}"
+    );
+    assert_eq!(
+        response["workspace"]["pr"]["source"]["kind"],
+        "local_intent"
+    );
+    assert_eq!(response["workspace"]["generation"], view["generation"]);
+    assert!(response["workspace"]["attempt"].is_null());
+    assert!(
+        !fixture
+            .requests()
+            .iter()
+            .any(|request| request["method"] == "POST")
+    );
+    fixture.change("checkout_head", Value::Null);
+    git(fixture.root(), &["checkout", "--quiet", "feature"]);
+    let retry = fixture.publish(&response["workspace"]);
+    assert!(retry["error"].is_null(), "{retry}");
+}
+
+#[test]
+fn newer_remote_source_head_is_fetched_and_blocks_publication_without_checkout() {
     let fixture = Fixture::new();
     let view = fixture.details(&fixture.open());
     let clone = tempdir().unwrap();
@@ -522,21 +597,49 @@ fn newer_remote_source_head_is_fetched_without_checkout_or_ref_changes() {
     git(
         fixture.root(),
         &[
+            "remote",
+            "set-url",
+            "origin",
+            clone.path().to_str().unwrap(),
+        ],
+    );
+    git(
+        fixture.root(),
+        &[
             "config",
             &format!("url.{}.insteadOf", clone.path().display()),
             "https://github.com/fork/repo",
         ],
     );
-    let refs = git(fixture.root(), &["show-ref"]);
+    let branches = git(fixture.root(), &["show-ref", "--heads"]);
     let response = fixture.publish(&view);
-    assert!(response["error"].is_null(), "{response}");
-    assert_eq!(git(fixture.root(), &["show-ref"]), refs);
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("not at remote head"),
+        "{response}"
+    );
+    assert_eq!(git(fixture.root(), &["show-ref", "--heads"]), branches);
+    assert_eq!(
+        git(
+            fixture.root(),
+            &["rev-parse", "refs/remotes/origin/feature"]
+        ),
+        remote_head
+    );
     assert_eq!(git(fixture.root(), &["rev-parse", "HEAD"]), fixture.head);
     assert_eq!(
         fs::read_to_string(fixture.root().join("file")).unwrap(),
         "base\ncommitted\n"
     );
     assert_eq!(response["workspace"]["comparison"], view["comparison"]);
+    assert!(
+        !fixture
+            .requests()
+            .iter()
+            .any(|request| request["method"] == "POST")
+    );
 }
 
 #[test]

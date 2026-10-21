@@ -54,7 +54,7 @@ write('routes.json', { entry = { route = 'batch', batch = initial.id, fresh_revi
 command(''); wait(function() return kind() == 'home' end, 'initial home missing')
 local home_buffer = api.nvim_get_current_buf()
 local function reset()
-  for _, name in ipairs({ 'delay_code', 'delay_actions', 'delay_context', 'delay_log' }) do vim.fn.delete(fixture .. '/' .. name) end
+  for _, name in ipairs({ 'delay_code', 'delay_historical_code', 'delay_actions', 'delay_context', 'delay_log' }) do vim.fn.delete(fixture .. '/' .. name) end
   local value = vim.deepcopy(initial)
   value.generation = state().generation
   write('state.json', value)
@@ -70,7 +70,9 @@ end
 local function focus_code()
   for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
     local meta = vim.b[api.nvim_win_get_buf(win)].buf_review
-    if meta and meta.kind == 'diff' and meta.side == 'head' then api.nvim_set_current_win(win); return win end
+    if meta and meta.kind == 'diff' and (meta.comment_role == 'comment' or not meta.comment_role and meta.side == 'head') then
+      api.nvim_set_current_win(win); return win
+    end
   end
   error('Missing head pane')
 end
@@ -133,10 +135,10 @@ api.nvim_win_close(retained_window, true)
 
 -- A newer PR-wide selection wins over an older delayed code/comment response.
 reset(); open('a')
-vim.fn.writefile({ '0.25' }, fixture .. '/delay_code')
-local before_code = #requests('code')
+vim.fn.writefile({ '0.25' }, fixture .. '/delay_historical_code')
+local before_comments = #requests('historical_code')
 command('next todo')
-wait(function() return #requests('code') == before_code + 1 end, 'delayed comment read missing')
+wait(function() return #requests('historical_code') == before_comments + 1 end, 'delayed comment read missing')
 api.nvim_set_current_buf(home_buffer)
 row('Feedback wide'); require('buf_review').enter()
 assert(kind() == 'thread' and vim.b.buf_review.object == 'wide', 'new PR-wide choice missing')
@@ -146,16 +148,16 @@ for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
   local meta = vim.b[api.nvim_win_get_buf(win)].buf_review
   if meta and meta.kind == 'diff' then assert(meta.path == 'src/a.rs', 'stale callback changed code after PR-wide choice') end
 end
-vim.fn.delete(fixture .. '/delay_code')
+vim.fn.delete(fixture .. '/delay_historical_code')
 command('next todo')
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'e' end, 'new selected comment and navigation order diverged')
 
 -- Returning home cancels delayed code and comment installation too.
 reset(); open('a')
-vim.fn.writefile({ '0.25' }, fixture .. '/delay_code')
-before_code = #requests('code')
+vim.fn.writefile({ '0.25' }, fixture .. '/delay_historical_code')
+before_comments = #requests('historical_code')
 command('next todo')
-wait(function() return #requests('code') == before_code + 1 end, 'home-race delayed read missing')
+wait(function() return #requests('historical_code') == before_comments + 1 end, 'home-race delayed read missing')
 command(''); wait(function() return kind() == 'home' end, 'newer home choice missing')
 ReviewTest.wait(400)
 assert(kind() == 'home' and #api.nvim_tabpage_list_wins(0) == 1, 'old callback reopened code after home')
@@ -164,6 +166,7 @@ assert(kind() == 'home' and #api.nvim_tabpage_list_wins(0) == 1, 'old callback r
 reset(); open('a')
 vim.fn.writefile({ '0.12' }, fixture .. '/delay_actions')
 vim.fn.writefile({ '0.35' }, fixture .. '/delay_code')
+local before_code
 before_actions, before_code = #requests('actions'), #requests('code')
 input('s')
 wait(function() return #requests('actions') == before_actions + 1 end, 'delayed comment mark missing')
@@ -178,16 +181,19 @@ assert(not visible_thread(), 'new file retained old discussion after delayed com
 -- Explicit comment navigation also settles pending file progress.
 reset(); open('a'); focus_code()
 vim.fn.writefile({ '0.12' }, fixture .. '/delay_actions')
-vim.fn.writefile({ '0.35' }, fixture .. '/delay_code')
+vim.fn.writefile({ '0.35' }, fixture .. '/delay_historical_code')
 before_actions, before_code = #requests('actions'), #requests('code')
+before_comments = #requests('historical_code')
 input('s')
 wait(function() return #requests('actions') == before_actions + 1 end, 'delayed file mark missing')
 focus_thread('a')
 command('next todo')
-wait(function() return #requests('code') == before_code + 1 end, 'new comment intent missing')
+wait(function() return #requests('historical_code') == before_comments + 1 end, 'new comment intent missing')
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'c' end, 'pending file mark overrode newer comment choice')
 ReviewTest.wait(200)
-assert(state().files[1].viewed and vim.deep_equal(code_since(before_code), { 'src/c.rs' }), 'file staging issued competing navigation')
+assert(state().files[1].viewed and #requests('code') == before_code
+  and #requests('historical_code') == before_comments + 1
+  and requests('historical_code')[before_comments + 1].comment == 'c', 'file staging issued competing navigation')
 
 -- PR-wide and log discussions are independent of the selected code file.
 reset(); open('a')

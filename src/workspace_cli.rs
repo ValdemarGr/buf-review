@@ -235,8 +235,15 @@ pub fn run(directory: &Path, request: Value) -> Result<Value> {
     let bound: Bound = serde_json::from_value(request.clone())?;
     if op == "actions" {
         let actions: Vec<Action> = serde_json::from_value(request["actions"].clone())?;
-        let result =
-            store.mutate_workspace_actions(&bound.workspace, generation(&bound)?, actions)?;
+        if actions
+            .iter()
+            .any(|action| matches!(action, Action::CompareLatest))
+        {
+            return Err(io::Error::other("comparison follows Git HEAD; reopen diff").into());
+        }
+        let generation = generation(&bound)?;
+        store.prepare_worktree(&bound.workspace)?;
+        let result = store.mutate_workspace_actions(&bound.workspace, generation, actions)?;
         let current = store.view_workspace(&result.workspace)?;
         let mut response = json!({
             "comment": if result.applied > 0 { current.saved_comment.clone() } else { None },
@@ -249,9 +256,13 @@ pub fn run(directory: &Path, request: Value) -> Result<Value> {
         }
         return Ok(response);
     }
-    let workspace = store
-        .workspace(&bound.workspace)?
-        .ok_or_else(|| io::Error::other("workspace does not exist"))?;
+    let workspace = if matches!(op.as_str(), "get" | "code" | "historical_code" | "publish") {
+        store.prepare_worktree(&bound.workspace)?
+    } else {
+        store
+            .workspace(&bound.workspace)?
+            .ok_or_else(|| io::Error::other("workspace does not exist"))?
+    };
     match op.as_str() {
         "get" => Ok(json!({"workspace":store.view_workspace(&workspace)?})),
         "fetch_objects" => crate::context::prepare(&mut store, &project, &workspace),
@@ -259,11 +270,15 @@ pub fn run(directory: &Path, request: Value) -> Result<Value> {
             let path = request["path"]
                 .as_str()
                 .ok_or_else(|| io::Error::other("code requires a file path"))?;
-            Ok(json!({"code":crate::context::code(&project, &workspace, path)?}))
+            Ok(
+                json!({"workspace":store.view_workspace(&workspace)?,"code":crate::context::code(&project, &workspace, path)?}),
+            )
         }
         "historical_code" => {
             let id: CommentId = serde_json::from_value(request["comment"].clone())?;
-            crate::context::historical_code(&store, &project, &workspace, &id)
+            let mut response = crate::context::historical_code(&store, &project, &workspace, &id)?;
+            response["workspace"] = serde_json::to_value(store.view_workspace(&workspace)?)?;
+            Ok(response)
         }
         "context" => {
             let id: CommentId = serde_json::from_value(request["comment"].clone())?;
@@ -289,22 +304,12 @@ pub fn run(directory: &Path, request: Value) -> Result<Value> {
             generation(&bound)?;
             let prepared: PreparedRefresh =
                 serde_json::from_value(request["prepared_refresh"].clone())?;
-            apply_refresh(
-                &mut store,
-                &bound.workspace,
-                &prepared,
-                request["compare_latest"].as_bool().unwrap_or(false),
-            )
+            apply_refresh(&mut store, &bound.workspace, &prepared)
         }
-        "refresh" | "compare_latest" => {
+        "refresh" => {
             generation(&bound)?;
             let prepared = fetch_refresh(&mut store, &workspace);
-            apply_refresh(
-                &mut store,
-                &bound.workspace,
-                &prepared,
-                op == "compare_latest",
-            )
+            apply_refresh(&mut store, &bound.workspace, &prepared)
         }
         "submit" => Err(io::Error::other(
             "only publish may write to the provider; stage publish_review first",
@@ -335,6 +340,7 @@ fn review_for_pr(
     {
         return Ok((cached.review.id, false));
     }
+    crate::diff::fetch_all(store.project_root())?;
     let fetched = github::fetch(&Url::parse(url)?)?;
     let id = store.cache_import_review(
         &fetched.reviewer,
@@ -449,6 +455,7 @@ fn fetch_refresh(store: &mut Store, before: &Workspace) -> PreparedRefresh {
         if before.attempt.is_some() {
             return Ok(None);
         }
+        crate::diff::fetch_all(store.project_root())?;
         let object = store.pull_request(&before.review.read.pull_request.id)?;
         let fetched = if let Some(object) = object
             && matches!(object.source, PullRequestSource::LocalIntent { .. })
@@ -493,12 +500,7 @@ fn fetch_refresh(store: &mut Store, before: &Workspace) -> PreparedRefresh {
 }
 
 /// Commit fetched metadata in the same ordered local-writer boundary as other actions.
-fn apply_refresh(
-    store: &mut Store,
-    id: &str,
-    prepared: &PreparedRefresh,
-    compare_latest: bool,
-) -> Result<Value> {
+fn apply_refresh(store: &mut Store, id: &str, prepared: &PreparedRefresh) -> Result<Value> {
     let before = store
         .workspace_at_generation(id, prepared.generation)?
         .ok_or_else(|| io::Error::other("prepared refresh generation does not exist"))?;
@@ -506,14 +508,12 @@ fn apply_refresh(
         return Err(io::Error::other("prepared refresh belongs to another workspace").into());
     }
     // Metadata rebases onto current local intent, including writes from other editors.
-    // Only provider evidence, receipts and the explicit comparison pin can invalidate it.
+    // Only provider evidence and receipts can invalidate it.
     for _ in 0..4 {
         let latest = store
             .workspace(id)?
             .ok_or_else(|| io::Error::other("workspace does not exist"))?;
-        if !refresh_still_current(&before, &latest)
-            || compare_latest && latest.comparison != before.comparison
-        {
+        if !refresh_still_current(&before, &latest) {
             return refresh_deferred(store, id);
         }
         let result = (|| -> Result<Value> {
@@ -530,14 +530,15 @@ fn apply_refresh(
                     Ok(json!({"workspace":store.view_workspace(&workspace)?,"error":error}))
                 }
                 RefreshOutcome::Snapshot { review } => {
-                    let mut workspace = store.refresh_workspace(id, latest.generation, review)?;
-                    if compare_latest {
-                        workspace = store.mutate_workspace(
-                            id,
-                            workspace.generation,
-                            Action::CompareLatest,
-                        )?;
-                    }
+                    let workspace = store.refresh_workspace(id, latest.generation, review)?;
+                    crate::context::prepare(
+                        store,
+                        &store.project_root().to_path_buf(),
+                        &workspace,
+                    )?;
+                    let workspace = store
+                        .workspace(id)?
+                        .ok_or_else(|| io::Error::other("workspace does not exist"))?;
                     Ok(json!({"workspace":store.view_workspace(&workspace)?}))
                 }
             }

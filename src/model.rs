@@ -316,6 +316,8 @@ pub enum Event {
     SetFileViewed {
         path: String,
         viewed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
     },
     SetReviewConclusion {
         conclusion: ReviewConclusion,

@@ -94,7 +94,8 @@ end
 local function code(side)
   for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
     local meta = vim.b[api.nvim_win_get_buf(win)].buf_review
-    if meta and meta.kind == 'diff' and meta.side == (side or 'head') then api.nvim_set_current_win(win); return end
+    if meta and meta.kind == 'diff' and (meta.comment_role == 'comment' and not side
+      or not meta.comment_role and meta.side == (side or 'head')) then api.nvim_set_current_win(win); return end
   end
   error('Missing code pane')
 end

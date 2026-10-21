@@ -37,7 +37,7 @@ local function row(needle)
 end
 local current = { base = string.rep('a', 40), head = string.rep('b', 40) }
 local old = { base = 'old-base', head = 'old-head' }
-local latest = string.rep('c', 40)
+local latest = current.head
 local followup = { base = old.head, head = latest }
 local function comment(id, revision, side, path)
   return {
@@ -96,13 +96,13 @@ local function pair(path, revision, historical, reconstructed, source_path, head
   for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
     local buf = api.nvim_win_get_buf(win)
     local meta = vim.b[buf].buf_review
-    if meta and meta.kind == 'diff' then
+    if meta and meta.kind == 'diff' and meta.comment_role ~= 'original_base' then
       assert(meta.path == path and vim.deep_equal(meta.revision, revision), 'wrong diff pair: ' .. vim.inspect(meta))
       assert(meta.source_path == (meta.side == 'base' and (source_path or path) or path), 'wrong physical source path')
       assert((meta.historical == true) == historical, 'historical metadata missing or leaked to current code')
       assert(vim.wo[win].diff, 'reference side lost native diff mode')
       if historical then
-        local label = meta.side == 'base' and 'Historical' or 'PR head'
+        local label = meta.side == 'base' and 'Comment' or 'HEAD'
         assert(vim.wo[win].winbar:find(label, 1, true), 'reference side is not visibly labeled ' .. label)
         assert(vim.wo[win].winbar:find(revision[meta.side], 1, true), 'reference side revision is not visible')
         assert(vim.wo[win].winbar:find(meta.side == 'base' and (source_path or path) or path, 1, true), 'reference source path is not visible')
@@ -142,7 +142,7 @@ local function ranges(side, expected)
 end
 open('recorded')
 local sides = pair('src/file.rs', followup, true)
-assert(text(sides.base.buffer):find('historical head', 1, true) and text(sides.head.buffer):find('latest PR head', 1, true), 'follow-up buffers do not compare referenced source with latest PR head')
+assert(text(sides.base.buffer):find('historical head', 1, true) and text(sides.head.buffer):find('changed', 1, true), 'follow-up buffers do not compare referenced source with latest PR head')
 assert(api.nvim_win_get_cursor(sides.base.window)[1] == 2, 'recorded historical range did not position diff cursor')
 ranges('base', { 2, 3 })
 open('reply'); pair('src/file.rs', followup, true); ranges('base', { 2, 3 })
@@ -152,7 +152,7 @@ wait(function() return #records('action_results.jsonl') > before end, 'historica
 assert(requests('actions')[before + 1].actions[1].comment == 'reply', 'historical reply lost individual mark identity')
 
 -- Historical references permit replies, but cannot create a root against the current pin.
-api.nvim_set_current_win(pair('src/file.rs', followup, true).head.window)
+api.nvim_set_current_win(pair('src/file.rs', followup, true).base.window)
 local previous_notices = #notices
 input('a')
 assert(kind() == 'diff' and #notices > previous_notices, 'historical code opened current-pin comment composer')
@@ -172,16 +172,16 @@ input(']f')
 wait(function() return kind() == 'diff' and not vim.b.buf_review.historical end, 'file navigation did not restore pinned code')
 assert(#requests('actions') == before, 'historical code incorrectly marked current file viewed')
 pair('src/next.rs', current, false)
-open('current'); pair('src/file.rs', current, false); ranges('head', { 2, 3 })
+open('current'); ranges('base', { 2, 3 })
 open('recorded-base'); sides = pair('src/file.rs', { base = old.base, head = latest }, true); ranges('base', { 2, 3 })
 assert(text(sides.base.buffer):find('historical base', 1, true), 'deleted-line comment showed historical Head instead of recorded Base')
 open('renamed'); pair('src/file.rs', followup, true, false, 'src/old.rs'); ranges('base', { 2, 3 })
 open('removed'); pair('removed.rs', followup, true, false, nil, true); ranges('base', { 2, 3 })
 local current_reads = #requests('code')
-command('compare latest')
-wait(function() return kind() == 'home' end, 'compare latest retained removed historical file')
-assert(#requests('code') == current_reads, 'compare latest requested removed path in current comparison')
-assert(vim.deep_equal(read('state.json').comparison, current), 'compare latest changed unchanged pin')
+command('')
+wait(function() return kind() == 'home' end, 'overview retained removed historical file')
+assert(#requests('code') == current_reads, 'overview requested removed path in current comparison')
+assert(vim.deep_equal(read('state.json').comparison, current), 'overview changed unchanged HEAD')
 open('removed'); pair('removed.rs', followup, true, false, nil, true)
 open('reconstructed-base'); sides = pair('src/file.rs', { base = 'reconstructed-base', head = latest }, true, true); ranges(nil, {})
 assert(api.nvim_win_get_cursor(sides.base.window)[1] == 1, 'reconstructed Base guessed deleted-line position')
@@ -215,7 +215,7 @@ row('Feedback current'); require('buf_review').enter()
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'current' end, 'newer current comment did not open')
 ReviewTest.wait(400)
 assert(kind() == 'thread' and vim.b.buf_review.object == 'current', 'stale historical callback replaced newer current comment')
-pair('src/file.rs', current, false)
+ranges('base', { 2, 3 })
 
 -- A refresh may discover a newer PR head without moving the session's comparison pin.
 command(''); wait(function() return kind() == 'home' end, 'home before head refresh missing')
@@ -223,13 +223,12 @@ historical_reads = #requests('historical_code')
 row('Feedback recorded'); require('buf_review').enter()
 wait(function() return #requests('historical_code') > historical_reads end, 'historical request before head refresh missing')
 local refreshed = read('state.json')
-latest, followup.head = string.rep('d', 40), string.rep('d', 40)
-refreshed.review.read.pull_request.revision.head = latest
+refreshed.review.read.pull_request.revision.head = string.rep('d', 40)
 write('state.json', refreshed)
 command('refresh')
 wait(function() return read('state.json').generation > refreshed.generation end, 'PR-head refresh missing')
-wait(function() return #requests('historical_code') >= historical_reads + 2 and kind() == 'thread' and vim.b.buf_review.object == 'recorded' end,
-  'historical response did not restart against newly fetched PR head')
+wait(function() return #requests('historical_code') == historical_reads + 1 and kind() == 'thread' and vim.b.buf_review.object == 'recorded' end,
+  'historical response changed selected comparison after PR-head refresh')
 pair('src/file.rs', followup, true); ranges('base', { 2, 3 })
 vim.fn.delete(fixture .. '/delay_historical_code')
 for _ = 1, 10 do open('recorded'); open('current') end
@@ -238,10 +237,13 @@ for _, buf in ipairs(api.nvim_list_bufs()) do
   local meta = vim.b[buf].buf_review
   if meta and meta.kind == 'diff' then
     owned = owned + 1
-    if #vim.fn.win_findbuf(buf) == 0 then hidden = hidden + 1 end
+    if #vim.fn.win_findbuf(buf) == 0 then
+      hidden = hidden + 1
+      assert(meta.comment_role == 'selected_head', 'hidden non-selected pane retained')
+    end
   end
 end
-assert(owned == 2 and hidden == 0, 'historical/current switching accumulated diff buffers')
+assert(owned == 3 and hidden == 1, 'historical/current switching accumulated diff buffers: ' .. owned .. '/' .. hidden)
 input('a')
 wait(function() return kind() == 'composer' end, 'reply composer missing')
 api.nvim_buf_set_lines(0, 0, -1, false, { 'Unsaved reply' })

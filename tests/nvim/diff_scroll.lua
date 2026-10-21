@@ -35,11 +35,27 @@ write('state.json', view)
 write('routes.json', { entry = { route = 'batch', batch = view.id, fresh_review = view.review.id } })
 write('code_contexts.json', { ['src/long.rs'] = { path = 'src/long.rs', revision = revision, base_content = base_text, head_content = head_text, binary = false } })
 local historical_revision = { base = old.head, head = revision.head }
-write('historical_contexts.json', { historical = {
+local historical_contexts = { historical = {
   anchor = view.comments[3].comment.comment.target.target, diff_hunk = '@@ -140 +140 @@\n-old\n+new',
   code = { path = 'src/long.rs', base_path = 'src/long.rs', revision = historical_revision, base_content = base_text, head_content = head_text, binary = false,
     historical = true, provenance = 'recorded', location = { path = 'src/long.rs', revision = historical_revision, range = { start = { side = 'base', line = 140 }, ['end'] = { side = 'base', line = 140 } } } },
-} })
+} }
+for index = 1, 2 do
+  local row = view.comments[index].comment.comment
+  local anchor = row.target.target
+  local side = anchor.range.start.side
+  local source = { base = revision[side], head = revision.head }
+  local location = vim.deepcopy(anchor)
+  location.revision = source
+  location.range.start.side, location.range['end'].side = 'base', 'base'
+  historical_contexts[row.id] = { anchor = anchor, code = {
+    path = anchor.path, base_path = anchor.path, revision = source,
+    base_content = side == 'base' and base_text or head_text, head_content = head_text,
+    historical = true, provenance = 'recorded', binary = false, location = location,
+    original_base = { commit = revision.base, path = anchor.path, content = base_text, missing = false, provenance = 'recorded' },
+  } }
+end
+write('historical_contexts.json', historical_contexts)
 write('contexts.json', { historical = { available = true, anchor = view.comments[3].comment.comment.target.target,
   base_content = head_text, head_content = base_text } })
 local function kind() return vim.b.buf_review and vim.b.buf_review.kind end
@@ -63,6 +79,8 @@ local function pair(context)
     local marker = vim.b[api.nvim_win_get_buf(win)].buf_review
     if marker and marker.kind == (context and 'context' or 'diff') then
       local side = context and vim.wo[win].winbar:match('^Original (%a+) ') or marker.side
+      if not context and marker.comment_role == 'original_base' then side = 'base'
+      elseif not context and marker.comment_role == 'comment' and marker.revision.base == revision.head then side = 'head' end
       if side then result[side] = win end
     end
   end

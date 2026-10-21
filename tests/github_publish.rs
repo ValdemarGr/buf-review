@@ -215,7 +215,8 @@ case "$endpoint" in
     esac ;;
   *reactions?per_page=100) printf '[[{"id":40,"content":"+1","user":{"id":99,"login":"other"}},{"id":41,"content":"+1","user":{"id":7,"login":"reviewer"}}]]' ;;
   repos/owner/repo/pulls/1)
-    printf '{"node_id":"PR_node"}' ;;
+    sha=$(git rev-parse --verify HEAD 2>/dev/null) || sha=head
+    printf '{"node_id":"PR_node","head":{"sha":"%s"}}' "$sha" ;;
   *)
     if [ "$method" = DELETE ]; then exit 0; fi
     if [ "$method" = GET ]; then
@@ -423,6 +424,7 @@ fn legacy_adapters_publish_native_endpoints_exact_anchors_and_persisted_mappings
             Event::SetFileViewed {
                 path: "src/lib.rs".into(),
                 viewed: true,
+                commit: None,
             },
             Event::DismissReview {
                 review: ReviewResourceId("old-review".into()),
@@ -654,6 +656,7 @@ fn different_authenticated_user_blocks_each_write_kind_without_receipts() {
         Event::SetFileViewed {
             path: "src/lib.rs".into(),
             viewed: true,
+            commit: None,
         },
         Event::SetReviewConclusion {
             conclusion: ReviewConclusion {
@@ -819,6 +822,7 @@ fn graphql_errors_or_null_payload_never_record_success() {
                 Event::SetFileViewed {
                     path: "src/lib.rs".into(),
                     viewed: true,
+                    commit: None,
                 },
             ],
         );
@@ -836,6 +840,7 @@ fn graphql_errors_or_null_payload_never_record_success() {
             &[Event::SetFileViewed {
                 path: "src/lib.rs".into(),
                 viewed: true,
+                commit: None,
             }],
         );
         let retry = publish(project.path(), None);
@@ -845,6 +850,7 @@ fn graphql_errors_or_null_payload_never_record_success() {
             &[Event::SetFileViewed {
                 path: "src/lib.rs".into(),
                 viewed: false,
+                commit: None,
             }],
         );
         let unviewed = publish(project.path(), None);
@@ -944,6 +950,30 @@ fn concurrent_publication_rejects_second_writer_and_retry_uses_saved_receipt() {
     };
 
     let project = fixture();
+    for arguments in [
+        vec![
+            "-c",
+            "user.name=Reviewer",
+            "-c",
+            "user.email=reviewer@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Head",
+        ],
+        vec!["tag", "base"],
+        vec!["tag", "head"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(project.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
     seed_events(
         project.path(),
         &[create("once", CommentTarget::PullRequest)],
@@ -1019,7 +1049,12 @@ fn concurrent_publication_rejects_second_writer_and_retry_uses_saved_receipt() {
     );
     let retry = publish_workspace(project.path(), None);
     assert!(succeeded(&retry), "{}", publication_error(&retry));
-    assert_eq!(requests(project.path()), calls);
+    let retried = requests(project.path());
+    assert_eq!(&retried[..calls.len()], calls.as_slice());
+    assert_eq!(
+        &retried[calls.len()..],
+        &[serde_json::json!({"endpoint":"repos/owner/repo/pulls/1","method":"GET","body":null})]
+    );
     assert_eq!(
         Store::open(project.path())
             .unwrap()

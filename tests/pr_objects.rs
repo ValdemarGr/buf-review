@@ -529,7 +529,10 @@ fn failed_import_rolls_back_canonical_metadata_and_binding() {
     );
     assert_eq!(store.pull_request(&object.id).unwrap(), Some(object));
     assert!(store.review_backend(&local.review.id).unwrap().is_none());
-    assert_eq!(store.workspace(&local.id).unwrap().unwrap(), local);
+    assert_eq!(
+        serde_json::to_value(store.workspace(&local.id).unwrap().unwrap()).unwrap(),
+        serde_json::to_value(local).unwrap()
+    );
 }
 
 #[test]

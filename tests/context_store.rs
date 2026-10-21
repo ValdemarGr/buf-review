@@ -124,8 +124,13 @@ fn local_intent_prepares_and_reads_pinned_code_without_provider_metadata() {
         "unstaged\n"
     );
 
+    let mut obsolete = workspace.clone();
+    obsolete.comparison.head = "0".repeat(40);
+    let prepared = buf_review::context::prepare(&mut store, project.path(), &obsolete).unwrap();
+    assert_eq!(prepared["revision"], serde_json::json!(revision));
+
     let mut missing = workspace;
-    missing.comparison.head = "0".repeat(40);
+    missing.review.read.pull_request.revision.base = "0".repeat(40);
     let error = buf_review::context::prepare(&mut store, project.path(), &missing).unwrap_err();
     assert!(
         error

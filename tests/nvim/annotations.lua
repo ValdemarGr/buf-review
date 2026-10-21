@@ -70,10 +70,19 @@ local view = {
 write(view)
 vim.fn.writefile({ vim.json.encode({ entry = { route = 'batch', batch = view.id, fresh_review = view.review.id } }) }, fixture .. '/routes.json')
 local function diff(side)
+  local current_source = false
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    local meta = vim.b[api.nvim_win_get_buf(win)].buf_review
+    if meta and meta.comment_role == 'comment' and meta.revision.base == revision.head then current_source = true end
+  end
   for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
     local buf = api.nvim_win_get_buf(win)
     local meta = vim.b[buf].buf_review
-    if meta and meta.kind == 'diff' and meta.side == side then return buf, win end
+    if meta and meta.kind == 'diff' then
+      local matches = current_source and (side == 'head' and meta.comment_role == 'comment' or side == 'base' and meta.comment_role == 'original_base')
+        or not current_source and meta.side == side
+      if matches then return buf, win end
+    end
   end
   error('Missing diff side ' .. side)
 end
@@ -129,6 +138,8 @@ local function ranges(head, base)
     for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
       local buf = api.nvim_win_get_buf(win)
       local expected = buf == head_buf and head or (buf == base_buf and (base or {}) or {})
+      local meta = vim.b[buf].buf_review
+      if meta and meta.comment_role == 'comment' then expected = {} end
       if not vim.deep_equal(match_rows(win), expected) then return false end
     end
     return true
@@ -239,7 +250,7 @@ moved.range.start.line, moved.range['end'].line = 2, 3
 changed.comments[1].comment.comment.target.target.current = moved
 write(changed); command('refresh')
 wait(function() return state().generation > changed.generation end, 'current anchor did not refresh')
-ranges({ 2, 3 })
+ranges({ 1, 2 })
 changed = state()
 changed.comments[1].comment.comment.target.target.current = nil
 write(changed); command('refresh')
@@ -338,7 +349,7 @@ input(':q!<CR>'); ranges({})
 open('historical'); ranges({}, { 1, 2 })
 head, base = diff('head'), diff('base')
 assert(marker(base, 1):find('1 comment [ ]', 1, true), 'historical reference lost its marker')
-assert(marker(head, 1) == '', 'historical line numbers leaked into newer PR-head markers')
+assert(marker(head, 1):find('2 comments', 1, true), 'selected-head markers lost current anchors: ' .. marker(head, 1))
 changed = state()
 changed.comments[9].comment.comment.target.target.range.start.line = 2
 changed.comments[9].comment.comment.target.target.range['end'].line = 7
@@ -381,6 +392,54 @@ root_window = api.nvim_get_current_win()
 api.nvim_set_current_win(code_window)
 ranges({})
 api.nvim_win_close(root_window, true)
+
+-- Exact-current comment source panes retain local file progress indicators.
+open('root')
+local current_buffer, current_window = diff('head')
+api.nvim_set_current_win(current_window)
+local initial_viewed = state().files[1].viewed
+require('buf_review').progress(not initial_viewed, false, 'file')
+wait(function()
+  return state().files[1].viewed ~= initial_viewed
+    and vim.wo[current_window].winbar:find(initial_viewed and '[unviewed]' or '[viewed]', 1, true)
+end, 'current comment source winbar did not update viewed status')
+assert(api.nvim_win_get_buf(current_window) == current_buffer, 'viewed toggle replaced comment source')
+require('buf_review').progress(initial_viewed, false, 'file')
+wait(function()
+  return state().files[1].viewed == initial_viewed
+    and vim.wo[current_window].winbar:find(initial_viewed and '[viewed]' or '[unviewed]', 1, true)
+end, 'current comment source winbar did not restore viewed status')
+
+-- Base-side draft paths use the current logical name after a rename, while
+-- immutable source bytes still belong to the old physical path.
+local base_anchor
+for _, value in ipairs(state().comments) do
+  if value.comment.comment.id == 'base' then base_anchor = vim.deepcopy(value.comment.comment.target.target) end
+end
+vim.fn.writefile({ vim.json.encode({ base = { anchor = base_anchor, code = {
+  path = 'src/file.rs', base_path = 'src/old.rs', revision = revision,
+  base_content = 'one\ntwo\nthree\n', head_content = 'one\nchanged\nthree\n',
+  historical = true, provenance = 'recorded', binary = false, location = base_anchor,
+} } }) }, fixture .. '/historical_contexts.json')
+open('base')
+local _, renamed_window = diff('base')
+api.nvim_set_current_win(renamed_window)
+assert(vim.b.buf_review.source_path == 'src/old.rs', 'rename fixture lost physical base path')
+api.nvim_win_set_cursor(0, { 2, 0 })
+input('<CR>')
+assert(kind() == 'threads', 'renamed base source lost existing root')
+input('aRenamed file draft<Esc>')
+assert(kind() == 'composer', 'renamed base source could not append')
+input(':wq<CR>')
+wait(function()
+  return kind() == 'threads' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Renamed file draft', 1, true)
+end, 'renamed base draft disappeared from retained source list')
+local renamed_draft
+for _, value in ipairs(state().comments) do
+  if value.comment.comment.body == 'Renamed file draft' then renamed_draft = value.comment.comment.target.target end
+end
+assert(renamed_draft.path == 'src/file.rs' and renamed_draft.range.start.side == 'base'
+  and vim.deep_equal(renamed_draft.revision, revision), 'renamed base draft changed logical anchor')
 
 print('Neovim comment annotation workflows passed')
 vim.fn.delete(fixture, 'rf')

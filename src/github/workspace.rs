@@ -1011,10 +1011,53 @@ fn publish_workspace_inner(
         .into());
     }
     let project = store.project_root().to_path_buf();
+    let validated_head = workspace.comparison.head.clone();
+    crate::diff::fetch_all(&project).map_err(|error| FetchError::Response(error.to_string()))?;
+    let local_intent = store
+        .pull_request(&workspace.review.read.pull_request.id)?
+        .is_some_and(|object| matches!(object.source, PullRequestSource::LocalIntent { .. }));
+    let mut pull_request_mapping = if local_intent {
+        // Local intents validate the remote source head before creating a PR.
+        None
+    } else {
+        let backend = store
+            .review_backend(&workspace.review.id)?
+            .ok_or_else(|| unsupported("workspace lacks provider metadata"))?;
+        let remote: Value = api(&endpoint(&backend)?, &["--method", "GET"])?;
+        let head = remote
+            .pointer("/head/sha")
+            .and_then(Value::as_str)
+            .ok_or_else(|| FetchError::Response("remote PR lacks its source commit".into()))?;
+        if head != workspace.comparison.head {
+            return Err(unsupported("not at remote head").into());
+        }
+        let core_id = &workspace.review.read.pull_request.id.0;
+        remote
+            .get("node_id")
+            .and_then(Value::as_str)
+            .filter(|node| !node.is_empty())
+            .filter(|node| {
+                !backend.mappings.iter().any(|mapping| {
+                    mapping.resource == "pull_request_node"
+                        && mapping.core_id == *core_id
+                        && mapping.remote_id == *node
+                })
+            })
+            .map(|node| IdMapping {
+                resource: "pull_request_node".into(),
+                core_id: core_id.clone(),
+                remote_id: node.into(),
+            })
+    };
     super::intent::resolve_pull_request(store, &project, &workspace)?;
     workspace = store
         .workspace(id)?
         .ok_or_else(|| WorkspaceError::NotFound(id.into()))?;
+    if workspace.comparison.head != validated_head {
+        return Err(
+            unsupported("Git HEAD changed while preparing publication; reopen diff").into(),
+        );
+    }
     if workspace.generation != generation {
         return Err(WorkspaceError::StaleGeneration {
             expected: generation,
@@ -1081,6 +1124,123 @@ fn publish_workspace_inner(
             apply_publication(store, &mut workspace, Action::RecordResult { result })?;
         }
     }
+    if let Some(inflight) = preparation.inflight.clone() {
+        if inflight == "review batch" && preparation.pending.is_some() {
+            record_created_review(store, &mut workspace, &mut preparation, &backend)?;
+        } else if inflight == "submit" {
+            let pending = preparation.pending.as_ref().ok_or_else(|| {
+                unsupported("uncertain submission lacks prepared review identity")
+            })?;
+            let response: Value = api(
+                &format!("{}/reviews/{}", endpoint(&backend)?, pending.id),
+                &["--method", "GET"],
+            )?;
+            let state = response
+                .get("state")
+                .and_then(Value::as_str)
+                .ok_or_else(|| unsupported("review state unavailable during reconciliation"))?;
+            if state != "PENDING" {
+                let conclusion = operations
+                    .iter()
+                    .find_map(|op| match &op.change {
+                        Change::SetReviewConclusion { conclusion } => Some(conclusion),
+                        _ => None,
+                    })
+                    .ok_or_else(|| unsupported("prepared review lacks conclusion"))?;
+                if state != conclusion_state(conclusion)
+                    || response
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        != conclusion.body.as_deref().unwrap_or_default()
+                {
+                    return Err(unsupported("uncertain review differs from prepared conclusion; inspect provider review before retry").into());
+                }
+                preparation.submitted = true;
+                preparation.submission_response = response.clone();
+                record_grouped(store, &mut workspace, &preparation, &response)?;
+            }
+            preparation.inflight = None;
+            save_preparation(store, &mut workspace, &preparation)?;
+        } else if let Some(operation_id) = inflight.strip_prefix("operation ") {
+            let operation = operations
+                .iter()
+                .find(|op| op.id == operation_id)
+                .ok_or_else(|| unsupported("uncertain operation missing from frozen plan"))?;
+            if !workspace.has_result(operation_id) {
+                if !matches!(
+                    operation.change,
+                    Change::SetFileViewed { .. } | Change::SetCommentReaction { .. }
+                ) {
+                    return Err(unsupported(format!("publication result uncertain ({inflight}); inspect provider state before retry; no duplicate write sent")).into());
+                }
+                let mut fresh = fetch(
+                    &Url::parse(&backend.source.locator).map_err(|_| FetchError::InvalidUrl)?,
+                )?;
+                canonicalize_fetched(&mut fresh, &backend);
+                if fresh.reviewer.id != workspace.review.reviewer.id {
+                    return Err(unsupported(
+                        "authenticated reviewer changed during reconciliation",
+                    )
+                    .into());
+                }
+                let applied = match &operation.change {
+                    Change::SetFileViewed { path, viewed, .. } => fresh
+                        .read
+                        .files
+                        .iter()
+                        .any(|file| file.path == *path && file.viewed == *viewed),
+                    Change::SetCommentReaction {
+                        comment,
+                        reaction,
+                        present,
+                    } => {
+                        fresh.read.reactions.iter().any(|item| {
+                            item.comment == *comment
+                                && item.author.as_ref() == Some(&workspace.review.reviewer.id)
+                                && item.reaction == *reaction
+                        }) == *present
+                    }
+                    _ => false,
+                };
+                if applied {
+                    apply_publication(
+                        store,
+                        &mut workspace,
+                        Action::RecordResult {
+                            result: OperationResult {
+                                operation: operation.clone(),
+                                mappings: vec![],
+                                response: json!({"reconciled":true}),
+                            },
+                        },
+                    )?;
+                }
+            }
+            preparation.inflight = None;
+            save_preparation(store, &mut workspace, &preparation)?;
+        } else {
+            return Err(unsupported(format!("publication result uncertain ({inflight}); inspect provider state before retry; no duplicate write sent")).into());
+        }
+    }
+    backend = backend_for(store, &workspace, &preparation)?;
+    backend.mappings.extend(pull_request_mapping.clone());
+    // Reconcile uncertain writes before deriving the remaining execution view.
+    // Keep the frozen plan and raw local history intact; stale viewed changes
+    // disappear through the same projection used by the CLI.
+    let (_, pending) = workspace.get_unpublished()?;
+    let operations = operations
+        .iter()
+        .filter(|operation| {
+            workspace.has_result(&operation.id)
+                || !matches!(operation.change, Change::SetFileViewed { .. })
+                || pending
+                    .operations
+                    .iter()
+                    .any(|candidate| candidate.change == operation.change)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let outstanding = CommitState {
         operations: operations
             .iter()
@@ -1143,106 +1303,6 @@ fn publish_workspace_inner(
     {
         return Err(unsupported("review drafts span different head commits; explicitly relocate unsent roots before publication").into());
     }
-    if let Some(inflight) = preparation.inflight.clone() {
-        if inflight == "review batch" && preparation.pending.is_some() {
-            record_created_review(store, &mut workspace, &mut preparation, &backend)?;
-        } else if inflight == "submit" {
-            let pending = preparation.pending.as_ref().ok_or_else(|| {
-                unsupported("uncertain submission lacks prepared review identity")
-            })?;
-            let response: Value = api(
-                &format!("{}/reviews/{}", endpoint(&backend)?, pending.id),
-                &["--method", "GET"],
-            )?;
-            let state = response
-                .get("state")
-                .and_then(Value::as_str)
-                .ok_or_else(|| unsupported("review state unavailable during reconciliation"))?;
-            if state != "PENDING" {
-                let conclusion = operations
-                    .iter()
-                    .find_map(|op| match &op.change {
-                        Change::SetReviewConclusion { conclusion } => Some(conclusion),
-                        _ => None,
-                    })
-                    .ok_or_else(|| unsupported("prepared review lacks conclusion"))?;
-                if state != conclusion_state(conclusion)
-                    || response
-                        .get("body")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        != conclusion.body.as_deref().unwrap_or_default()
-                {
-                    return Err(unsupported("uncertain review differs from prepared conclusion; inspect provider review before retry").into());
-                }
-                preparation.submitted = true;
-                preparation.submission_response = response.clone();
-                record_grouped(store, &mut workspace, &preparation, &response)?;
-            }
-            preparation.inflight = None;
-            save_preparation(store, &mut workspace, &preparation)?;
-        } else if let Some(operation_id) = inflight.strip_prefix("operation ") {
-            let operation = operations
-                .iter()
-                .find(|op| op.id == operation_id)
-                .ok_or_else(|| unsupported("uncertain operation missing from frozen plan"))?;
-            if !workspace.has_result(operation_id) {
-                if !matches!(
-                    operation.change,
-                    Change::SetFileViewed { .. } | Change::SetCommentReaction { .. }
-                ) {
-                    return Err(unsupported(format!("publication result uncertain ({inflight}); inspect provider state before retry; no duplicate write sent")).into());
-                }
-                let mut fresh = fetch(
-                    &Url::parse(&backend.source.locator).map_err(|_| FetchError::InvalidUrl)?,
-                )?;
-                canonicalize_fetched(&mut fresh, &backend);
-                if fresh.reviewer.id != workspace.review.reviewer.id {
-                    return Err(unsupported(
-                        "authenticated reviewer changed during reconciliation",
-                    )
-                    .into());
-                }
-                let applied = match &operation.change {
-                    Change::SetFileViewed { path, viewed } => fresh
-                        .read
-                        .files
-                        .iter()
-                        .any(|file| file.path == *path && file.viewed == *viewed),
-                    Change::SetCommentReaction {
-                        comment,
-                        reaction,
-                        present,
-                    } => {
-                        fresh.read.reactions.iter().any(|item| {
-                            item.comment == *comment
-                                && item.author.as_ref() == Some(&workspace.review.reviewer.id)
-                                && item.reaction == *reaction
-                        }) == *present
-                    }
-                    _ => false,
-                };
-                if applied {
-                    apply_publication(
-                        store,
-                        &mut workspace,
-                        Action::RecordResult {
-                            result: OperationResult {
-                                operation: operation.clone(),
-                                mappings: vec![],
-                                response: json!({"reconciled":true}),
-                            },
-                        },
-                    )?;
-                }
-            }
-            preparation.inflight = None;
-            save_preparation(store, &mut workspace, &preparation)?;
-        } else {
-            return Err(unsupported(format!("publication result uncertain ({inflight}); inspect provider state before retry; no duplicate write sent")).into());
-        }
-    }
-    backend = backend_for(store, &workspace, &preparation)?;
     for (index, operation) in operations.iter().enumerate() {
         if workspace.has_result(&operation.id) {
             continue;
@@ -1277,7 +1337,13 @@ fn publish_workspace_inner(
             let head = heads
                 .first()
                 .map(|head| (*head).clone())
-                .unwrap_or_else(|| workspace.review.read.pull_request.revision.head.clone());
+                .unwrap_or_else(|| {
+                    if workspace.worktree_context {
+                        workspace.comparison.head.clone()
+                    } else {
+                        workspace.review.read.pull_request.revision.head.clone()
+                    }
+                });
             let mut body = json!({"commit_id":head});
             let roots = operations[index..].iter().take_while(|op| matches!(&op.change,
                 Change::CreateComment { comment: DraftComment { target: CommentTarget::Diff(location), .. } } if location.position.range.is_some() && location.revision.head == head
@@ -1334,6 +1400,7 @@ fn publish_workspace_inner(
                     save_preparation(store, &mut workspace, &preparation)?;
                     record_created_review(store, &mut workspace, &mut preparation, &backend)?;
                     backend = backend_for(store, &workspace, &preparation)?;
+                    backend.mappings.extend(pull_request_mapping.clone());
                 }
                 Err(error) => {
                     fail_attempt(store, &mut workspace, &mut preparation, &error)?;
@@ -1398,7 +1465,8 @@ fn publish_workspace_inner(
             _ => publish(&workspace.review, &backend, operation),
         };
         match result {
-            Ok(result) => {
+            Ok(mut result) => {
+                result.mappings.extend(pull_request_mapping.take());
                 if matches!(operation.change, Change::CreateComment { .. }) && uses_review {
                     preparation.prepared.push(OperationResult {
                         operation: operation.clone(),

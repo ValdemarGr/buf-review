@@ -312,6 +312,9 @@ fn require_pushed(
     remote_head: &str,
     branches: &BranchPair,
 ) -> Result<(), FetchError> {
+    if reviewed_head != remote_head {
+        return Err(FetchError::Response("not at remote head".into()));
+    }
     if !matches!(remote_head.len(), 40 | 64)
         || !remote_head.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -500,6 +503,16 @@ pub fn resolve_pull_request(
             )
         })?;
     require_pushed(project, &workspace.comparison.head, head, &branches)?;
+    if workspace.worktree_context
+        && crate::diff::resolve(project, "HEAD")
+            .map_err(|error| FetchError::Response(error.to_string()))?
+            != workspace.comparison.head
+    {
+        return Err(FetchError::Response(
+            "Git HEAD changed while preparing publication; reopen diff".into(),
+        )
+        .into());
+    }
     let resolution = PullRequestResolution {
         branches: branches.clone(),
         title: object.title.clone(),

@@ -178,7 +178,7 @@ impl Projection {
                     .reactions
                     .retain(|reaction| &reaction.comment != comment);
             }
-            Change::SetFileViewed { path, viewed } => {
+            Change::SetFileViewed { path, viewed, .. } => {
                 self.state
                     .files
                     .iter_mut()
@@ -413,6 +413,18 @@ pub fn prepare(
                 Change::SetFileViewed {
                     path: file.path.clone(),
                     viewed: file.viewed,
+                    commit: batch
+                        .write
+                        .events
+                        .iter()
+                        .rev()
+                        .find_map(|event| match event {
+                            Event::SetFileViewed { path, commit, .. } if path == &file.path => {
+                                Some(commit.clone())
+                            }
+                            _ => None,
+                        })
+                        .flatten(),
                 },
             )?);
         }
@@ -533,11 +545,17 @@ pub(crate) fn operation_source(batch: &Batch, change: &Change) -> Result<usize, 
                 comment == candidate
             }
             (
-                Change::SetFileViewed { path, .. },
-                Event::SetFileViewed {
-                    path: candidate, ..
+                Change::SetFileViewed {
+                    path,
+                    viewed,
+                    commit,
                 },
-            ) => path == candidate,
+                Event::SetFileViewed {
+                    path: candidate,
+                    viewed: candidate_viewed,
+                    commit: candidate_commit,
+                },
+            ) => path == candidate && viewed == candidate_viewed && commit == candidate_commit,
             (Change::SetReviewConclusion { .. }, Event::SetReviewConclusion { .. }) => true,
             (
                 Change::DismissReview { review, .. },
@@ -561,8 +579,15 @@ pub(crate) fn operation_source(batch: &Batch, change: &Change) -> Result<usize, 
         .ok_or_else(|| CoreError::Invalid("processed write has no source event".into()))
 }
 
-fn operation(batch: &Batch, change: Change) -> Result<Operation, CoreError> {
-    let source = operation_source(batch, &change)?;
+pub(crate) fn operation(batch: &Batch, change: Change) -> Result<Operation, CoreError> {
+    Ok(operation_at(
+        batch,
+        operation_source(batch, &change)?,
+        change,
+    ))
+}
+
+pub(crate) fn operation_at(batch: &Batch, source: usize, change: Change) -> Operation {
     let kind = match &change {
         Change::CreateComment { .. } => "create_comment",
         Change::EditComment { .. } => "edit_comment",
@@ -578,8 +603,8 @@ fn operation(batch: &Batch, change: Change) -> Result<Operation, CoreError> {
         kind,
     ))
     .expect("strings and event sequence serialize");
-    Ok(Operation {
+    Operation {
         id: Uuid::new_v5(&Uuid::NAMESPACE_URL, &name).to_string(),
         change,
-    })
+    }
 }

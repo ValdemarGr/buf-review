@@ -95,6 +95,10 @@ fn lost_progress_response_reconciles_before_concluding_review_once() {
     run("uncertain_progress");
 }
 #[test]
+fn uncertain_retry_filters_stale_viewed_changes_after_reconciling_the_write() {
+    run("uncertain_stale_viewed");
+}
+#[test]
 fn fetched_comment_delete_rejected_before_provider_writes() {
     run("alias_delete");
 }
@@ -186,9 +190,101 @@ fn reply_lookup_failure_is_retryable_without_an_uncertain_write() {
 fn legacy_standalone_inline_drafts_require_explicit_move_before_publication() {
     run("legacy_standalone");
 }
+#[test]
+fn changed_remote_head_blocks_publication_without_mutating_local_work() {
+    run("remote_head_changed");
+}
+#[test]
+fn failed_git_fetch_blocks_publication_before_provider_writes() {
+    run("fetch_failure");
+}
+#[test]
+fn changed_checkout_during_remote_head_check_blocks_publication_without_writes() {
+    run("checkout_head_changed");
+}
+#[test]
+fn conclusion_without_inline_roots_uses_validated_head_when_cached_pr_is_older() {
+    run("runtime_conclusion_head");
+}
 
 fn run(case: &str) {
     let directory = tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    if case == "fetch_failure" {
+        assert!(
+            Command::new("git")
+                .args(["remote", "add", "origin"])
+                .arg(directory.path().join("missing.git"))
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    if matches!(case, "checkout_head_changed" | "runtime_conclusion_head") {
+        for name in ["base", "validated", "replacement"] {
+            fs::write(directory.path().join("file.rs"), name).unwrap();
+            for arguments in [
+                vec!["add", "file.rs"],
+                vec![
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    name,
+                ],
+            ] {
+                assert!(
+                    Command::new("git")
+                        .args(arguments)
+                        .current_dir(directory.path())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            let head = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert!(head.status.success());
+            fs::write(directory.path().join(format!("{name}-head")), &head.stdout).unwrap();
+        }
+        assert!(
+            Command::new("git")
+                .args(["branch", "replacement"])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let validated =
+            fs::read_to_string(directory.path().join(if case == "checkout_head_changed" {
+                "validated-head"
+            } else {
+                "replacement-head"
+            }))
+            .unwrap();
+        assert!(
+            Command::new("git")
+                .args(["checkout", "--quiet", "--detach", validated.trim()])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
     fs::write(directory.path().join("review.py"), r#"import json, os, pathlib, sys
 root = pathlib.Path(os.environ["PROVIDER_ROOT"])
 case = os.environ["PROVIDER_CASE"]
@@ -303,6 +399,9 @@ case "$endpoint" in
    case "$body" in
     *BulkReviewCommentAnchors*) printf '%s' "$body" | python3 "$PROVIDER_ROOT/review.py" anchors ;;
     *ReviewSnapshot*)
+      viewed=VIEWED
+      snapshot_head=old-head
+      if [ "$PROVIDER_CASE" = uncertain_stale_viewed ]; then viewed=UNVIEWED; snapshot_head=$(cat "$PROVIDER_ROOT/remote-head"); fi
       if [ "$PROVIDER_CASE" = alias_edit ] && [ -f "$PROVIDER_ROOT/alias" ]; then text=Local; else text=Original; fi
       case "$PROVIDER_CASE" in alias_*) comments="{\"totalCount\":1,\"nodes\":[{\"id\":\"IC300\",\"fullDatabaseId\":\"300\",\"body\":\"$text\",\"createdAt\":\"2026-01-01T00:00:00Z\",\"author\":{\"databaseId\":7,\"login\":\"reviewer\"},\"reactions\":{\"totalCount\":0,\"nodes\":[],\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null}}}],\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null}}" ;;
         *) comments='{ "totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}' ;;
@@ -310,7 +409,7 @@ case "$endpoint" in
       if [ "$PROVIDER_CASE" = alias_reaction ] && [ -f "$PROVIDER_ROOT/alias" ]; then
         comments='{ "totalCount":1,"nodes":[{"id":"IC300","fullDatabaseId":"300","body":"Original","createdAt":"2026-01-01T00:00:00Z","author":{"databaseId":7,"login":"reviewer"},"reactions":{"totalCount":1,"nodes":[{"id":"R501","content":"THUMBS_UP","user":{"databaseId":7,"login":"reviewer"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}'
       fi
-      printf '{"data":{"viewer":{"databaseId":7,"login":"reviewer"},"repository":{"pullRequest":{"id":"PR1","fullDatabaseId":"1","title":"PR","body":"","author":null,"state":"OPEN","baseRefOid":"old-base","headRefOid":"new-head","headRefName":"feature","headRepository":{"url":"https://github.com/acme/repo"},"changedFiles":1,"files":{"totalCount":1,"nodes":[{"path":"file.rs","changeType":"MODIFIED","viewerViewedState":"VIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"comments":%s,"reviews":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"reviewThreads":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' "$comments" ;;
+      printf '{"data":{"viewer":{"databaseId":7,"login":"reviewer"},"repository":{"pullRequest":{"id":"PR1","fullDatabaseId":"1","title":"PR","body":"","author":null,"state":"OPEN","baseRefOid":"old-base","headRefOid":"%s","headRefName":"feature","headRepository":{"url":"https://github.com/acme/repo"},"changedFiles":1,"files":{"totalCount":1,"nodes":[{"path":"file.rs","changeType":"MODIFIED","viewerViewedState":"%s"}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"comments":%s,"reviews":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"reviewThreads":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' "$snapshot_head" "$viewed" "$comments" ;;
     *addPullRequestReviewThreadReply*) printf '{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"C202","databaseId":202}}}}' ;;
     *addPullRequestReviewThread*)
       if [ "$PROVIDER_CASE" = uncertain_review ]; then printf 'connection lost after preparing comment' >&2; exit 1; fi
@@ -331,10 +430,21 @@ case "$endpoint" in
     *reviewThreads*)
       if [ "$PROVIDER_CASE" = reply_lookup_fail ] && [ ! -f "$PROVIDER_ROOT/thread-lookup" ]; then touch "$PROVIDER_ROOT/thread-lookup"; printf 'HTTP 503 thread lookup unavailable' >&2; exit 1; fi
       printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"T400","comments":{"nodes":[{"databaseId":400}]}},{"id":"T201","comments":{"nodes":[{"databaseId":201}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' ;;
-    null) printf '[{"data":{"repository":{"pullRequest":{"baseRefOid":"old-base","headRefOid":"new-head","files":{"totalCount":1,"nodes":[{"path":"file.rs","viewerViewedState":"VIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}]' ;;
+    null) printf '[{"data":{"repository":{"pullRequest":{"baseRefOid":"old-base","headRefOid":"old-head","files":{"totalCount":1,"nodes":[{"path":"file.rs","viewerViewedState":"VIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}]' ;;
     *) printf 'unexpected GraphQL' >&2; exit 1 ;;
    esac ;;
- */pulls/1) printf '{"id":1,"node_id":"PR1","title":"PR","body":"","user":null,"state":"open","merged":false,"changed_files":1,"base":{"sha":"old-base"},"head":{"sha":"new-head"}}' ;;
+ */pulls/1)
+   head=old-head
+   case "$PROVIDER_CASE" in
+     remote_head_changed) head=new-head ;;
+     checkout_head_changed)
+       head=$(cat "$PROVIDER_ROOT/validated-head")
+       git -C "$PROVIDER_ROOT" checkout --quiet --detach replacement || exit 1 ;;
+     runtime_conclusion_head) head=$(cat "$PROVIDER_ROOT/replacement-head") ;;
+     mixed) head=other-head ;;
+     uncertain_stale_viewed) head=$(cat "$PROVIDER_ROOT/remote-head") ;;
+   esac
+   printf '{"id":1,"node_id":"PR1","title":"PR","body":"","user":null,"state":"open","merged":false,"changed_files":1,"base":{"sha":"old-base"},"head":{"sha":"%s"}}' "$head" ;;
  */pulls/1/files*) printf '[[{"filename":"file.rs","status":"modified","additions":12,"deletions":3}]]' ;;
  */pulls/1/comments?*) printf '[[]]' ;;
  */issues/1/comments?*)
@@ -496,6 +606,29 @@ fn provider_child() {
             })
             .collect();
     }
+    if matches!(
+        case.as_str(),
+        "checkout_head_changed" | "runtime_conclusion_head"
+    ) {
+        read.pull_request.revision.base =
+            fs::read_to_string(std::path::Path::new(&root).join("base-head"))
+                .unwrap()
+                .trim()
+                .into();
+        read.pull_request.revision.head =
+            fs::read_to_string(std::path::Path::new(&root).join("validated-head"))
+                .unwrap()
+                .trim()
+                .into();
+        store.enable_worktree_context();
+    }
+    if case == "uncertain_stale_viewed" {
+        read.files
+            .extend(["keep.rs", "done.rs"].map(|path| ChangedFile {
+                path: path.into(),
+                ..read.files[0].clone()
+            }));
+    }
     if matches!(case.as_str(), "reply_first" | "reply_lookup_fail") {
         read.pull_request.revision.head = "new-head".into();
         let CommentTarget::Diff(anchor) = location("old-head") else {
@@ -580,6 +713,251 @@ fn provider_child() {
         .import_review(&ReviewId("snapshot".into()), &reviewer, &read, &backend)
         .unwrap();
     let mut workspace = store.open_workspace(&ReviewId("snapshot".into())).unwrap();
+    if case == "runtime_conclusion_head" {
+        let expected =
+            fs::read_to_string(std::path::Path::new(&root).join("replacement-head")).unwrap();
+        assert_eq!(workspace.comparison.head, expected.trim());
+        assert_ne!(
+            workspace.comparison.head,
+            workspace.review.read.pull_request.revision.head
+        );
+        workspace = store
+            .mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::PublishReview {
+                    conclusion: Some(ReviewConclusion {
+                        outcome: ReviewOutcome::Comment,
+                        body: Some("Summary".into()),
+                    }),
+                },
+            )
+            .unwrap();
+        workspace =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                .unwrap();
+        assert_eq!(workspace.results.len(), 1);
+        let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let created = requests
+            .iter()
+            .find(|request| {
+                request["endpoint"] == "repos/owner/repo/pulls/1/reviews"
+                    && request["method"] == "POST"
+            })
+            .unwrap();
+        assert_eq!(created["body"]["commit_id"], expected.trim());
+        assert_eq!(created["body"]["event"], "COMMENT");
+        return;
+    }
+    if case == "uncertain_stale_viewed" {
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["config", "user.name", "Reviewer"]);
+        git(&["config", "user.email", "reviewer@example.invalid"]);
+        for path in ["file.rs", "keep.rs", "done.rs"] {
+            fs::write(std::path::Path::new(&root).join(path), "original\n").unwrap();
+        }
+        git(&["add", "file.rs", "keep.rs", "done.rs"]);
+        git(&["commit", "--quiet", "-m", "Original"]);
+        git(&["update-ref", "refs/tags/old-head", "HEAD"]);
+        git(&["update-ref", "refs/tags/old-base", "HEAD"]);
+        for path in ["done.rs", "file.rs", "keep.rs"] {
+            workspace = store
+                .mutate_workspace(
+                    &workspace.id,
+                    workspace.generation,
+                    Action::Viewed {
+                        path: path.into(),
+                        viewed: true,
+                    },
+                )
+                .unwrap();
+        }
+        let frozen = workspace.publication_plan().unwrap().operations;
+        workspace = store
+            .mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::BeginPublication {
+                    destination: buf_review::workspace::Destination::Review,
+                    operations: frozen.clone(),
+                },
+            )
+            .unwrap();
+        let publication = workspace.attempt.as_ref().unwrap().id.clone();
+        workspace = store
+            .mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::RecordResult {
+                    result: buf_review::store::OperationResult {
+                        operation: frozen[0].clone(),
+                        mappings: vec![],
+                        response: serde_json::json!({"confirmed":true}),
+                    },
+                },
+            )
+            .unwrap();
+        workspace = store.mutate_workspace(&workspace.id, workspace.generation, Action::SetAttemptProvider {
+            provider: serde_json::json!({"inflight": format!("operation {}", frozen[1].id)}),
+        }).unwrap();
+        workspace = store
+            .mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::FinishPublication {
+                    success: false,
+                    uncertain: true,
+                    error: Some("lost viewed response".into()),
+                },
+            )
+            .unwrap();
+        fs::write(
+            std::path::Path::new(&root).join("file.rs"),
+            "newer version\n",
+        )
+        .unwrap();
+        git(&["commit", "--quiet", "-am", "Change one reviewed file"]);
+        read.pull_request.revision.head = git(&["rev-parse", "HEAD"]);
+        fs::write(
+            std::path::Path::new(&root).join("remote-head"),
+            &read.pull_request.revision.head,
+        )
+        .unwrap();
+        let latest = ReviewId("latest".into());
+        store
+            .import_review(&latest, &reviewer, &read, &backend)
+            .unwrap();
+        workspace = store
+            .refresh_workspace(&workspace.id, workspace.generation, &latest)
+            .unwrap();
+        workspace = store
+            .mutate_workspace(&workspace.id, workspace.generation, Action::CompareLatest)
+            .unwrap();
+        let history = workspace.batch.write.events.clone();
+        assert_eq!(
+            workspace
+                .get_unpublished()
+                .unwrap()
+                .1
+                .operations
+                .into_iter()
+                .map(|operation| operation.change)
+                .collect::<Vec<_>>(),
+            vec![frozen[2].change.clone()]
+        );
+        assert_eq!(workspace.suspended_attempts[0].id, publication);
+        assert_eq!(workspace.suspended_attempts[0].operations, frozen);
+        workspace =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                .unwrap();
+        assert!(workspace.pending().unwrap().operations.is_empty());
+        assert!(workspace.suspended_attempts.is_empty() && workspace.attempt.is_none());
+        assert_eq!(workspace.batch.write.events, history);
+        assert_eq!(
+            workspace
+                .results
+                .iter()
+                .map(|result| &result.operation)
+                .collect::<Vec<_>>(),
+            vec![&frozen[0], &frozen[2]]
+        );
+        assert!(!workspace.has_result(&frozen[1].id));
+        let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let snapshot = requests
+            .iter()
+            .position(|request| {
+                request["body"]["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("ReviewSnapshot"))
+            })
+            .unwrap();
+        let writes = requests
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| {
+                request["body"]["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("MarkFileAsViewedInput"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 1);
+        assert!(snapshot < writes[0].0);
+        assert_eq!(writes[0].1["body"]["variables"]["input"]["path"], "keep.rs");
+        return;
+    }
+    if matches!(
+        case.as_str(),
+        "remote_head_changed" | "fetch_failure" | "checkout_head_changed"
+    ) {
+        workspace = store
+            .mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::Viewed {
+                    path: "file.rs".into(),
+                    viewed: true,
+                },
+            )
+            .unwrap();
+        let before = serde_json::to_value(&workspace).unwrap();
+        let error =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                .unwrap_err();
+        if case == "remote_head_changed" {
+            assert_eq!(
+                error.to_string(),
+                "cannot publish to GitHub: not at remote head"
+            );
+        } else if case == "fetch_failure" {
+            assert!(error.to_string().contains("git:"), "{error}");
+        } else {
+            assert!(
+                error
+                    .to_string()
+                    .contains("Git HEAD changed while preparing publication"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(
+                Store::open(&root)
+                    .unwrap()
+                    .workspace(&workspace.id)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+        let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap_or_default();
+        assert!(!log.contains("\"method\":\"POST\""));
+        assert!(!log.contains("\"method\":\"PATCH\""));
+        assert!(!log.contains("\"method\":\"DELETE\""));
+        if case == "fetch_failure" {
+            assert!(log.is_empty(), "{log}");
+        }
+        return;
+    }
     if matches!(case.as_str(), "viewed_cache" | "viewed_cache_failure") {
         let paths = workspace
             .review
@@ -663,7 +1041,7 @@ fn provider_child() {
                 .filter(|request| request["endpoint"] == "repos/owner/repo/pulls/1"
                     && request["method"] == "GET")
                 .count(),
-            1
+            if case == "viewed_cache_failure" { 2 } else { 1 }
         );
         let writes = requests
             .iter()
@@ -1487,7 +1865,8 @@ fn provider_child() {
             workspace = store.workspace(&workspace.id).unwrap().unwrap();
             assert!(!workspace.rejected_anchors.contains_key(&draft));
             assert!(workspace.rejected_anchors.contains_key(&rejected));
-            assert!(!std::path::Path::new(&std::env::var("PROVIDER_LOG").unwrap()).exists());
+            let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+            assert!(!log.contains("\"method\":\"POST\""));
             workspace = store
                 .mutate_workspace(
                     &workspace.id,
@@ -1516,9 +1895,16 @@ fn provider_child() {
                 )
                 .unwrap_err();
                 assert!(error.to_string().contains("resolution"));
+                let after = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
                 assert_eq!(
-                    fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap(),
+                    after
+                        .lines()
+                        .filter(|line| line.contains("\"method\":\"POST\""))
+                        .count(),
                     before
+                        .lines()
+                        .filter(|line| line.contains("\"method\":\"POST\""))
+                        .count()
                 );
                 assert!(workspace.completed.is_empty());
                 return;

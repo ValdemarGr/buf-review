@@ -4,6 +4,7 @@ local client = require('buf_review.client')
 local editor = require('buf_review.editor')
 local action_queue = require('buf_review.actions')
 local checkout = require('buf_review.checkout')
+local comment_diff = require('buf_review.comment_diff')
 local repositories, buffers = {}, {}
 local namespace = api.nvim_create_namespace('buf-review')
 local range_namespace = api.nvim_create_namespace('buf-review-comment-range')
@@ -13,13 +14,14 @@ local first_load = true
 local commands = {
   'prs', 'pr', 'start', 'leave', 'conclude', 'publish', 'refresh', 'comment', 'reply',
   'edit', 'delete', 'restore', 'move', 'suggest', 'done', 'todo', 'viewed', 'unviewed',
-  'next', 'previous', 'compare', 'context', 'relocate', 'resolve', 'log', 'sessions', 'checkout',
+  'next', 'previous', 'context', 'relocate', 'resolve', 'log', 'sessions', 'checkout',
 }
 local dispatch, home, open_file, open_comment, compose, refresh, show_conflict, thread, thread_list
 local navigate, publication, navigate_items
 local render_reader
 local refresh_checkout, checkout_current
 local highlight_comment
+local show_diff, open_local
 local pending_renders, render_scheduled = {}, false
 local function render_pending(safe)
   render_scheduled = false
@@ -114,16 +116,18 @@ local function displayed_location(view, row, meta)
   end
   local root = root_row(view, row)
   if not root or content(root).target.kind ~= 'diff' then return end
-  if content(root).id == meta.root then return meta.location end
-  if meta.side ~= 'base' then return end
+  if content(root).id == meta.root and meta.comment_role ~= 'original_base' and meta.side == 'base' then return meta.location end
   local location = content(root).target.target
   local range = location.range
   if not range or range.start.side ~= range['end'].side then return end
   local source = location.revision[range.start.side]
-  if source ~= meta.revision.base or location.path ~= meta.source_path then return end
+  local displayed = meta.side == 'head' and meta.revision.head or meta.revision.base
+  local logical_path = vim.deep_equal(location.revision, meta.action_revision)
+    and range.start.side == meta.action_side and location.path == meta.path
+  if source ~= displayed or (location.path ~= meta.source_path and not logical_path) then return end
   location = vim.deepcopy(location)
   location.revision, location.path = meta.revision, meta.path
-  location.range.start.side, location.range['end'].side = 'base', 'base'
+  location.range.start.side, location.range['end'].side = meta.side, meta.side
   return location
 end
 
@@ -213,10 +217,12 @@ highlight_comment = function(safe)
                 end_row = last, end_col = 0, hl_group = 'BufReviewCommentRange', hl_eol = true, priority = 200,
               })
               highlighted[#highlighted + 1] = buf
-              local rows = vim.fn.range(first, last)
-              for _, win in ipairs(windows) do
-                local id = vim.fn.matchaddpos('BufReviewCommentRange', rows, 200, -1, { window = win })
-                range_matches[#range_matches + 1] = { window = win, id = id }
+              if meta.comment_role ~= 'comment' then
+                local rows = vim.fn.range(first, last)
+                for _, win in ipairs(windows) do
+                  local id = vim.fn.matchaddpos('BufReviewCommentRange', rows, 200, -1, { window = win })
+                  range_matches[#range_matches + 1] = { window = win, id = id }
+                end
               end
             end
           end
@@ -280,13 +286,30 @@ local function guard(state)
 end
 
 local function leave_diff(win)
+  if valid(win) then comment_diff.window(win, false) end
   if valid(win) and vim.wo[win].diff then
     api.nvim_win_call(win, function() vim.cmd('diffoff') end)
   end
 end
 
+local function close_original(state)
+  if valid(state.original) then
+    if not valid(state.left) and not valid(state.right) then
+      state.left, state.top, state.original = state.original, state.original, nil
+      leave_diff(state.left)
+      return
+    end
+    local buf = api.nvim_win_get_buf(state.original)
+    leave_diff(state.original)
+    api.nvim_win_close(state.original, false)
+    if buffers[buf] and #vim.fn.win_findbuf(buf) == 0 then api.nvim_buf_delete(buf, { force = true }) end
+  end
+  state.original = nil
+end
+
 api.nvim_create_autocmd('WinClosed', { callback = function(event)
   local win = tonumber(event.match)
+  comment_diff.window(win, false)
   local meta = valid(win) and buffers[api.nvim_win_get_buf(win)]
   if meta and meta.role then leave_diff(win) end
 end })
@@ -298,10 +321,12 @@ local function tab(state)
     settle(previous)
     guard(previous)
     if previous.tab and api.nvim_tabpage_is_valid(previous.tab) then
+      close_original(previous)
       if valid(previous.discussion) then leave_diff(previous.discussion); api.nvim_win_close(previous.discussion, false) end
-      if valid(previous.right) then leave_diff(previous.right); api.nvim_win_close(previous.right, false) end
+      if valid(previous.right) then leave_diff(previous.right); api.nvim_win_close(previous.right, true) end
       state.tab, state.top = previous.tab, valid(previous.left) and previous.left or previous.top
       previous.tab, previous.top, previous.left, previous.right, previous.discussion = nil, nil, nil, nil, nil
+      previous.diff_windows = nil
     end
     repository.current = state
   end
@@ -311,7 +336,8 @@ local function tab(state)
     vim.cmd('keepjumps tabnew')
     state.tab = api.nvim_get_current_tabpage()
     state.top = api.nvim_get_current_win()
-    state.left, state.right, state.discussion = nil, nil, nil
+    state.left, state.right, state.discussion, state.original = nil, nil, nil, nil
+    state.diff_windows = nil
   end
 end
 
@@ -324,12 +350,16 @@ end
 local reader_windows = {
   home = 'top', loading = 'top', prs = 'top', sessions = 'top', historical = 'left',
   ['diff:base'] = 'left', ['diff:head'] = 'right', context = 'context_left',
+  ['diff:original_base'] = 'original',
   ['context:base'] = 'context_left', ['context:head'] = 'context_right',
 }
 
 local function reader_slot(state, role)
   state.readers = state.readers or {}
   local slot = state.readers[role] or {}
+  for index = #slot, 1, -1 do
+    if not api.nvim_buf_is_valid(slot[index]) then table.remove(slot, index) end
+  end
   state.readers[role] = slot
   local owner = state[reader_windows[role] or 'discussion']
   local function available(buf)
@@ -470,14 +500,15 @@ local function require_view(state)
 end
 
 local function render_file_winbar(buf, meta, view)
-  if meta.historical then return end
+  if meta.historical and not meta.comment_label then return end
   local progress = ''
-  if vim.deep_equal(meta.revision, view.comparison) then
+  if vim.deep_equal(meta.action_revision or meta.revision, view.comparison) then
     for _, file in ipairs(view.files) do
       if file.path == meta.path then progress = file.viewed and ' [viewed]' or ' [unviewed]'; break end
     end
   end
-  local title = ('%s %s  %s%s'):format(meta.side == 'base' and 'Base' or 'Head', meta.revision[meta.side], meta.source_path, progress):gsub('%%', '%%%%')
+  local title = meta.comment_label and (meta.comment_label .. progress)
+    or ('%s %s  %s%s'):format(meta.side == 'base' and 'Base' or 'Head', meta.revision[meta.side], meta.source_path, progress):gsub('%%', '%%%%')
   for _, win in ipairs(vim.fn.win_findbuf(buf)) do vim.wo[win].winbar = title end
 end
 
@@ -528,7 +559,8 @@ render_reader = function(buf, cursor, safe)
   elseif meta.kind == 'thread' then thread(state, find(state.view, meta.object), buf, cursor)
   elseif meta.kind == 'threads' then
     local roots = {}
-    if meta.location and vim.deep_equal(meta.location.revision, state.view.comparison) then roots = roots_at(state.view, meta.location)
+    if meta.location and meta.source and meta.source.historical then roots = roots_at(state.view, meta.location, meta.source)
+    elseif meta.location and vim.deep_equal(meta.location.revision, state.view.comparison) then roots = roots_at(state.view, meta.location)
     else
       for _, id in ipairs(meta.root_ids) do
         local row = find(state.view, id)
@@ -567,6 +599,10 @@ local function apply(state, response, cursor)
 end
 
 local function request(state, operation, fields, callback, generation)
+  local opening = state.repository.opening
+  local read_revision = state.view and vim.deepcopy(state.view.comparison)
+  local read_review = state.view and state.view.review.id
+  local read_generation = state.view and state.view.generation
   local origin = callback and { window = api.nvim_get_current_win(), buffer = api.nvim_get_current_buf(), cursor = api.nvim_win_get_cursor(0) }
   local payload = vim.tbl_extend('force', { op = operation }, fields or {})
   if vim.tbl_contains({ 'start', 'leave', 'save', 'delete', 'restore', 'undo', 'viewed', 'reaction', 'summary', 'publish_review', 'move', 'relocate', 'resolve', 'pr_details' }, operation) then
@@ -581,7 +617,13 @@ local function request(state, operation, fields, callback, generation)
     local stationary = origin and api.nvim_get_current_win() == origin.window
       and api.nvim_get_current_buf() == origin.buffer and vim.deep_equal(api.nvim_win_get_cursor(0), origin.cursor)
     local cursor = (operation == 'actions' or operation == 'reaction' or operation == 'viewed' or operation == 'delete' or operation == 'restore') and 'position' or ((operation == 'refresh' or operation == 'apply_refresh') and 'object' or nil)
-    local current = response and operation ~= 'refresh' and operation ~= 'apply_refresh' and apply(state, response, cursor) or state
+    local code = operation == 'code' or operation == 'historical_code'
+    local workspace = response and response.workspace
+    local accepted = not code or (state.repository.opening == opening and state.repository.current == state
+      and state.view.review.id == read_review and state.view.generation == read_generation
+      and vim.deep_equal(state.view.comparison, read_revision)
+      and (not workspace or workspace.review.id == read_review))
+    local current = response and accepted and operation ~= 'refresh' and operation ~= 'apply_refresh' and apply(state, response, cursor) or state
     if callback then callback(response, err, current, stationary) elseif err and report ~= false then notify(err, vim.log.levels.ERROR) end
   end
   if payload.op == 'actions' or payload.op == 'apply_refresh' then
@@ -607,10 +649,10 @@ local function actions(state, queue, callback)
   request(state, 'actions', { actions = entries }, callback)
 end
 
-local function refresh_snapshot(state, compare_latest, callback)
+local function refresh_snapshot(state, callback)
   request(state, 'fetch_refresh', {}, function(fetched, err)
     if err then callback(fetched, err); return end
-    request(state, 'apply_refresh', { prepared_refresh = fetched.prepared_refresh, compare_latest = compare_latest }, callback)
+    request(state, 'apply_refresh', { prepared_refresh = fetched.prepared_refresh }, callback)
   end)
 end
 
@@ -622,11 +664,11 @@ local function prepare_objects(state, callback, recheck)
       if callback then job.waiters[#job.waiters + 1] = callback end
       return
     elseif not job.error and not recheck then
-      if callback then callback() end
+      if callback then callback(nil, revision) end
       return
     end
   end
-  job = { revision = revision, review = state.view.review.id, waiters = callback and { callback } or {} }
+  job = { revision = revision, review = state.view.review.id, generation = state.view.generation, waiters = callback and { callback } or {} }
   state.objects = job
   local function redraw()
     if state.home and buffers[state.home] then
@@ -636,18 +678,32 @@ local function prepare_objects(state, callback, recheck)
   end
   redraw()
   client.request(state.root, { op = 'fetch_objects', workspace = state.view.id }, function(response, err)
+    local workspace = response and response.workspace
+    local authoritative = not err and workspace and state.objects == job and state.view.review.id == job.review
+      and state.view.generation == job.generation and workspace.id == state.view.id and workspace.review.id == job.review
+      and vim.deep_equal(state.view.comparison, job.revision)
+      and workspace.generation >= state.view.generation and vim.deep_equal(workspace.comparison, response.revision)
+    if authoritative then
+      revision, job.revision = vim.deepcopy(response.revision), vim.deepcopy(response.revision)
+      apply(state, response, 'position')
+    end
     if not err and not (response and vim.deep_equal(response.revision, revision)) then
       err = 'Comparison changed while preparing code; reopen the file'
     end
     job.done, job.error = true, err
-    if state.objects == job and vim.deep_equal(state.view.comparison, revision) then
+    if state.objects == job and state.view.review.id == job.review and vim.deep_equal(state.view.comparison, revision) then
+      local workspace = response and response.workspace
+      if not err and workspace and workspace.id == state.view.id and workspace.review.id == job.review
+        and vim.deep_equal(workspace.comparison, revision) and workspace.generation >= state.view.generation then
+        apply(state, response, 'position')
+      end
       redraw()
       if response and response.warnings then
         notify('Historical commits unavailable: ' .. table.concat(response.missing_commits or {}, ', '), vim.log.levels.WARN)
       end
       if err and state.repository.current == state then notify(err, vim.log.levels.ERROR) end
     end
-    for _, waiter in ipairs(job.waiters) do waiter(err) end
+    for _, waiter in ipairs(job.waiters) do waiter(err, revision) end
     job.waiters = {}
   end)
 end
@@ -850,12 +906,12 @@ render_home = function(state, cursor)
     or (state.refresh_deferred and 'cached; refresh deferred')
     or (state.refreshed_at and ('refreshed ' .. state.refreshed_at)) or 'cached snapshot'
   if branches and not state.error then freshness = 'local committed snapshot' end
-  if view.new_commits then freshness = freshness .. ' | new commits: :Review compare latest' end
+  if view.new_commits then freshness = freshness .. ' | not at remote head' end
   local lines = {
     'Pull request: ' .. (branches and (branches.source.branch .. ' → ' .. branches.sink.branch .. ' [local]') or pr.source.locator),
     '  ' .. (pr.title ~= '' and pr.title or '(untitled)'),
     ('Reviewer: @%s  WIP: %s'):format(view.review.reviewer.name, wip),
-    ('Comparison: %s → %s'):format(view.comparison.base:sub(1, 10), view.comparison.head:sub(1, 10)),
+    ('Git: %s → HEAD %s'):format(view.comparison.base:sub(1, 10), view.comparison.head:sub(1, 10)),
     'Freshness: ' .. freshness,
   }
   for line, text in ipairs(lines) do lines[line] = text:gsub('[\r\n]', ' ') end
@@ -885,9 +941,10 @@ render_home = function(state, cursor)
     or (objects.error and 'fetch failed; open a file or :Review refresh to retry') or 'ready'
   lines[#lines + 1] = 'Code: ' .. code_status
   highlights[#highlights + 1] = { line = #lines, group = objects and objects.error and 'BufReviewError' or 'BufReviewState' }
-  if state.error or view.last_error then
+  local problem = state.error or view.comparison_error or view.last_error
+  if problem then
     local first = #lines + 1
-    vim.list_extend(lines, vim.split(('Error: ' .. (state.error or view.last_error)):gsub('\r\n', '\n'), '\n', { plain = true }))
+    vim.list_extend(lines, vim.split(('Error: ' .. problem):gsub('\r\n', '\n'), '\n', { plain = true }))
     for line = first, #lines do highlights[#highlights + 1] = { line = line, group = 'BufReviewError' } end
   end
   if view.attempt then
@@ -971,6 +1028,13 @@ render_home = function(state, cursor)
       if row then entries[#entries + 1] = comment_entry(row, { comment = id, checklist = true }) end
     end
     return entries
+  end
+  if #(view.unpulled_commits or {}) > 0 then
+    local commits = {}
+    for _, commit in ipairs(view.unpulled_commits) do
+      commits[#commits + 1] = { text = commit.id:sub(1, 10) .. ' ' .. commit.subject, row = {} }
+    end
+    section('Unpulled commits', commits)
   end
   section('Todo', comments(view.todo))
   local pending, included = {}, {}
@@ -1085,12 +1149,14 @@ home = function(state)
   state.repository.opening = {}
   settle(state)
   tab(state)
+  close_original(state)
   if valid(state.discussion) then leave_diff(state.discussion); api.nvim_win_close(state.discussion, false) end
   state.discussion = nil
-  if valid(state.right) then leave_diff(state.right); api.nvim_win_close(state.right, false) end
+  if valid(state.right) then leave_diff(state.right); api.nvim_win_close(state.right, true) end
   state.right = nil
   if valid(state.left) then state.top = state.left end
   state.left = nil
+  state.diff_windows = nil
   if not valid(state.top) then state.top = api.nvim_get_current_win() end
   display_home(state)
   api.nvim_set_current_win(state.top)
@@ -1100,9 +1166,11 @@ local function show_browser(state, buf)
   guard(state)
   state.repository.opening = {}
   tab(state)
+  close_original(state)
   if valid(state.discussion) then leave_diff(state.discussion); api.nvim_win_close(state.discussion, false); state.discussion = nil end
-  if valid(state.right) then leave_diff(state.right); api.nvim_win_close(state.right, false); state.right = nil end
+  if valid(state.right) then leave_diff(state.right); api.nvim_win_close(state.right, true); state.right = nil end
   if valid(state.left) then state.top = state.left; state.left = nil end
+  state.diff_windows = nil
   leave_diff(state.top)
   show_buffer(state.top, buf)
   api.nvim_set_current_win(state.top)
@@ -1190,7 +1258,7 @@ refresh = function(state, callback)
   if (state.loading or was_loading) and valid(state.top) and (api.nvim_win_get_buf(state.top) == state.home or api.nvim_win_get_buf(state.top) == state.loading_buf) then
     display_home(state)
   end
-  refresh_snapshot(state, false, function(response, err)
+  refresh_snapshot(state, function(response, err)
     state.refreshing = nil
     if loading and state.loading == loading then state.loading = nil end
     local rendered, problem = pcall(function()
@@ -1343,13 +1411,26 @@ local function immutable(state, path, side, revision, text, code)
   if lines[#lines] == '' and #lines > 1 then table.remove(lines) end
   local buf, meta = scratch(state, 'diff', path, lines, false, 'diff:' .. side)
   meta.path, meta.side, meta.revision = path, side, revision
+  meta.comment_label = nil
   meta.historical, meta.location, meta.root = code and code.historical, code and code.location, code and code.root
-  meta.source_path = side == 'base' and code and code.base_path or path
+  meta.source_path = code and code.source_path or (side == 'base' and code and code.base_path or path)
   meta.source_lines = text == '' and 0 or #lines
   local marker = vim.b[buf].buf_review
   marker.side, marker.path, marker.revision = side, path, revision
-  marker.historical, marker.provenance = meta.historical, code and code.provenance
+  marker.historical, marker.provenance = meta.historical, meta.historical and code.provenance or nil
   marker.source_path = meta.source_path
+  meta.action_revision, meta.action_side = nil, nil
+  if code and code.comment_role then
+    meta.comment_role = code.comment_role
+    marker.comment_role = code.comment_role
+    marker.missing = code.missing == true
+    local commit = side == 'head' and revision.head or revision.base
+    if not code.missing then
+      if commit == state.view.comparison.head then meta.action_side = 'head'
+      elseif commit == state.view.comparison.base then meta.action_side = 'base' end
+      if meta.action_side then meta.action_revision = state.view.comparison end
+    end
+  else meta.comment_role, marker.comment_role, marker.missing = nil, nil, nil end
   vim.b[buf].buf_review = marker
   local ft = vim.filetype.match({ filename = meta.source_path })
   if ft then vim.bo[buf].filetype = ft end
@@ -1357,12 +1438,22 @@ local function immutable(state, path, side, revision, text, code)
     local ok, err = pcall(M.new_comment, nil, true)
     if not ok then notify(err, vim.log.levels.ERROR) end
   end, { buffer = buf, silent = true, nowait = true })
+  vim.keymap.set('n', 'o', function()
+    local ok, err = pcall(open_local, state, meta.diff_context)
+    if not ok then notify(err, vim.log.levels.ERROR) end
+  end, { buffer = buf, silent = true })
   annotate(buf, meta, state.view)
   return buf
 end
 
-local function show_code(state, code)
-  local path = code.path
+local function local_text(buf)
+  local text = table.concat(api.nvim_buf_get_lines(buf, 0, -1, false), '\n')
+  return text .. (vim.bo[buf].endofline and '\n' or '')
+end
+
+show_diff = function(context, panes)
+  local state, code = context.state, context.code
+  guard(state)
   tab(state)
   if valid(state.discussion) then
     local buf = api.nvim_win_get_buf(state.discussion)
@@ -1372,50 +1463,126 @@ local function show_code(state, code)
       location = edit.target.kind == 'diff' and edit.target.target
         or edit.target.kind == 'reply' and anchor(state.view, find(state.view, edit.target.target))
     end
-    if location and location.path ~= path then
+    if location and location.path ~= code.path then
       leave_diff(state.discussion)
       api.nvim_win_close(state.discussion, false)
       state.discussion = nil
     end
   end
-  if not valid(state.left) then
-    state.left = valid(state.top) and state.top or api.nvim_get_current_win()
-    api.nvim_set_current_win(state.left)
-    vim.cmd('keepjumps rightbelow vsplit')
-    state.right = api.nvim_get_current_win()
+  local windows, seen = {}, {}
+  for _, win in pairs(state.diff_windows or { state.original, state.left, state.right }) do
+    if valid(win) and not seen[win] then windows[#windows + 1], seen[win] = win, true end
   end
-  if not valid(state.right) then
-    api.nvim_set_current_win(state.left)
-    vim.cmd('keepjumps rightbelow vsplit')
-    state.right = api.nvim_get_current_win()
+  table.sort(windows, function(a, b) return api.nvim_win_get_position(a)[2] < api.nvim_win_get_position(b)[2] end)
+  if #windows == 0 then windows[1] = valid(state.top) and state.top or api.nvim_get_current_win() end
+  local previous_buffers = {}
+  for _, win in ipairs(windows) do previous_buffers[api.nvim_win_get_buf(win)] = true end
+  local roles = {}
+  for _, role in ipairs({ 'base', 'middle', 'right' }) do if panes[role] then roles[#roles + 1] = role end end
+  while #windows > #roles do
+    local win = table.remove(windows)
+    leave_diff(win)
+    api.nvim_win_close(win, true)
   end
-  leave_diff(state.left)
-  leave_diff(state.right)
-  local base = immutable(state, path, 'base', code.revision, code.base_content, code)
-  local head = immutable(state, path, 'head', code.revision, code.head_content, code)
-  buffers[base].binary, buffers[head].binary = code.binary, code.binary
-  show_buffer(state.left, base)
-  show_buffer(state.right, head)
-  for _, win in ipairs({ state.left, state.right }) do
-    api.nvim_win_call(win, function() vim.cmd('diffthis'); vim.wo.wrap = false end)
+  for index = 2, #roles do
+    if not windows[index] then
+      api.nvim_set_current_win(windows[index - 1])
+      vim.cmd('keepjumps rightbelow vsplit')
+      windows[index] = api.nvim_get_current_win()
+    end
   end
+  state.diff_windows = {}
+  local comment_buf, working_buf
+  for index, role in ipairs(roles) do
+    local pane, win = panes[role], windows[index]
+    leave_diff(win)
+    local buf
+    if pane.kind == 'local' then
+      buf = vim.fn.bufadd(pane.path)
+      vim.fn.bufload(buf)
+      show_buffer(win, buf)
+      working_buf = buf
+      vim.wo[win].winbar = ('Working tree  %s'):format(code.path):gsub('%%', '%%%%')
+    else
+      local version = context.versions[role]
+      local side = role == 'right' and 'head' or (role == 'base' and code.historical and 'original_base' or 'base')
+      local revision = role == 'base' and code.historical and { base = pane.commit, head = code.revision.head } or code.revision
+      local data = vim.tbl_extend('force', {}, code, { source_path = pane.path, missing = version.missing, provenance = version.provenance })
+      if code.historical then data.comment_role = role == 'base' and 'original_base' or (role == 'middle' and 'comment' or 'selected_head') end
+      buf = immutable(state, code.path, side, revision, version.content, data)
+      buffers[buf].binary, buffers[buf].diff_context = code.binary, context
+      show_buffer(win, buf)
+      if code.historical then
+        local label = ({ base = 'Original base', middle = 'Comment', right = 'HEAD' })[role]
+        if version.provenance == 'reconstructed' then label = label .. ' (reconstructed)' end
+        buffers[buf].comment_label = ('%s %s  %s%s'):format(label, pane.commit, pane.path, version.missing and ' [file absent]' or ''):gsub('%%', '%%%%')
+      end
+      render_file_winbar(buf, buffers[buf], state.view)
+      if role == 'middle' then comment_buf = buf end
+    end
+    state.diff_windows[role] = win
+    api.nvim_win_call(win, function()
+      if #roles > 1 then vim.cmd('diffthis') end
+      vim.wo.wrap = false
+    end)
+  end
+  state.left = state.diff_windows.middle or state.diff_windows.base or state.diff_windows.right
+  state.original = state.diff_windows.middle and state.diff_windows.base or nil
+  state.right = state.diff_windows.right ~= state.left and state.diff_windows.right or nil
+  state.top, state.path, state.diff_context, state.diff_panes = state.left, code.path, context, panes
+  context.panes = panes
+  if comment_buf then
+    comment_diff.highlight(comment_buf, code, working_buf and local_text(working_buf))
+    comment_diff.window(state.diff_windows.middle, true)
+  end
+  for buf in pairs(previous_buffers) do
+    local meta = buffers[buf]
+    if meta and meta.state == state and meta.kind == 'diff' and #vim.fn.win_findbuf(buf) == 0 and not editor.retains(buf) then
+      api.nvim_buf_delete(buf, { force = true })
+    end
+  end
+  api.nvim_set_current_win(state.diff_windows.right or state.left)
+  activate(api.nvim_get_current_buf())
+end
+
+open_local = function(state, context)
+  guard(state)
+  if not context or not context.code.local_path then error('Working file path unavailable; reopen this diff') end
+  local panes = vim.deepcopy(context.panes)
+  panes.right = { kind = 'local', path = context.code.local_path }
+  show_diff(context, panes)
+end
+
+local function show_code(state, code)
+  local context = { state = state, code = code, versions = {} }
+  local function commit(role, hash, path, content, missing, provenance)
+    context.versions[role] = { content = content, missing = missing, provenance = provenance }
+    return { kind = 'commit', commit = hash, path = path }
+  end
+  local panes = {}
   if code.historical then
-    local label = 'Historical' .. (code.provenance == 'reconstructed' and ' (reconstructed)' or '')
-    vim.wo[state.left].winbar = ('%s %s  %s'):format(label, code.revision.base, code.base_path or path):gsub('%%', '%%%%')
-    vim.wo[state.right].winbar = ('PR head %s  %s%s'):format(code.revision.head, path, code.head_missing and ' [file absent]' or ''):gsub('%%', '%%%%')
+    local original, selected = comment_diff.sides(code)
+    if original then
+      local source = code.original_base
+      panes.base = commit('base', source.commit, source.path, source.content, source.missing, source.provenance)
+    end
+    panes.middle = commit('middle', code.revision.base, code.base_path or code.path, code.base_content, code.base_missing, code.provenance)
+    if selected then panes.right = commit('right', code.revision.head, code.path, code.head_content, code.head_missing, 'recorded') end
   else
-    render_file_winbar(base, buffers[base], state.view)
-    render_file_winbar(head, buffers[head], state.view)
+    panes.base = commit('base', code.revision.base, code.base_path or code.path, code.base_content, code.base_missing, 'recorded')
+    panes.right = commit('right', code.revision.head, code.path, code.head_content, code.head_missing, 'recorded')
   end
-  state.top = state.left
-  state.path = path
-  api.nvim_set_current_win(state.right)
-  activate(head)
+  local loaded = code.local_path and vim.fn.bufnr(code.local_path) or -1
+  local unsaved = loaded >= 0 and api.nvim_buf_is_loaded(loaded)
+    and vim.bo[loaded].modified
+  if code.local_path and (code.local_dirty or unsaved) then panes.right = { kind = 'local', path = code.local_path } end
+  show_diff(context, panes)
 end
 
 local function show_historical_hunk(state, response, id)
   tab(state)
-  if valid(state.right) then leave_diff(state.right); api.nvim_win_close(state.right, false) end
+  close_original(state)
+  if valid(state.right) then leave_diff(state.right); api.nvim_win_close(state.right, true) end
   state.right = nil
   state.left = valid(state.left) and state.left or (valid(state.top) and state.top or api.nvim_get_current_win())
   leave_diff(state.left)
@@ -1429,6 +1596,7 @@ local function show_historical_hunk(state, response, id)
   show_buffer(state.left, buf)
   vim.wo[state.left].winbar = 'Historical reference · recorded hunk'
   state.top, state.path = state.left, meta.path
+  state.diff_windows = nil
   api.nvim_set_current_win(state.left)
 end
 
@@ -1448,19 +1616,20 @@ end
 
 local function open_historical(state, id)
   local selection, navigation = state.repository.current, state.repository.navigation
-  local revision, opening = vim.deepcopy(state.view.comparison), {}
-  local head = state.view.review.read.pull_request.revision.head
+  local opening = {}
   state.repository.opening = opening
-  prepare_objects(state, function()
+  prepare_objects(state, function(_, prepared_revision)
     if state.repository.opening ~= opening or state.repository.current ~= selection or state.repository.navigation ~= navigation then return end
+    if not vim.deep_equal(state.view.comparison, prepared_revision) then return end
+    local revision = vim.deepcopy(state.view.comparison)
     request(state, 'historical_code', { comment = id }, function(response, err)
       if state.repository.opening ~= opening or state.repository.current ~= selection or state.repository.navigation ~= navigation
-        or not vim.deep_equal(state.view.comparison, revision) then return end
+        then return end
       if err then notify(err, vim.log.levels.ERROR); return end
       if protected(state) then notify('Unsaved composer; historical view preserved', vim.log.levels.ERROR); return end
-      if head ~= state.view.review.read.pull_request.revision.head then open_historical(state, id); return end
-      if response.code and response.code.revision.head ~= head then
-        notify('PR head changed while loading; reopen this comment', vim.log.levels.WARN)
+      if not response.workspace and not vim.deep_equal(state.view.comparison, revision) then return end
+      if response.code and response.code.revision.head ~= state.view.comparison.head then
+        notify('Comparison changed while loading; reopen this comment', vim.log.levels.WARN)
         return
       end
       local row = find(state.view, id)
@@ -1483,16 +1652,17 @@ open_file = function(state, path, callback)
   local selection = state.repository.current
   local navigation = state.repository.navigation
   local revision = vim.deepcopy(require_view(state).comparison)
-  prepare_objects(state, function(problem)
+  prepare_objects(state, function(problem, prepared_revision)
     if problem then return end
-    if state.repository.opening ~= opening or state.repository.current ~= selection or state.repository.navigation ~= navigation
-      or not vim.deep_equal(state.view.comparison, revision) then return end
+    if state.repository.opening ~= opening or state.repository.current ~= selection or state.repository.navigation ~= navigation then return end
+    if not vim.deep_equal(state.view.comparison, prepared_revision) then return end
     request(state, 'code', { path = path }, function(response, err)
       if state.repository.opening ~= opening or state.repository.current ~= selection or state.repository.navigation ~= navigation then return end
       if err then notify(err, vim.log.levels.ERROR); return end
       if protected(state) then notify('Unsaved composer; code view preserved', vim.log.levels.ERROR); return end
       local code = response.code
-      if not vim.deep_equal(state.view.comparison, revision) or not vim.deep_equal(code.revision, revision) then return end
+      if not response.workspace and not vim.deep_equal(state.view.comparison, revision) then return end
+      if not vim.deep_equal(code.revision, state.view.comparison) then return end
       show_code(state, code)
       if callback then callback() end
     end, false)
@@ -1526,7 +1696,7 @@ local function highlight_discussion(buf, highlights)
   end
 end
 
-thread_list = function(state, roots, existing, cursor, location)
+thread_list = function(state, roots, existing, cursor, location, action_location, source)
   local views = {}
   if existing then
     for _, win in ipairs(vim.fn.win_findbuf(existing)) do
@@ -1556,6 +1726,12 @@ thread_list = function(state, roots, existing, cursor, location)
   else
     buf, meta = scratch(state, 'threads', nil, lines)
     meta.location = vim.deepcopy(location)
+    meta.action_location = vim.deepcopy(action_location)
+    if source then
+      meta.source = { historical = source.historical, source_path = source.source_path,
+        side = source.side, revision = source.revision, path = source.path,
+        action_revision = source.action_revision, action_side = source.action_side }
+    end
   end
   meta.root_ids = {}
   for _, row in ipairs(roots) do meta.root_ids[#meta.root_ids + 1] = content(row).id end
@@ -1687,16 +1863,8 @@ open_comment = function(state, id)
   state.selected = id
   state.selected_file = nil
   local location = anchor(state.view, row)
-  if location and not matches(state.view, location) then open_historical(state, id); return end
-  local available = location and vim.tbl_contains(state.view.files, function(file)
-    return file.path == location.path
-  end, { predicate = true })
-  if available then
-    open_file(state, location.path, function()
-      thread(state, row)
-      if matches(state.view, location) then reveal_location(state.left, state.right, location) end
-    end)
-  else thread(state, row) end
+  if location then open_historical(state, id); return end
+  thread(state, row)
 end
 
 local function composer_header(buf, message)
@@ -1738,7 +1906,7 @@ compose = function(state, options)
   local return_views
   if kind == 'comment' and origin_meta and origin_meta.kind == 'diff' then
     return_views = {}
-    for _, win in ipairs({ origin_win, state.left, state.right }) do
+    for _, win in pairs({ origin_win, state.original, state.left, state.right }) do
       if valid(win) then
         return_views[win] = { buffer = api.nvim_win_get_buf(win), view = api.nvim_win_call(win, vim.fn.winsaveview) }
       end
@@ -1956,8 +2124,9 @@ local function reply(state, row, destination, options)
   return compose(state, vim.tbl_extend('force', options or {}, { target = { kind = 'reply', target = content(root).id }, destination = destination }))
 end
 
-local function range(meta, first, last)
-  return { revision = meta.revision, path = meta.path, range = { start = { side = meta.side, line = first }, ['end'] = { side = meta.side, line = last } } }
+local function range(meta, first, last, current)
+  local side = current and meta.action_side or meta.side
+  return { revision = current and meta.action_revision or meta.revision, path = meta.path, range = { start = { side = side, line = first }, ['end'] = { side = side, line = last } } }
 end
 
 function M.append()
@@ -1967,11 +2136,12 @@ function M.append()
     local view = require_view(state)
     local options = { return_buf = api.nvim_get_current_buf(), return_view = vim.fn.winsaveview() }
     if meta and meta.kind == 'diff' then
-      if not vim.deep_equal(meta.revision, view.comparison) then error('Comparison changed; reopen this code location before appending') end
+      if not vim.deep_equal(meta.action_revision or meta.revision, view.comparison) then error('Comparison changed; reopen this code location before appending') end
       M.new_comment()
     elseif meta and meta.kind == 'threads' and meta.location then
-      if not vim.deep_equal(meta.location.revision, view.comparison) then error('Comparison changed; reopen this code location before appending') end
-      options.target = { kind = 'diff', target = vim.deepcopy(meta.location) }
+      local location = meta.action_location or meta.location
+      if not vim.deep_equal(location.revision, view.comparison) then error('Comparison changed; reopen this code location before appending') end
+      options.target = { kind = 'diff', target = vim.deepcopy(location) }
       compose(state, options)
     elseif meta and meta.kind == 'thread' then
       local root = find(view, meta.object)
@@ -1990,7 +2160,7 @@ function M.new_comment(destination, visual, args)
   if not meta then error('New inline comments require a review diff; use home header for PR-wide comments') end
   local target
   if meta.kind == 'diff' then
-    if meta.historical then error('Historical code is reference only; reply in its thread or open the current file') end
+    if meta.historical and not meta.action_revision then error('Historical code is reference only; reply in its thread or open the current file') end
     if meta.source_lines == 0 then error('This comparison side has no source lines; create a file comment from its home row instead') end
     if meta.binary then error('Binary files support file comments from the home file row; line anchors are unavailable') end
     local first, last = api.nvim_win_get_cursor(0)[1], api.nvim_win_get_cursor(0)[1]
@@ -2004,7 +2174,7 @@ function M.new_comment(destination, visual, args)
       if vim.fn.visualmode() == '\022' then error('Blockwise selections cannot anchor comments') end
       first, last = args.line1, args.line2
     end
-    target = { kind = 'diff', target = range(meta, first, last) }
+    target = { kind = 'diff', target = range(meta, first, last, meta.action_revision ~= nil) }
   elseif meta.kind == 'home' then
     local object = selected(meta)
     if object and object.file then target = { kind = 'diff', target = { path = object.file, revision = state.view.comparison } }
@@ -2033,7 +2203,8 @@ function M.enter()
       local line = api.nvim_win_get_cursor(0)[1]
       local location = range(meta, line, line)
       local roots = roots_at(state.view, location, meta)
-      if #roots > 0 then thread_list(state, roots, nil, nil, location) end
+      local action_location = meta.action_revision and range(meta, line, line, true)
+      if #roots > 0 then thread_list(state, roots, nil, nil, location, action_location, meta) end
       return
     end
     local object = selected(meta)
@@ -2119,7 +2290,7 @@ function M.progress(present, visual, mode, selection)
     if selection and selection.comment then objects = { { comment = selection.comment } }
     elseif selection and selection.file then objects = { { file = selection.file } }
     elseif meta and meta.kind == 'diff' then
-      if meta.historical then error('Historical code cannot mark the current file viewed; mark its comment in the thread') end
+      if meta.historical and not vim.deep_equal(meta.action_revision, view.comparison) then error('Historical code cannot mark the current file viewed; mark its comment in the thread') end
       objects = { { file = meta.path } }
     elseif visual or (selection and selection.range > 0) then
       local first = visual and math.min(vim.fn.getpos('v')[2], api.nvim_win_get_cursor(0)[1]) or selection.line1
@@ -2257,11 +2428,12 @@ local function suggestion()
   if not location.range then error('Suggestions require a line/range-anchored root comment composer') end
   local state = edit.state
   local source
-  for _, win in ipairs({ state.left, state.right }) do
+  for _, win in pairs({ state.left, state.right, state.original }) do
     if valid(win) then
       local source_buf = api.nvim_win_get_buf(win)
       local meta = buffers[source_buf]
-      if meta and meta.path == location.path and meta.side == location.range.start.side and vim.deep_equal(meta.revision, location.revision) then source = source_buf; break end
+      if meta and meta.path == location.path and (meta.action_side or meta.side) == location.range.start.side
+        and vim.deep_equal(meta.action_revision or meta.revision, location.revision) then source = source_buf; break end
     end
   end
   if not source then error('Suggestion source unavailable for this exact anchor; open its immutable code first') end
@@ -2441,28 +2613,6 @@ dispatch = function(command, arguments, opts)
       if state.repository.current ~= selection or protected(state.repository.current) then return end
       show_log(state, response.log)
     end, false)
-  elseif command == 'compare' then
-    if arguments[1] ~= 'latest' then error('Use :Review compare latest') end
-    guard(state)
-    local opening = {}
-    state.repository.opening = opening
-    local previous = vim.deepcopy(state.view.comparison)
-    refresh_snapshot(state, true, function(response, err)
-      if response then apply(state, response, 'object') end
-      if err then notify(err, vim.log.levels.ERROR); return end
-      if response and response.refresh_deferred then
-        notify('Comparison update deferred while another operation settles; retry :Review compare latest')
-        return
-      end
-      if state.repository.opening ~= opening or state.repository.current ~= selection or protected(state) then return end
-      prepare_objects(state, nil, true)
-      notify(('Comparison %s..%s → %s..%s'):format(previous.base, previous.head, state.view.comparison.base, state.view.comparison.head))
-      if state.path and valid(state.left) then
-        if vim.tbl_contains(state.view.files, function(file) return file.path == state.path end, { predicate = true }) then
-          open_file(state, state.path)
-        else home(state) end
-      end
-    end)
   elseif command == 'context' then context(state, picked(state, meta))
   elseif command == 'resolve' then
     local resolution = arguments[1]
@@ -2515,7 +2665,7 @@ local function complete(lead, line)
   local candidates = commands
   if #parts > 2 or (#parts == 2 and lead == '') then
     local command = parts[2]
-    candidates = ({ prs = { 'assignee=', 'assignee=@me', 'assignee=all', 'state=open', 'state=closed', 'state=merged', 'state=all' }, sessions = { 'new' }, next = { 'todo', 'comment', 'file' }, previous = { 'todo', 'comment', 'file' }, compare = { 'latest' }, resolve = { 'local', 'remote', 'edit' } })[command] or {}
+    candidates = ({ prs = { 'assignee=', 'assignee=@me', 'assignee=all', 'state=open', 'state=closed', 'state=merged', 'state=all' }, sessions = { 'new' }, next = { 'todo', 'comment', 'file' }, previous = { 'todo', 'comment', 'file' }, resolve = { 'local', 'remote', 'edit' } })[command] or {}
     if command == 'relocate' then
       local ok, state = pcall(get_state)
       if ok and state.view then for _, row in ipairs(state.view.comments) do if unpublished(row) and content(row).target.kind == 'diff' then candidates[#candidates + 1] = content(row).id end end end
@@ -2525,6 +2675,24 @@ local function complete(lead, line)
 end
 
 function M.register()
+  api.nvim_create_autocmd({ 'TextChanged', 'TextChangedI', 'BufWritePost' }, { callback = function(event)
+    for _, repository in pairs(repositories) do
+      for _, state in pairs(repository.sessions) do
+        local context, pane = state.diff_context, state.diff_panes and state.diff_panes.right
+        local win = state.diff_windows and state.diff_windows.right
+        if context and pane and pane.kind == 'local' and valid(win) and api.nvim_win_get_buf(win) == event.buf and not state.diff_update then
+          state.diff_update = true
+          vim.schedule(function()
+            state.diff_update = nil
+            if state.diff_context ~= context or not valid(win) or api.nvim_win_get_buf(win) ~= event.buf then return end
+            api.nvim_win_call(win, function() vim.cmd('diffupdate') end)
+            local middle = state.diff_windows.middle
+            if valid(middle) then comment_diff.highlight(api.nvim_win_get_buf(middle), context.code, local_text(event.buf)) end
+          end)
+        end
+      end
+    end
+  end })
   api.nvim_create_autocmd('FocusGained', { callback = function()
     local meta = buffers[api.nvim_get_current_buf()]
     if meta and meta.kind == 'home' then refresh_checkout(meta.state) end

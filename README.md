@@ -42,8 +42,7 @@ Use `:Review pr master` to review the current branch against `master` before a
 GitHub PR exists. The command reuses an existing open PR for that exact source/
 target repository and branch pair, or creates a local PR intent before opening
 its review session. Existing session routing still creates, resumes or offers
-unfinished batches. Only committed changes enter the pinned diff; staged and
-unstaged source edits stay outside it.
+unfinished batches. The review comparison follows checked-out Git `HEAD`.
 The base must name an available local branch; fetch/create it first when absent.
 
 For a local intent, Enter on the home title opens a Markdown composer: first
@@ -51,7 +50,7 @@ line is the PR title, the rest its body. `:w` and `:wq` save locally. Publishing
 reuses a matching open PR or creates a draft PR, then sends the selected review
 changes. Push the reviewed commits with ordinary Git/Fugitive first; the plugin
 does not push them. Binding preserves logical PR, session and draft IDs plus
-comparison pins. A PR creation result survives later comment failures/restarts.
+saved comment anchors. A PR creation result survives later comment failures/restarts.
 Conflicting existing local PR identities block binding and retain both sessions.
 
 PR browsing leaves your checkout unchanged. Home shows the local branch, its
@@ -62,11 +61,16 @@ changes, choose Cancel, Stash & switch, or Carry changes & switch. Stashes are
 ordinary named Git stashes; restore them through Git or Fugitive. Stashing includes
 untracked files but excludes `.review/` and ignored files. Existing local commits
 are preserved; successful checkout reloads unmodified source buffers. Review
-sessions and comparison pins stay fixed. Checkout orchestration belongs to Lua;
-Rust supplies its remote PR source metadata alongside review state.
+sessions and saved comment anchors stay fixed. Reopen the diff to read the new
+checkout. Checkout orchestration belongs to Lua; Rust supplies its remote PR
+source metadata alongside review state.
 
 Use `:Review start` to make new inline comments part of a WIP review. Enter on a
-file opens the immutable base/head diff; Enter on code opens its existing-thread
+file opens the committed base/`HEAD` diff. When that file has local edits, the
+right pane opens the ordinary editable file instead. Press `o` in a review diff
+to switch its right pane to **Local**, including a clean file. Local mode stays
+editable until the diff is reopened. Commit changes and reopen before creating
+comments; unpushed commits are allowed locally. Enter on code opens its existing-thread
 list, including a single thread, and does nothing when there are no threads.
 Enter on a list entry opens its discussion. `a` on code or in the location's
 thread list starts a new thread; `a` in a discussion replies to its root,
@@ -108,10 +112,13 @@ Current-comparison Base/Head winbars show `[viewed]` or `[unviewed]` beside the
 file path. Both panes update after `s`/`u` from staged local progress without
 publishing, preserving their revision/path labels. Historical winbars retain
 their existing labels.
+Local viewed changes record their commit. Later commits touching that file make
+the mark ineffective for both display and publication; its saved event remains.
+Checking out the earlier commit and reopening restores the mark.
 
 Overview file rows show `M +12 -3  path`: modified, added (`A`) or deleted (`D`),
 with added/removed line counts. Renames, copies and type changes use `M`.
-Status and counts use theme colors. Stats describe the pinned comparison;
+Status and counts use theme colors. Stats describe the checked-out comparison;
 unavailable cached counts show `?`.
 
 In Review buffers, `]f`/`[f` navigate unviewed files and `]r`/`[r` navigate Todo
@@ -141,17 +148,23 @@ do additional windows opened manually.
 Internal pane changes preserve the jumplist; ordinary user motions still record
 jumps normally.
 
-Comment navigation opens the relevant code in both diff panes. Historical comments
-show the referenced historical file on the left and its latest fetched PR-head
-version on the right, with the thread below. This shows changes since the comment,
-including renames; a deleted current file has an empty right pane labelled absent.
-Winbars show Historical / PR head and commit SHAs. Verified comment ranges are
-highlighted on the left. Unknown original base-side context is labelled
+Comment navigation always shows the recorded comment version, with up to three
+panes: original base, commented version, and checked-out `HEAD`. Adjacent panes
+contract when their file diff is empty; the commented version and its anchor stay
+visible even when both surrounding panes contract. Different commit IDs alone do
+not require separate panes. A comment on `HEAD` normally needs only its original
+base and commented version. File navigation restores the ordinary base/`HEAD`
+comparison, using the editable local file on the right when it has local edits.
+The commented version shows additions relative to its original base in green and
+lines removed toward checked-out `HEAD` in red. Red takes precedence when a
+line was both added and later removed. Replies use their root's original anchor;
+GitHub's relocated current anchor never replaces the recorded version.
+Winbars identify each version, commit and path. Renames are followed; absent files
+stay distinct from empty files. Unknown original base-side context is labelled
 Reconstructed and its lines are never guessed. Missing history shows the recorded
-hunk above the thread. Current-comment/file navigation restores the pinned
-comparison.
-Historical code is a reference: replies and Done work in the thread, while new
-inline comments and file-viewed marks require current code.
+hunk above the thread. Historical code remains a reference: replies and Done work
+in the thread, while new inline comments and file-viewed marks require current
+code.
 PR-wide comments open their discussion without changing code.
 Readers reuse stable numbered buffers during navigation. A manual split keeps
 its existing target; navigation uses another slot when needed. Composers remain
@@ -193,8 +206,12 @@ alongside writes. Local actions never wait for that network fetch.
 
 The selected session and saved drafts persist in the repository root's
 `.review/state.sqlite3`. Refresh preserves local intent, reports conflicts and
-never moves saved anchors or the pinned comparison implicitly. Commands,
-`<Plug>` mappings, composer behavior and original-context navigation are
+never moves saved comment anchors. PR refresh runs `git fetch --all`, then reads
+the checked-out `HEAD`; fetching never pulls or switches branches. Review shows
+`not at remote head` when `HEAD` differs from the fetched PR head, alongside
+remote commits absent locally. Publish rejects that mismatch before API writes.
+Push or update your checkout with ordinary Git, reopen and inspect, then retry.
+Commands, `<Plug>` mappings, composer behavior and original-context navigation are
 documented in `:help buf-review` (generate help tags with `:helptags` for a manual
 runtime-path installation). [SPEC.md](SPEC.md) records the complete UX contract.
 
@@ -269,14 +286,14 @@ later refreshes run in the background. Hidden readers rebuild when displayed,
 so local actions redraw only visible review buffers.
 
 Selection runs `{"op":"fetch_objects","workspace":"BATCH-ID"}` before showing
-review objects. Rust prepares pinned base/head history and latest fetched PR head
+review objects. Rust prepares checked-out `HEAD`, its review base and latest fetched PR head
 first, then batch-checks all original comment commits in Git's local object
 database. Any remaining missing hashes fetch together. Already-local commits need
 no network, including
 commits outside current branch history. Later refreshes prepare newly discovered
 hashes while the existing view remains usable. Unavailable historical hashes
 produce explicit warnings and retain the recorded-hunk fallback; unavailable
-current pins produce an error. Git-object preparation never changes the current branch,
+current comparison commits produce an error. Git-object preparation never changes the current branch,
 worktree, index, refs or FETCH_HEAD.
 
 Git stores file contents; SQLite retains snapshots, anchors and publication
@@ -367,8 +384,8 @@ legacy inline comments into the review. `submit` is rejected.
 | `pr batch new <review-id>` | New batch ID, plain text |
 | `pr batch list <review-id>` | JSON array of batch IDs |
 | `pr batch open <batch-id>` | JSON batch and its complete ordered event log |
-| `pr state <batch-id>` | JSON projection of snapshot and the complete event log |
-| `pr plan <batch-id>` | JSON pending net operations, accounting for saved results |
+| `pr state <batch-id>` | JSON projection at Git HEAD, including local events |
+| `pr plan <batch-id>` | JSON pending operations at Git HEAD, accounting for saved results |
 | `pr diff <review-id> [--base <commit>] [--head <commit>] [--path <path>]` | Local Git diff |
 | `pr workspace` | Structured JSON response; reads one request from stdin |
 

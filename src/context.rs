@@ -87,11 +87,44 @@ fn base_path(
 
 /// Prepare current history first; fetch exceptional comment commits together.
 pub fn prepare(store: &mut Store, project: &Path, workspace: &Workspace) -> Result<Value> {
-    let current = [
-        workspace.comparison.base.clone(),
-        workspace.comparison.head.clone(),
+    let mut current = vec![
+        workspace.review.read.pull_request.revision.base.clone(),
+        diff::resolve(project, "HEAD")?,
         workspace.review.read.pull_request.revision.head.clone(),
     ];
+    current.extend(
+        workspace
+            .batch
+            .write
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::SetFileViewed {
+                    commit: Some(commit),
+                    ..
+                } => Some(commit.clone()),
+                _ => None,
+            }),
+    );
+    current.extend(workspace.legacy_viewed_commits.values().cloned());
+    let local = store
+        .pull_request(&workspace.review.read.pull_request.id)?
+        .is_some_and(|pr| matches!(pr.source, PullRequestSource::LocalIntent { .. }));
+    if local {
+        let missing = diff::missing_commits(project, &current)?;
+        if !missing.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "local review commits unavailable: {}; restore Git objects before opening code",
+                missing.join(", ")
+            ))
+            .into());
+        }
+    } else {
+        let backend = store
+            .review_backend(&workspace.review.id)?
+            .ok_or_else(|| std::io::Error::other("workspace has no provider metadata"))?;
+        github::fetch_workspace_commits(project, &current, &backend)?;
+    }
     let mut commits = BTreeSet::new();
     for row in &workspace.view()?.comments {
         let revision = match &row.comment {
@@ -137,17 +170,22 @@ pub fn prepare(store: &mut Store, project: &Path, workspace: &Workspace) -> Resu
             )]);
             response["missing_commits"] = json!(missing);
         }
+        let current = store.prepare_worktree(&workspace.id)?;
+        response["revision"] = json!(current.comparison);
+        response["workspace"] = serde_json::to_value(store.view_workspace(&current)?)?;
         return Ok(response);
     }
     let backend = store
         .review_backend(&workspace.review.id)?
         .ok_or_else(|| std::io::Error::other("workspace has no provider metadata"))?;
-    github::fetch_workspace_commits(project, &current, &backend)?;
     if let Err(error) = github::fetch_workspace_commits(project, &commits, &backend) {
         response["warnings"] = json!([error.to_string()]);
         response["missing_commits"] =
             json!(diff::missing_commits(project, &commits).unwrap_or(commits));
     }
+    let current = store.prepare_worktree(&workspace.id)?;
+    response["revision"] = json!(current.comparison);
+    response["workspace"] = serde_json::to_value(store.view_workspace(&current)?)?;
     Ok(response)
 }
 
@@ -248,7 +286,7 @@ pub fn read(store: &Store, project: &Path, workspace: &Workspace, id: &CommentId
     }))
 }
 
-/// Compare the file referenced by the comment with its latest fetched PR version.
+/// Compare the file referenced by the comment with the selected review head.
 /// Reconstructed deleted-side context remains viewable without claiming an exact anchor.
 pub fn historical_code(
     store: &Store,
@@ -295,7 +333,7 @@ pub fn historical_code(
     if let Some((commit, historical_path, before, provenance)) = source {
         let revision = DiffRevision {
             base: commit.clone(),
-            head: workspace.review.read.pull_request.revision.head.clone(),
+            head: workspace.comparison.head.clone(),
         };
         let Ok(renamed_path) =
             diff::renamed_path(project, &revision, historical_path, DiffSide::Base)
@@ -307,10 +345,18 @@ pub fn historical_code(
             return Ok(response);
         };
         let after = head.as_deref().unwrap_or_default();
-        let binary = before.contains(&0)
-            || after.contains(&0)
-            || std::str::from_utf8(before).is_err()
-            || std::str::from_utf8(after).is_err();
+        let original_base = ctx
+            .comparison
+            .as_ref()
+            .and_then(|pair| Some((pair, ctx.base_path.as_deref()?, ctx.base.as_ref().ok()?)));
+        let binary = [
+            Some(before),
+            Some(after),
+            original_base.and_then(|(_, _, content)| content.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|content| content.contains(&0) || std::str::from_utf8(content).is_err());
         let verified = !binary
             && ctx.anchor.position.range.as_ref().is_some_and(|range| {
                 let count = if before.is_empty() {
@@ -338,7 +384,16 @@ pub fn historical_code(
         });
         response["code"] = json!({"path":path,"base_path":historical_path,
             "revision":revision,"base_content":String::from_utf8_lossy(before),"head_content":String::from_utf8_lossy(after),
+            "original_base":original_base.map(|(pair, path, content)| json!({
+                "commit":pair.revision.base,"path":path,
+                "content":String::from_utf8_lossy(content.as_deref().unwrap_or_default()),
+                "missing":content.is_none(),"provenance":pair.provenance,
+            })),
             "binary":binary,"historical":true,"provenance":provenance,"location":location,"head_missing":head.is_none()});
+        if workspace.worktree_context {
+            response["code"]["local_path"] = json!(std::fs::canonicalize(project)?.join(path));
+            response["code"]["local_dirty"] = json!(diff::local_changes(project, path)?);
+        }
         response["message"] = Value::Null;
     }
     Ok(response)
@@ -361,7 +416,10 @@ pub fn code(project: &Path, workspace: &Workspace, path: &str) -> Result<Value> 
         || head.contains(&0)
         || std::str::from_utf8(&base).is_err()
         || std::str::from_utf8(&head).is_err();
-    Ok(
-        json!({"path":path,"revision":workspace.comparison,"base_content":String::from_utf8_lossy(&base),"head_content":String::from_utf8_lossy(&head),"binary":binary}),
-    )
+    let mut code = json!({"path":path,"revision":workspace.comparison,"base_content":String::from_utf8_lossy(&base),"head_content":String::from_utf8_lossy(&head),"binary":binary});
+    if workspace.worktree_context {
+        code["local_path"] = json!(std::fs::canonicalize(project)?.join(path));
+        code["local_dirty"] = json!(diff::local_changes(project, path)?);
+    }
+    Ok(code)
 }

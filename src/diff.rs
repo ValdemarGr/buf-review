@@ -1,10 +1,11 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::Write,
     path::Path,
     process::{Command, Output, Stdio},
 };
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{ChangedFile, DiffRevision, DiffSide, FileChange, FileStats};
@@ -15,6 +16,152 @@ pub enum DiffError {
     Io(#[from] std::io::Error),
     #[error("git: {0}")]
     Git(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitSummary {
+    pub id: String,
+    pub subject: String,
+}
+
+/// Report index or working-tree changes for a literal repository path.
+pub fn local_changes(project_root: &Path, path: &str) -> Result<bool, DiffError> {
+    let output = checked(
+        Command::new("git")
+            .current_dir(project_root)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args([
+                "--literal-pathspecs",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                path,
+            ])
+            .output()?,
+    )?;
+    Ok(!output.stdout.is_empty())
+}
+
+/// Update remote tracking refs without changing the index or working tree.
+pub fn fetch_all(project_root: &Path) -> Result<(), DiffError> {
+    checked(
+        Command::new("git")
+            .current_dir(project_root)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["fetch", "--all"])
+            .output()?,
+    )?;
+    Ok(())
+}
+
+/// List fetched commits not reachable from the selected comparison head.
+pub fn missing_commits_summary(
+    project_root: &Path,
+    selected_head: &str,
+    fetched_head: &str,
+) -> Result<Vec<CommitSummary>, DiffError> {
+    let selected = resolve(project_root, selected_head)?;
+    let fetched = resolve(project_root, fetched_head)?;
+    require_complete_history(project_root)?;
+    if selected == fetched {
+        return Ok(Vec::new());
+    }
+    let output = checked(
+        Command::new("git")
+            .current_dir(project_root)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args([
+                "log",
+                "--date-order",
+                "--no-color",
+                "--no-show-signature",
+                "--no-notes",
+                "--format=%H%x00%s",
+                "-z",
+                &format!("{selected}..{fetched}"),
+                "--",
+            ])
+            .output()?,
+    )?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| DiffError::Git("commit summaries must be valid UTF-8".into()))?;
+    let mut fields = text.split_terminator('\0');
+    let mut commits = Vec::new();
+    while let Some(id) = fields.next() {
+        let subject = fields
+            .next()
+            .ok_or_else(|| DiffError::Git("incomplete commit summary from Git".into()))?;
+        commits.push(CommitSummary {
+            id: id.into(),
+            subject: subject.into(),
+        });
+    }
+    Ok(commits)
+}
+
+/// Keep paths untouched by commits unique to either head. Unlike a tree diff,
+/// this detects changes followed by reverts and works in either direction.
+pub fn unchanged_paths(
+    project_root: &Path,
+    marked_head: &str,
+    selected_head: &str,
+    paths: &[String],
+) -> Result<BTreeSet<String>, DiffError> {
+    let marked = resolve(project_root, marked_head)?;
+    let selected = resolve(project_root, selected_head)?;
+    require_complete_history(project_root)?;
+    if marked == selected {
+        return Ok(paths.iter().cloned().collect());
+    }
+    let output = checked(
+        Command::new("git")
+            .current_dir(project_root)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args([
+                "log",
+                "--full-history",
+                "--root",
+                "-m",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--no-show-signature",
+                "--no-notes",
+                "--format=",
+                "--name-only",
+                "-z",
+                &format!("{marked}...{selected}"),
+                "--",
+            ])
+            .output()?,
+    )?;
+    let changed: HashSet<_> = output.stdout.split(|byte| *byte == 0).collect();
+    Ok(paths
+        .iter()
+        .filter(|path| !changed.contains(path.as_bytes()))
+        .cloned()
+        .collect())
+}
+
+fn require_complete_history(project_root: &Path) -> Result<(), DiffError> {
+    let output = checked(
+        Command::new("git")
+            .current_dir(project_root)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args(["rev-parse", "--is-shallow-repository"])
+            .output()?,
+    )?;
+    if output.stdout == b"false\n" {
+        Ok(())
+    } else {
+        Err(DiffError::Git(
+            "complete Git history required; fetch missing history before evaluating viewed changes"
+                .into(),
+        ))
+    }
 }
 
 /// Makes the pinned commits available without checking out files or updating refs.
@@ -370,7 +517,7 @@ pub fn renamed_path(
     Ok(None)
 }
 
-fn resolve(project_root: &Path, revision: &str) -> Result<String, DiffError> {
+pub fn resolve(project_root: &Path, revision: &str) -> Result<String, DiffError> {
     let output = checked(
         Command::new("git")
             .current_dir(project_root)

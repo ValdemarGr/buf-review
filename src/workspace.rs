@@ -62,6 +62,12 @@ pub struct PublicationAttempt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
+    #[serde(skip)]
+    pub project_root: Option<std::path::PathBuf>,
+    #[serde(skip)]
+    pub worktree_context: bool,
+    #[serde(skip)]
+    pub legacy_viewed_commits: BTreeMap<usize, String>,
     pub id: String,
     #[serde(default)]
     pub locator: Option<String>,
@@ -125,6 +131,8 @@ pub struct View {
     pub conflicts: Vec<Conflict>,
     pub last_error: Option<String>,
     pub new_commits: bool,
+    pub unpulled_commits: Vec<crate::diff::CommitSummary>,
+    pub comparison_error: Option<String>,
     pub saved_comment: Option<CommentId>,
     pub attempt: Option<PublicationAttempt>,
     pub suspended_attempts: Vec<PublicationAttempt>,
@@ -246,6 +254,9 @@ impl Workspace {
     pub fn new(review: Review) -> Self {
         let id = Uuid::new_v4().to_string();
         Self {
+            project_root: None,
+            worktree_context: false,
+            legacy_viewed_commits: BTreeMap::new(),
             comparison: review.read.pull_request.revision.clone(),
             comparison_files: review.read.files.clone(),
             batch: Batch {
@@ -272,6 +283,50 @@ impl Workspace {
             chronology: BTreeMap::new(),
             rejected_anchors: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn use_worktree(&mut self) -> Result<(), WorkspaceError> {
+        let project = self
+            .project_root
+            .as_deref()
+            .ok_or_else(|| WorkspaceError::Invalid("workspace has no Git working tree".into()))?;
+        let revision = DiffRevision {
+            base: self.review.read.pull_request.revision.base.clone(),
+            head: crate::diff::resolve(project, "HEAD")
+                .map_err(|error| WorkspaceError::Invalid(error.to_string()))?,
+        };
+        let files = crate::diff::files(project, &revision)
+            .map_err(|error| WorkspaceError::Invalid(error.to_string()))?;
+        self.comparison = revision;
+        self.comparison_files = files;
+        self.worktree_context = true;
+        Ok(())
+    }
+
+    fn committed_line_source(&self, location: &DiffLocation) -> Result<(), WorkspaceError> {
+        if self.worktree_context && location.position.range.is_some() {
+            let project = self.project_root.as_deref().ok_or_else(|| {
+                WorkspaceError::Invalid("workspace has no Git working tree".into())
+            })?;
+            if crate::diff::resolve(project, "HEAD")
+                .map_err(|error| WorkspaceError::Invalid(error.to_string()))?
+                != location.revision.head
+            {
+                return Err(WorkspaceError::Invalid(
+                    "HEAD changed; reopen the diff before commenting".into(),
+                ));
+            }
+            if location.position.range.as_ref().is_some_and(|range| {
+                range.start.side == DiffSide::Head || range.end.side == DiffSide::Head
+            }) && crate::diff::local_changes(project, &location.position.path)
+                .map_err(|error| WorkspaceError::Invalid(error.to_string()))?
+            {
+                return Err(WorkspaceError::Invalid(
+                    "local changes cannot anchor line comments; commit and reopen the diff".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Missing conflicted resources are retained only in the local projection.
@@ -306,9 +361,77 @@ impl Workspace {
         review
     }
 
-    pub fn pending(&self) -> Result<CommitState, WorkspaceError> {
-        let mut plan =
-            core::prepare_ordered(&self.projection_review(), &self.batch, &self.completed)?;
+    /// Derive effective local changes once for presentation and publication.
+    pub fn get_unpublished(&self) -> Result<(core::ProjectedState, CommitState), WorkspaceError> {
+        let review = self.projection_review();
+        let paths = review
+            .read
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut excluded = BTreeSet::new();
+        let mut local = BTreeMap::<String, Vec<(usize, String)>>::new();
+        for (index, event) in self.batch.write.events.iter().enumerate() {
+            let Event::SetFileViewed { path, commit, .. } = event else {
+                continue;
+            };
+            if !paths.contains(path.as_str()) {
+                excluded.insert(index);
+                continue;
+            }
+            if self.has_result(&core::operation_at(&self.batch, index + 1, event.clone()).id) {
+                continue;
+            }
+            let head = commit
+                .as_ref()
+                .or_else(|| self.legacy_viewed_commits.get(&index))
+                .or_else(|| {
+                    (self.project_root.is_none()
+                        && self.comparison == self.review.read.pull_request.revision)
+                        .then_some(&self.comparison.head)
+                })
+                .ok_or_else(|| WorkspaceError::Invalid("viewed mark commit unavailable".into()))?;
+            if head != &self.comparison.head {
+                local
+                    .entry(head.clone())
+                    .or_default()
+                    .push((index, path.clone()));
+            }
+        }
+        for (head, marks) in local {
+            let project = self.project_root.as_deref().ok_or_else(|| {
+                WorkspaceError::Invalid("Git history unavailable for local viewed changes".into())
+            })?;
+            let paths = marks
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect::<Vec<_>>();
+            let unchanged =
+                crate::diff::unchanged_paths(project, &head, &self.comparison.head, &paths)
+                    .map_err(|error| WorkspaceError::Invalid(error.to_string()))?;
+            excluded.extend(
+                marks
+                    .into_iter()
+                    .filter_map(|(index, path)| (!unchanged.contains(&path)).then_some(index)),
+            );
+        }
+        let sources = (0..self.batch.write.events.len())
+            .filter(|index| !excluded.contains(index))
+            .collect::<Vec<_>>();
+        let mut batch = self.batch.clone();
+        batch.write.events = sources
+            .iter()
+            .map(|index| self.batch.write.events[*index].clone())
+            .collect();
+        let completed = self.completed.iter().filter(|operation| !matches!(&operation.change, Event::SetFileViewed { path, .. } if !paths.contains(path.as_str()))).cloned().collect::<Vec<_>>();
+        let projected = core::project(&review, &batch)?;
+        let mut plan = core::prepare_ordered(&review, &batch, &completed)?;
+        // Filtering must not renumber surviving event identities.
+        for operation in &mut plan.operations {
+            let source = sources[core::operation_source(&batch, &operation.change)? - 1] + 1;
+            *operation = core::operation_at(&self.batch, source, operation.change.clone());
+        }
         if self
             .wip
             .as_ref()
@@ -318,7 +441,11 @@ impl Workspace {
             plan.operations
                 .retain(|operation| !matches!(operation.change, Event::SetReviewConclusion { .. }));
         }
-        Ok(plan)
+        Ok((projected, plan))
+    }
+
+    pub fn pending(&self) -> Result<CommitState, WorkspaceError> {
+        self.get_unpublished().map(|(_, pending)| pending)
     }
 
     fn attempts(&self) -> impl Iterator<Item = &PublicationAttempt> {
@@ -356,7 +483,7 @@ impl Workspace {
     }
 
     pub fn projected(&self) -> Result<core::ProjectedState, WorkspaceError> {
-        Ok(core::project(&self.projection_review(), &self.batch)?)
+        self.get_unpublished().map(|(projected, _)| projected)
     }
 
     fn find(&self, id: &CommentId) -> Result<ProjectedComment, WorkspaceError> {
@@ -738,7 +865,12 @@ impl Workspace {
                     CommentTarget::Diff(location) => {
                         if location.revision != self.comparison {
                             return Err(WorkspaceError::Invalid(
-                                "new comment must use the pinned comparison".into(),
+                                if self.worktree_context {
+                                    "HEAD changed; reopen the diff before commenting"
+                                } else {
+                                    "new comment must use the pinned comparison"
+                                }
+                                .into(),
                             ));
                         }
                         if !self
@@ -750,6 +882,7 @@ impl Workspace {
                                 "comment path is not in the comparison".into(),
                             ));
                         }
+                        self.committed_line_source(location)?;
                     }
                 }
                 if style == Destination::Review {
@@ -925,7 +1058,11 @@ impl Workspace {
                     .find(|f| f.path == path)
                     .ok_or_else(|| CoreError::MissingFile(path.clone()))?;
                 if previous.viewed != viewed {
-                    self.append(Event::SetFileViewed { path, viewed })?;
+                    self.append(Event::SetFileViewed {
+                        path,
+                        viewed,
+                        commit: Some(self.comparison.head.clone()),
+                    })?;
                 }
             }
             Action::Reaction { comment, present } => {
@@ -973,13 +1110,6 @@ impl Workspace {
             Action::CompareLatest => {
                 self.comparison = self.review.read.pull_request.revision.clone();
                 self.comparison_files = self.review.read.files.clone();
-                let paths = self
-                    .comparison_files
-                    .iter()
-                    .map(|f| f.path.as_str())
-                    .collect::<BTreeSet<_>>();
-                self.batch.write.events.retain(|e|!matches!(e,Event::SetFileViewed{path,..} if !paths.contains(path.as_str())));
-                self.completed.retain(|op|!matches!(&op.change,Event::SetFileViewed{path,..} if !paths.contains(path.as_str())));
             }
             Action::Relocate { comment, location } => {
                 self.unsent_comment(&comment)?;
@@ -1002,6 +1132,7 @@ impl Workspace {
                         "relocation path is not in the comparison".into(),
                     ));
                 }
+                self.committed_line_source(&location)?;
                 self.owned(&comment)?;
                 let event = self
                     .batch
@@ -1462,8 +1593,8 @@ impl Workspace {
     }
 
     pub fn view(&self) -> Result<View, WorkspaceError> {
-        let projected = self.projected()?;
-        let pending = self.pending()?.operations;
+        let (projected, pending) = self.get_unpublished()?;
+        let pending = pending.operations;
         let mut comments = projected.comments;
         let deleted = pending
             .iter()
@@ -1699,7 +1830,9 @@ impl Workspace {
             done,
             conflicts: self.conflicts.values().cloned().collect(),
             last_error: self.last_error.clone(),
-            new_commits: self.review.read.pull_request.revision != self.comparison,
+            new_commits: self.review.read.pull_request.revision.head != self.comparison.head,
+            unpulled_commits: vec![],
+            comparison_error: None,
             saved_comment: self.saved_comment.clone(),
             attempt: self.attempt.clone(),
             suspended_attempts: self.suspended_attempts.clone(),
@@ -1786,7 +1919,25 @@ impl Workspace {
             .iter()
             .map(|op| op.change.clone())
             .collect::<Vec<_>>();
+        let viewed = self
+            .batch
+            .write
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(index, event)| {
+                matches!(event, Event::SetFileViewed { .. })
+                    && !self.has_result(
+                        &core::operation_at(&self.batch, index + 1, (*event).clone()).id,
+                    )
+            })
+            .map(|(index, event)| (index + 1, event.clone()))
+            .collect::<Vec<_>>();
+        let mut viewed_sources = viewed.iter().map(|(index, _)| *index);
         for op in pending {
+            if matches!(op.change, Event::SetFileViewed { .. }) {
+                continue;
+            }
             match &op.change {
                 Event::EditComment { comment, body } => {
                     if let Some(new) = remote.get(comment)
@@ -1860,7 +2011,11 @@ impl Workspace {
             }
             events.push(op.change);
         }
+        events.extend(viewed.iter().map(|(_, event)| event.clone()));
         for event in progress.into_values() {
+            if matches!(event, Event::SetFileViewed { .. }) {
+                continue;
+            }
             if matches!(&event,Event::SetCommentReaction{comment,..} if !remote.contains_key(comment))
             {
                 continue;
@@ -1870,7 +2025,16 @@ impl Workspace {
         // Preserve interleaving as well as creation chronology when rebasing intent.
         let mut events = events
             .into_iter()
-            .map(|event| Ok((core::operation_source(&self.batch, &event)?, event)))
+            .map(|event| {
+                let source = if matches!(event, Event::SetFileViewed { .. }) {
+                    viewed_sources
+                        .next()
+                        .expect("retained viewed event has source")
+                } else {
+                    core::operation_source(&self.batch, &event)?
+                };
+                Ok((source, event))
+            })
             .collect::<Result<Vec<_>, CoreError>>()?;
         events.sort_by_key(|(source, event)| {
             (matches!(event, Event::SetReviewConclusion { .. }), *source)

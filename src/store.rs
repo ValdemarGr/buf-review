@@ -89,9 +89,40 @@ pub struct WorkspaceActions {
 pub struct Store {
     connection: Connection,
     directory: PathBuf,
+    worktree_context: bool,
 }
 
 impl Store {
+    /// Use checked-out Git HEAD for canonical operations without rewriting saved history.
+    pub fn enable_worktree_context(&mut self) {
+        self.worktree_context = true;
+    }
+
+    /// Prepare only a missing current base before enabling working-tree operations.
+    pub fn prepare_worktree(
+        &mut self,
+        id: &str,
+    ) -> Result<crate::workspace::Workspace, StoreError> {
+        let workspace = Self::read_workspace(&self.connection, id, self.project_root(), false)?
+            .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()))?;
+        crate::diff::resolve(self.project_root(), "HEAD")
+            .map_err(|error| crate::workspace::WorkspaceError::Invalid(error.to_string()))?;
+        let commits = [workspace.review.read.pull_request.revision.base.clone()];
+        if !crate::diff::missing_commits(self.project_root(), &commits)
+            .map_err(|error| crate::workspace::WorkspaceError::Invalid(error.to_string()))?
+            .is_empty()
+        {
+            let backend = self.review_backend(&workspace.review.id)?.ok_or_else(|| {
+                crate::workspace::WorkspaceError::Invalid("current base commit unavailable".into())
+            })?;
+            crate::github::fetch_workspace_commits(self.project_root(), &commits, &backend)
+                .map_err(|error| crate::workspace::WorkspaceError::Invalid(error.to_string()))?;
+        }
+        self.enable_worktree_context();
+        self.workspace(id)?
+            .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()).into())
+    }
+
     pub fn project_root(&self) -> &Path {
         self.directory
             .parent()
@@ -161,6 +192,7 @@ impl Store {
         Ok(Self {
             connection,
             directory,
+            worktree_context: false,
         })
     }
 
@@ -1244,8 +1276,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut workspace = Self::read_workspace(&transaction, &id.0)?
-            .ok_or_else(|| StoreError::BatchNotFound(id.clone()))?;
+        let mut workspace = Self::read_workspace(
+            &transaction,
+            &id.0,
+            self.directory.parent().unwrap(),
+            self.worktree_context,
+        )?
+        .ok_or_else(|| StoreError::BatchNotFound(id.clone()))?;
         if workspace.attempt.is_some() || !workspace.suspended_attempts.is_empty() {
             return Err(crate::workspace::WorkspaceError::Invalid(
                 "reconcile publication before staging raw events".into(),
@@ -1337,8 +1374,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut workspace = Self::read_workspace(&transaction, &batch.0)?
-            .ok_or_else(|| StoreError::BatchNotFound(batch.clone()))?;
+        let mut workspace = Self::read_workspace(
+            &transaction,
+            &batch.0,
+            self.directory.parent().unwrap(),
+            self.worktree_context,
+        )?
+        .ok_or_else(|| StoreError::BatchNotFound(batch.clone()))?;
         if workspace.has_result(&operation.id) {
             return Err(rusqlite::Error::InvalidQuery.into());
         }
@@ -1367,6 +1409,8 @@ impl Store {
     fn read_workspace(
         connection: &Connection,
         id: &str,
+        project: &Path,
+        worktree_context: bool,
     ) -> Result<Option<crate::workspace::Workspace>, StoreError> {
         let id = Self::canonical_batch(connection, &BatchId(id.into()))?;
         connection
@@ -1385,13 +1429,116 @@ impl Store {
                 workspace.review = Self::read_review(connection, &workspace.batch.review)?
                     .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
                 Self::load_summary_ids(connection, &mut workspace)?;
+                workspace.project_root = Some(project.to_path_buf());
+                if workspace
+                    .batch
+                    .write
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::SetFileViewed { commit: None, .. }))
+                {
+                    let history = Self::history_states(connection, &id.0, None)?;
+                    let mut previous = Vec::<(String, bool, Option<String>)>::new();
+                    let mut previous_batch = None;
+                    for row in history {
+                        let batch = (
+                            row.state["batch"].clone(),
+                            row.state["event_count"].clone(),
+                            row.state["event_value"].clone(),
+                        );
+                        if previous_batch.as_ref() == Some(&batch) {
+                            continue;
+                        }
+                        previous_batch = Some(batch);
+                        let saved = Self::hydrate_workspace(connection, row.state)?;
+                        let mut offset = 0;
+                        let viewed = saved
+                            .batch
+                            .write
+                            .events
+                            .iter()
+                            .filter_map(|event| {
+                                let Event::SetFileViewed {
+                                    path,
+                                    viewed,
+                                    commit,
+                                } = event
+                                else {
+                                    return None;
+                                };
+                                let retained = previous[offset..].iter().position(
+                                    |(old_path, old_viewed, _)| {
+                                        old_path == path && old_viewed == viewed
+                                    },
+                                );
+                                let retained = retained.map(|index| {
+                                    offset += index + 1;
+                                    previous[offset - 1].2.clone()
+                                });
+                                let head = commit.clone().or_else(|| {
+                                    if let Some(head) = retained {
+                                        head
+                                    } else if row.action["action"] == "viewed"
+                                        && row.action["path"] == *path
+                                        && row.action["viewed"] == *viewed
+                                    {
+                                        Some(saved.comparison.head.clone())
+                                    } else if saved.comparison.head
+                                        == saved.review.read.pull_request.revision.head
+                                    {
+                                        Some(saved.comparison.head.clone())
+                                    } else {
+                                        None
+                                    }
+                                });
+                                Some((path.clone(), *viewed, head))
+                            })
+                            .collect();
+                        previous = viewed;
+                    }
+                    let mut offset = 0;
+                    for (index, event) in workspace.batch.write.events.iter().enumerate() {
+                        let Event::SetFileViewed {
+                            path,
+                            viewed,
+                            commit: None,
+                        } = event
+                        else {
+                            continue;
+                        };
+                        let head = previous[offset..]
+                            .iter()
+                            .position(|(old_path, old_viewed, _)| {
+                                old_path == path && old_viewed == viewed
+                            })
+                            .map(|position| {
+                                offset += position + 1;
+                                previous[offset - 1].2.clone()
+                            });
+                        if let Some(head) = head.unwrap_or_else(|| {
+                            (workspace.comparison.head
+                                == workspace.review.read.pull_request.revision.head)
+                                .then(|| workspace.comparison.head.clone())
+                        }) {
+                            workspace.legacy_viewed_commits.insert(index, head);
+                        }
+                    }
+                }
+                if worktree_context {
+                    workspace.use_worktree()?;
+                }
                 Ok(workspace)
             })
             .transpose()
     }
 
     pub fn workspace(&self, id: &str) -> Result<Option<crate::workspace::Workspace>, StoreError> {
-        Self::read_workspace(&self.connection, id)
+        Self::read_workspace(
+            &self.connection,
+            id,
+            self.project_root(),
+            self.worktree_context,
+        )
     }
 
     pub fn workspace_at_generation(
@@ -1477,8 +1624,13 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
             .map(|id| {
-                Self::read_workspace(&self.connection, &id)?
-                    .ok_or(rusqlite::Error::QueryReturnedNoRows.into())
+                Self::read_workspace(
+                    &self.connection,
+                    &id,
+                    self.project_root(),
+                    self.worktree_context,
+                )?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows.into())
             })
             .collect()
     }
@@ -1490,8 +1642,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let workspace = Self::read_workspace(&transaction, &id.0)?
-            .ok_or_else(|| StoreError::BatchNotFound(id.clone()))?;
+        let workspace = Self::read_workspace(
+            &transaction,
+            &id.0,
+            self.directory.parent().unwrap(),
+            self.worktree_context,
+        )?
+        .ok_or_else(|| StoreError::BatchNotFound(id.clone()))?;
         Self::select_workspace(&transaction, &workspace)?;
         transaction.commit()?;
         Ok(workspace)
@@ -1529,8 +1686,13 @@ impl Store {
         };
         let mut candidates = Vec::new();
         for id in ids {
-            let workspace = Self::read_workspace(&transaction, &id)?
-                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            let workspace = Self::read_workspace(
+                &transaction,
+                &id,
+                self.directory.parent().unwrap(),
+                self.worktree_context,
+            )?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
             if workspace.is_unfinished()? {
                 candidates.push(workspace);
             }
@@ -1656,8 +1818,13 @@ impl Store {
         action: &Value,
     ) -> Result<(), StoreError> {
         use crate::workspace::WorkspaceError;
-        let actual = Self::read_workspace(connection, &workspace.id)?
-            .ok_or_else(|| WorkspaceError::NotFound(workspace.id.clone()))?;
+        let actual = Self::read_workspace(
+            connection,
+            &workspace.id,
+            workspace.project_root.as_deref().unwrap_or(Path::new(".")),
+            workspace.worktree_context,
+        )?
+        .ok_or_else(|| WorkspaceError::NotFound(workspace.id.clone()))?;
         if actual.generation != expected {
             return Err(WorkspaceError::StaleGeneration {
                 expected,
@@ -1770,8 +1937,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut workspace = Self::read_workspace(&transaction, id)?
-            .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()))?;
+        let mut workspace = Self::read_workspace(
+            &transaction,
+            id,
+            self.directory.parent().unwrap(),
+            self.worktree_context,
+        )?
+        .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()))?;
         if workspace.generation != generation {
             return Err(crate::workspace::WorkspaceError::StaleGeneration {
                 expected: generation,
@@ -1844,8 +2016,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut workspace = Self::read_workspace(&transaction, id)?
-            .ok_or_else(|| WorkspaceError::NotFound(id.into()))?;
+        let mut workspace = Self::read_workspace(
+            &transaction,
+            id,
+            self.directory.parent().unwrap(),
+            self.worktree_context,
+        )?
+        .ok_or_else(|| WorkspaceError::NotFound(id.into()))?;
         if workspace.generation != generation {
             return Err(WorkspaceError::StaleGeneration {
                 expected: generation,
@@ -2006,8 +2183,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut workspace = Self::read_workspace(&transaction, id)?
-            .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()))?;
+        let mut workspace = Self::read_workspace(
+            &transaction,
+            id,
+            self.directory.parent().unwrap(),
+            self.worktree_context,
+        )?
+        .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()))?;
         if workspace
             .attempt
             .as_ref()
@@ -2042,7 +2224,26 @@ impl Store {
         &self,
         workspace: &crate::workspace::Workspace,
     ) -> Result<crate::workspace::View, StoreError> {
+        let mut runtime;
+        let workspace = if self.worktree_context && !workspace.worktree_context {
+            runtime = workspace.clone();
+            runtime.project_root = Some(self.project_root().to_path_buf());
+            runtime.use_worktree()?;
+            &runtime
+        } else {
+            workspace
+        };
         let mut view = workspace.view()?;
+        if view.new_commits {
+            match crate::diff::missing_commits_summary(
+                self.project_root(),
+                &workspace.comparison.head,
+                &workspace.review.read.pull_request.revision.head,
+            ) {
+                Ok(commits) => view.unpulled_commits = commits,
+                Err(error) => view.comparison_error = Some(error.to_string()),
+            }
+        }
         view.pr =
             Self::read_pull_request(&self.connection, &workspace.review.read.pull_request.id)?;
         view.publications = self
@@ -2051,6 +2252,59 @@ impl Store {
             .map(|detail| detail.summary)
             .collect();
         Ok(view)
+    }
+
+    /// Select an earlier recorded comparison without rebasing local intent.
+    pub fn compare_saved(
+        &mut self,
+        id: &str,
+        generation: u64,
+        commit: &str,
+    ) -> Result<crate::workspace::Workspace, StoreError> {
+        let workspace = self
+            .workspace(id)?
+            .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()))?;
+        if workspace.generation != generation {
+            return Err(crate::workspace::WorkspaceError::StaleGeneration {
+                expected: generation,
+                actual: workspace.generation,
+            }
+            .into());
+        }
+        if commit.is_empty() {
+            return Err(crate::workspace::WorkspaceError::Invalid(
+                "comparison commit is required".into(),
+            )
+            .into());
+        }
+        let mut comparisons = Vec::new();
+        for row in self.batch_history(&workspace.batch.id)? {
+            if row.state.comparison.head.starts_with(commit)
+                && !comparisons
+                    .iter()
+                    .any(|(revision, _)| revision == &row.state.comparison)
+            {
+                comparisons.push((row.state.comparison, row.state.comparison_files));
+            }
+        }
+        if comparisons.len() != 1 {
+            return Err(crate::workspace::WorkspaceError::Invalid(
+                if comparisons.is_empty() {
+                    "unknown saved comparison"
+                } else {
+                    "ambiguous saved comparison"
+                }
+                .into(),
+            )
+            .into());
+        }
+        let (revision, files) = comparisons.pop().unwrap();
+        self.update_workspace(id, generation, |workspace| {
+            workspace.comparison = revision.clone();
+            workspace.comparison_files = files;
+            workspace.projected()?;
+            Ok(())
+        })
     }
 
     /// Read only publication lifecycle fields. Routine local saves do not
@@ -2119,8 +2373,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut workspace = Self::read_workspace(&transaction, id)?
-            .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()))?;
+        let mut workspace = Self::read_workspace(
+            &transaction,
+            id,
+            self.directory.parent().unwrap(),
+            self.worktree_context,
+        )?
+        .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()))?;
         if workspace.generation != generation {
             return Err(crate::workspace::WorkspaceError::StaleGeneration {
                 expected: generation,

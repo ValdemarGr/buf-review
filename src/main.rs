@@ -42,9 +42,9 @@ enum Commands {
         #[command(subcommand)]
         command: BatchCommand,
     },
-    /// Project a batch's complete event log over its fetched snapshot.
+    /// Project a batch's event log at checked-out Git HEAD.
     State { batch_id: String },
-    /// Print pending net changes after accounting for successful operations.
+    /// Print pending changes at Git HEAD, accounting for successful operations.
     Plan { batch_id: String },
     /// Print a diff between local commits; defaults to fetched base/head.
     Diff {
@@ -133,15 +133,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             BatchCommand::Open { batch_id } => json(&batch(&mut store, batch_id)?),
         },
         Commands::State { batch_id } => {
-            let workspace = store
-                .workspace(&batch_id)?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "batch does not exist"))?;
+            let workspace = store.prepare_worktree(&batch_id)?;
             json(&workspace.projected()?)
         }
         Commands::Plan { batch_id } => {
-            let workspace = store
-                .workspace(&batch_id)?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "batch does not exist"))?;
+            let workspace = store.prepare_worktree(&batch_id)?;
             json(&workspace.pending()?)
         }
         Commands::Diff {

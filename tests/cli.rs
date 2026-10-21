@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::Write,
     path::Path,
     process::{Command, Output, Stdio},
@@ -84,6 +85,32 @@ fn project() -> tempfile::TempDir {
             .unwrap()
             .success()
     );
+    for (text, tag) in [("base\n", "base"), ("changed\n", "head")] {
+        fs::write(project.path().join("file.rs"), text).unwrap();
+        for arguments in [
+            vec!["add", "file.rs"],
+            vec![
+                "-c",
+                "user.name=Reviewer",
+                "-c",
+                "user.email=reviewer@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                tag,
+            ],
+            vec!["tag", tag],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(arguments)
+                    .current_dir(project.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
     project
 }
 
@@ -115,16 +142,6 @@ fn explicit_batches_preserve_log_while_plans_collapse_cancelled_changes() {
     Uuid::parse_str(&first).unwrap();
     let second = success(run(project.path(), &["batch", "new", "review"], None));
     assert_ne!(first, second);
-    let events = [
-        Event::SetFileViewed {
-            path: "file.rs".into(),
-            viewed: true,
-        },
-        Event::SetFileViewed {
-            path: "file.rs".into(),
-            viewed: false,
-        },
-    ];
     let response = workspace(
         project.path(),
         json!({
@@ -135,6 +152,21 @@ fn explicit_batches_preserve_log_while_plans_collapse_cancelled_changes() {
             ]
         }),
     );
+    let head = response["workspace"]["comparison"]["head"]
+        .as_str()
+        .unwrap();
+    let events = [
+        Event::SetFileViewed {
+            path: "file.rs".into(),
+            viewed: true,
+            commit: Some(head.into()),
+        },
+        Event::SetFileViewed {
+            path: "file.rs".into(),
+            viewed: false,
+            commit: Some(head.into()),
+        },
+    ];
     assert_eq!(response["applied"], 2);
     assert!(response.get("error").is_none());
     let opened: Batch = serde_json::from_str(&success(run(
@@ -251,10 +283,6 @@ fn invalid_event_is_rejected_and_batch_remains_usable() {
             .is_empty()
     );
 
-    let valid = Event::SetFileViewed {
-        path: "file.rs".into(),
-        viewed: true,
-    };
     let response = workspace(
         project.path(),
         json!({
@@ -264,6 +292,13 @@ fn invalid_event_is_rejected_and_batch_remains_usable() {
     );
     assert_eq!(response["applied"], 1);
     assert!(response.get("error").is_none());
+    let valid = Event::SetFileViewed {
+        path: "file.rs".into(),
+        viewed: true,
+        commit: response["workspace"]["comparison"]["head"]
+            .as_str()
+            .map(str::to_owned),
+    };
     let retained = store.get_batch(&batch).unwrap().unwrap();
     assert_eq!(retained.write.events, vec![valid]);
     let state: Value =
@@ -272,11 +307,54 @@ fn invalid_event_is_rejected_and_batch_remains_usable() {
     let plan: Value =
         serde_json::from_str(&success(run(project.path(), &["plan", "batch"], None))).unwrap();
     assert_eq!(plan["operations"].as_array().unwrap().len(), 1);
+
+    // All CLI projections use the same read-time HEAD filtering as publication.
+    fs::write(project.path().join("file.rs"), "new committed version\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Reviewer",
+                "-c",
+                "user.email=reviewer@example.invalid",
+                "commit",
+                "--quiet",
+                "-am",
+                "New head",
+            ])
+            .current_dir(project.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let state: Value =
+        serde_json::from_str(&success(run(project.path(), &["state", "batch"], None))).unwrap();
+    let plan: Value =
+        serde_json::from_str(&success(run(project.path(), &["plan", "batch"], None))).unwrap();
+    let current = workspace(project.path(), json!({"op":"get","workspace":"batch"}));
+    assert_eq!(state["files"][0]["viewed"], false);
+    assert_eq!(plan["operations"], json!([]));
+    assert_eq!(plan["operations"], current["workspace"]["pending"]);
+    assert!(
+        Command::new("git")
+            .args(["checkout", "--quiet", "--detach", "head"])
+            .current_dir(project.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let restored: Value =
+        serde_json::from_str(&success(run(project.path(), &["state", "batch"], None))).unwrap();
+    assert_eq!(restored["files"][0]["viewed"], true);
+    assert_eq!(
+        store.get_batch(&batch).unwrap().unwrap().write.events,
+        retained.write.events
+    );
 }
 
 #[test]
 fn cli_plan_after_editor_refresh_uses_current_delta_not_historical_receipts() {
-    let project = tempdir().unwrap();
+    let project = project();
     let mut store = Store::open(project.path()).unwrap();
     let old = ReviewId("old".into());
     store.create_review(&old, &reviewer(), &baseline()).unwrap();

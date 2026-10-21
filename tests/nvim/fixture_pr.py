@@ -426,19 +426,27 @@ elif op == "historical_code":
         pair = original["revision"]
         source_side = original.get("range", {}).get("start", {}).get("side", "head")
         source = pair[source_side]
-        revision = {"base": source, "head": view["review"]["read"]["pull_request"]["revision"]["head"]}
+        revision = {"base": source, "head": view["comparison"]["head"]}
         location = copy.deepcopy(original)
         location["revision"] = revision
         if location.get("range"):
             location["range"]["start"]["side"] = "base"
             location["range"]["end"]["side"] = "base"
+        source_content = "one\nhistorical " + source_side + "\nthree\n"
+        head_content = "one\nchanged\nthree\n"
+        original_base = None
+        if pair.get("base"):
+            base_content = "one\ntwo\nthree\n" if pair == view["comparison"] else "one\nhistorical base\nthree\n"
+            original_base = {"commit": pair["base"], "path": original["path"], "content": base_content, "missing": False, "provenance": "recorded"}
+            if source_side == "base": source_content = base_content
+        if pair == view["comparison"] and source_side == "head": source_content = head_content
         response = {
             "anchor": original,
             "diff_hunk": "@@ -1 +1 @@\n-old\n+new",
             "code": {
                 "path": original["path"], "base_path": original["path"], "revision": revision,
-                "base_content": "one\nhistorical " + source_side + "\nthree\n",
-                "head_content": "one\nlatest PR head\nthree\n",
+                "base_content": source_content, "head_content": head_content,
+                "original_base": original_base,
                 "binary": False, "historical": True, "provenance": "recorded", "location": location,
             },
         }

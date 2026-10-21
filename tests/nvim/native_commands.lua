@@ -300,7 +300,7 @@ wait(function() return not state().comments[1].done end, 'discussion range undo 
 -- Immutable diff rows all refer to one file; native ranges deduplicate it.
 for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
   local marker = vim.b[api.nvim_win_get_buf(win)].buf_review
-  if marker and marker.kind == 'diff' and marker.side == 'head' then api.nvim_set_current_win(win); break end
+  if marker and marker.kind == 'diff' and marker.comment_role == 'comment' then api.nvim_set_current_win(win); break end
 end
 assert(kind() == 'diff', 'diff pane missing')
 before = #requests('actions')

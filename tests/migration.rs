@@ -532,6 +532,7 @@ fn workspace_migration_preserves_legacy_operation_namespaces_journals_and_aliase
             change: Event::SetFileViewed {
                 path: "old.rs".into(),
                 viewed: true,
+                commit: None,
             },
         },
         mappings: vec![],

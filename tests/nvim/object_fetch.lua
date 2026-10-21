@@ -104,14 +104,18 @@ assert(api.nvim_win_is_valid(retained_window), 'PR switch closed user-owned boun
 api.nvim_win_close(retained_window, true)
 assert(#api.nvim_tabpage_list_wins(0) == 1, 'managed PR panes accumulated during preparation')
 
--- Updating comparison while a read waits discards old pinned callbacks.
+-- Changing checkout while a read waits discards obsolete code callbacks.
 local latest = { base = string.rep('c', 40), head = string.rep('d', 40) }
-write('latest_comparison.json', latest)
-command('compare latest')
+local checked_out = read('state.json')
+checked_out.comparison = latest
+write('state.json', checked_out)
+command('refresh')
 wait(function() return home(third) and #requests('fetch_objects') == 4 end, 'new comparison did not prepare new pins')
 row('src/file.rs'); enter()
-write('latest_comparison.json', { base = string.rep('e', 40), head = string.rep('f', 40) })
-command('compare latest')
+checked_out = read('state.json')
+checked_out.comparison = { base = string.rep('e', 40), head = string.rep('f', 40) }
+write('state.json', checked_out)
+command('refresh')
 wait(function() return home(third) and #requests('fetch_objects') == 5 end, 'second comparison reused old preparation')
 wait(function() return completions() == 5 end, 'updated comparison preparations did not complete')
 ReviewTest.wait(60)
@@ -120,7 +124,6 @@ assert(vim.deep_equal(records('fetch_objects_complete.jsonl')[5].response.revisi
 row('src/file.rs'); enter()
 wait(function() return kind() == 'diff' and #requests('code') == 2 end, 'prepared latest comparison code did not open')
 assert(#requests('fetch_objects') == 5, 'ready comparison fetched again when opening code')
-vim.fn.delete(fixture .. '/latest_comparison.json')
 vim.fn.delete(fixture .. '/delay_fetch_objects')
 
 -- Network failures preserve local work; opening code and refresh can retry.
