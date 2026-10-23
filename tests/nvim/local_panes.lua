@@ -30,7 +30,7 @@ local view = {
   comments = { { comment = { origin = 'read', comment = { id = 'root', body = 'Existing comment', author = { id = 'alice', name = 'alice' },
     target = { kind = 'diff', target = { path = 'file.txt', revision = revision,
       range = { start = { side = 'head', line = 1 }, ['end'] = { side = 'head', line = 1 } } } },
-  } }, fetched = true, done = false, pending_delete = false, conflict = false, summary = false } },
+  } }, fetched = true, done = false, conflict = false, summary = false } },
   files = { { path = 'file.txt', viewed = false } }, pending = {}, todo = { 'root' }, done = {}, conflicts = {}, publications = {}, new_commits = false,
 }
 write('state.json', view)

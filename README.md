@@ -36,7 +36,9 @@ or opens the session browser when several are unfinished. Use
 `:Review prs` to choose any PR, or `:Review sessions` to browse saved sessions
 grouped by PR. `:Review sessions new` creates another session for the selected
 or current PR. Each session is a batch with a stable ID; refresh and publication
-preserve it. Inside a review buffer, `:Review` returns to that bound session.
+preserve it. Each repository has one marked Review tab. Inside that tab,
+`:Review` returns to its current session even after ordinary editing replaces
+the buffers or changes the window layout. A closed Review tab is recreated.
 
 Use `:Review pr master` to review the current branch against `master` before a
 GitHub PR exists. The command reuses an existing open PR for that exact source/
@@ -93,12 +95,16 @@ unsent conclusion and keep publication pending. Saving queues one
 Only `:Review publish` sends saved operations. Inline comments share one review
 per publication. Without a queued conclusion the review stays pending/draft;
 with one, publication concludes after its comments and other ordered changes.
-To move legacy unpublished standalone inline comments into that review, select
+To move unpublished standalone inline comments into that review, select
 them and run `:Review move` (current comment, Ex range or visual selection).
 Sent comments cannot move. Include unpublished parents and replies together.
 
 Publication waits for writes, then fetches fresh PR state. Refresh failure is
 reported separately and keeps confirmed publication results intact.
+Local events receive UUIDs when created; refresh and retries retain those IDs.
+Publication coalesces local intent before excluding confirmed operations. A local
+viewed or Done toggle reversed back to its known baseline stays cancelled after
+refresh. New toggles after publication are independent changes.
 
 Todo includes fetched remote comments without **your** thumbs-up, including
 individual replies and nonblank review summaries. `s` marks the selected fetched
@@ -169,6 +175,8 @@ PR-wide comments open their discussion without changing code.
 Readers reuse stable numbered buffers during navigation. A manual split keeps
 its existing target; navigation uses another slot when needed. Composers remain
 separate, and their return readers stay reserved until the composer closes.
+Tab identity lives in `t:buf_review.repository`; it does not depend on a Review
+buffer remaining visible. PR/session navigation and `o` reuse the same tab.
 
 Inline markers show fetched comments with `[ ]` none Done, `[-]` partly Done,
 or `[x]` all Done, using your thumbs-up on each comment/reply. Local comments
@@ -246,8 +254,7 @@ Save intent metadata through the ordinary action list using
 `{"action":"pr_details","revision":0,"title":"Title","body":"Body"}`.
 Its revision is the PR object's revision, alongside the request's workspace
 generation. Metadata and its history commit together; stale or already-remote
-PR edits fail without replacing newer text. `publish` resolves local PR intent before sending the ordered saved queue.
-`submit` is rejected; queue a `publish_review` action instead.
+PR edits fail without replacing newer text. `publish` resolves local PR intent before executing the saved publication.
 These CLI operations return local state with publication receipts. The Neovim
 plugin explicitly chains a subsequent fetch and reconciliation.
 
@@ -369,12 +376,12 @@ pr workspace <<JSON
 JSON
 ```
 
-`publish` is the sole provider-write operation. It sends the ordered saved queue;
+`publish` is the sole provider-write operation. It sends saved operations in dependency order;
 an optional `{"action":"publish_review","conclusion":{"outcome":"comment","body":"Summary"}}`
 action concludes the review. Setting `conclusion` to `null` cancels the unsent
 conclusion. Without that action, comments publish as a draft
 review. `{"action":"move","comments":["local-id"]}` moves selected unsent
-legacy inline comments into the review. `submit` is rejected.
+inline comments into the review.
 
 | Command | Output |
 | --- | --- |
@@ -463,35 +470,41 @@ The resulting `CommitState` contains only net operations. A create followed by a
 delete produces no server write; toggles back to their baseline cancel too.
 The original events remain inspectable.
 
-After every successful provider write, its operation, returned identities and
-response are saved before advancing. Successfully sent content is immutable,
+Each confirmed operation saves its own receipt, returned identities and response,
+including successes from a partially failed batch. Successfully sent content is immutable,
 including pending review comments. Corrections are new comments or replies.
 Unsent create/edit/delete changes coalesce; deleting an unsent comment cancels
 its creation. Provider mappings preserve local identities across refreshes.
 
-Publication preserves queue order and stops at the first error, blocked anchor
-or uncertain result. Retry retains the publication ID and confirmed receipts,
-then sends only its remaining operations. New unrelated work waits for another
-publication. Completed publications remain immutable.
+Publication follows dependencies, sending one batch per operation family at each
+dependency depth. Independent comments share a request; replies wait until their
+new parents have confirmed identities. Viewed flags and reactions are batched
+by family, and a queued conclusion follows the other operations. One publication
+uses at most one provider review: it reuses the authenticated reviewer's pending
+review for that PR and head, or creates one when missing. A later publication may
+extend or conclude that pending review without recreating confirmed comments.
 
-Adjacent compatible inline roots use GitHub's native bulk create-review API.
-A terminal conclusion can join that write. Existing pending reviews, replies
-and progress may require separate writes; arbitrary GraphQL aliases do not
-provide atomicity or stop-on-error guarantees. One publication uses at most one
-provider review. A later publication may extend or conclude its saved pending
-review without recreating confirmed comments.
+Batch writes use GraphQL aliases in one HTTP request. GitHub executes those
+fields serially, without atomicity or rollback: some may succeed while others
+fail. All confirmed results are saved, then any error, blocked operation or
+uncertain result stops later batches. Retry retains the publication ID and
+confirmed receipts; confirmed operations never resend. New unrelated work waits
+for another publication. Completed publications remain immutable.
 
 Publishing verifies the reviewer/account and known constraints before writing.
 Only unsent comments can be edited, deleted, moved or relocated. GitHub validates
 exact saved head/path/range anchors; the adapter never substitutes a location.
 Nonblank text is required for Comment and Request changes conclusions; Approve
-may omit it. A provider-side pending review belonging to another tool is never
-silently adopted or deleted.
+may omit it. Reusing an existing pending review never deletes its earlier comments
+or treats them as successful receipts for new local operations.
 
 Publication holds `.review/publish.lock`; local saves remain available outside
 the frozen scope. Remote writes and SQLite cannot form one transaction. Lost
-responses remain explicitly uncertain: retry reconciles known identities and
-blocks blind duplicate creation or later writes when the result is unknown.
+responses remain explicitly uncertain. Unknown creates stay blocked until their
+provider identities are confirmed; they never blindly resend. Unknown viewed or
+reaction operations are reconciled together with one fresh fetch before retry
+decides which operations remain. Later batches stay blocked while results are
+unresolved.
 
 ## Model
 
@@ -558,9 +571,8 @@ An ordinary progress mark therefore records local changes without another copy
 of the PR. Identical fetches reuse evidence only when reviewer and provider
 identities also match. Explicitly imported review IDs remain valid.
 
-Opening an older database migrates full workspace checkpoints transactionally,
-preserving drafts, history, pinned comparisons and publication recovery state.
-The completed migration compacts the database to release the redundant pages.
+Only the current database format is supported. Opening an incompatible database
+returns an error without converting or deleting it.
 
 `review_sources` and `id_mappings` hold backend metadata separately.
 `Store::import_review` saves a snapshot and its source/mappings atomically;
@@ -568,7 +580,7 @@ The completed migration compacts the database to release the redundant pages.
 stay in their own tables.
 
 `operation_results` stores successful processed writes separately, keyed by
-batch and deterministic operation ID and ordered by execution sequence. A row
+batch and event UUID and ordered by execution sequence. A row
 means the operation completed; its JSON payload, mappings and raw provider
 response preserve the relevant metadata. Success does not complete the batch.
 Logical resource IDs in event JSON can join `id_mappings` to resolve returned
@@ -581,21 +593,13 @@ events using only `BatchId`. No storage operation replaces a baseline or collaps
 event log. Batch IDs are unique across all reviews, and SQLite enforces the
 review/batch relationship. Event sequences are independent for each batch.
 
-Opening a database from the previous review-owned-log schema migrates it in one
-transaction. Each original review gets a batch whose ID equals its review ID.
-Snapshots, reviewers and ordered events are preserved. The original event table
-is retained as `legacy_write_events`; the old `committed` column is retained but
-no longer controls editing. Reopening the migrated store does not migrate again.
-
-The compact workspace format requires the current binary. Running an older
-binary requires a database copy from before migration; renaming the retained
-event tables does not restore the older workspace format.
 
 ## Checks
 
 Run `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
 Rust 1.89 or newer is required. The existing Nix development shell supplies the
-Rust tools, Neovim and Python for fixture processes. Run the standalone UI
+Rust tools and Python for fixture processes. Neovim comes from your existing
+PATH. Run the standalone UI
 workflows with:
 
 ```sh

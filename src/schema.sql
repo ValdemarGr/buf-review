@@ -50,13 +50,7 @@ CREATE TABLE IF NOT EXISTS batch_revisions (
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
     revision INTEGER NOT NULL,
     review_id TEXT NOT NULL REFERENCES reviews(review_id),
-    namespace TEXT NOT NULL,
     PRIMARY KEY(batch_id, revision)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS batch_aliases (
-    alias TEXT PRIMARY KEY NOT NULL,
-    batch_id TEXT NOT NULL REFERENCES batches(batch_id)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS write_events (

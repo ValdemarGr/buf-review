@@ -33,7 +33,7 @@ for index = 1, 12 do
   view.comments[index] = {
     comment = { origin = 'read', comment = { id = id, author = { id = 'alice', name = 'alice' }, body = 'Feedback ' .. index,
       target = { kind = 'diff', target = { path = path(index), revision = revision, range = { start = { side = 'head', line = 2 }, ['end'] = { side = 'head', line = 2 } } } } } },
-    fetched = true, done = false, pending_delete = false, conflict = false, summary = false,
+    fetched = true, done = false, conflict = false, summary = false,
   }
   view.todo[index] = id
 end

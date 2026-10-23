@@ -21,7 +21,7 @@ installing manually. Optional executable override: >lua
 :Review leave                   Legacy activity command; membership stays unchanged.
 :Review conclude                Outcome picker and Markdown conclusion composer.
 :Review publish                 Send saved queue; no conclusion means draft review.
-:Review move                    Move selected unsent legacy comments into review.
+:Review move                    Move selected unsent comments into review.
 
 Review buffers target their own repository/PR/session. From source, :Review
 uses the current branch: exactly one open PR routes to it; zero or multiple
@@ -81,6 +81,11 @@ hashes in the background.
 Missing historical commits report warnings and use recorded-hunk fallback;
 missing current comparison commits report an error. Preparation never checks out files.
 
+Each repository has one marked Review tab. :Review reuses it after ordinary
+buffer replacements or window changes, creating one only when no marked tab remains.
+The marker t:buf_review.repository identifies the repository independently of
+buffer metadata. PR/session switches and o share that tab; unrelated user
+windows and unsaved native buffers are preserved.
 The reusable review tab contains home or committed code panes, with
 one reusable discussion split below them. A dirty right pane uses the ordinary
 editable source buffer. Press o in a review diff to open its right pane as Local,
@@ -280,19 +285,19 @@ Example: >lua
     even when threads already exist at the selected line.
 :Review reply [review|standalone]
     Reply to selected inline thread, including your own comment.
-:Review edit                    Edit selected owned comment.
-:Review delete                  Stage explicit deletion of owned comment.
-:Review restore                 Cancel unsent deletion of fetched comment.
+:Review edit                    Edit selected unpublished comment.
+:Review delete                  Delete selected unpublished comment.
+:Review restore                 Cancel unsent deletion of a local comment.
 :Review suggest                 Insert suggestion with captured immutable lines.
 :Review done / todo             Stage selected fetched comment's own thumbs-up.
 :Review viewed / unviewed        Stage selected file/diff progress.
 
 New inline comments join one review per publication. Replies to unpublished
-legacy standalone parents inherit that destination. :Review move explicitly
+standalone parents inherit that destination. :Review move explicitly
 moves the current comment, Ex range or visual selection into the review;
 include unpublished parents and replies together. Sent comments cannot move.
 Successfully sent comments/conclusions are immutable, including pending drafts.
-Corrections use new comments or replies. PR-wide legacy comments retain targets.
+Corrections use new comments or replies. PR-wide comments retain targets.
 
 Composers are ordinary Markdown with read-only virtual metadata above their text.
     :w      Save locally; keep composer open. Never publish.
@@ -337,12 +342,28 @@ review comments. A queued conclusion runs after preceding saved operations.
 Publication never prompts. Fetched pending roots/replies show [draft], remain
 read-only and stay outside Todo/Done until submitted and fetched.
 
-Publish preserves ordered operations, batches adjacent compatible roots through
-native create-review, persists each result, and stops at first blocked/error/
-uncertain operation. Retry keeps publication ID and confirmed receipts; no
-unrelated writes bypass failure. Completed publication stays immutable; new
-work uses a new publication. A saved pending provider review may be extended or
-concluded by that later publication. Unknown creates never blindly resend.
+Publish follows dependencies, sending one batch per operation family at each
+dependency depth. Independent comments share a request; replies wait for newly
+created parents' confirmed identities. Viewed flags and reactions are batched
+by family; the conclusion follows the other operations. The authenticated
+reviewer's matching pending review is reused, or created when missing.
+
+Each confirmed operation keeps its own receipt, including successes within a
+partially failed batch. Batch mutations use GraphQL aliases in one HTTP request;
+the server executes fields serially, without atomicity or rollback. An error,
+blocked operation or uncertain result stops later batches. Retry keeps the
+publication ID and confirmed receipts; confirmed operations never resend.
+Unknown creates remain blocked until their provider identities are confirmed.
+Unknown viewed/reaction results reconcile together with one fresh fetch before
+retry decides what remains. New unrelated work waits for another publication.
+Completed publications stay immutable; later work may extend or conclude the
+same pending review without deleting its earlier comments or claiming them as
+receipts for new local operations.
+
+Local events receive UUIDs when created; refresh and retries preserve identity.
+The publication plan coalesces intent before removing confirmed operations.
+Viewed/Done toggles reversed to their known baseline stay cancelled after
+refresh. A new toggle after publication is a separate local event.
 
 Publish waits for writes, then fresh PR fetch/reconciliation. Refresh failure is
 reported separately, preserving receipts. Ctrl-C interrupts waiting while
@@ -412,8 +433,8 @@ Git supplies file contents directly; SQLite retains snapshots, anchors and
 receipts. Confirmed receipts preserve your exact original comparisons across
 imports/sessions. PR preparation refetches locally pruned objects when possible.
 SQLite shares fetched payloads; workspace history stores references and field
-changes. Unchanged fetches reuse matching snapshots. Existing databases migrate
-and compact on open, preserving drafts, action logs and publication recovery.
+changes. Unchanged fetches reuse matching snapshots. Only the current database
+format is supported; incompatible databases are rejected without conversion.
 Reader buffers have stable numbered names and are reused during navigation.
 Manual splits keep their original target, including in other tabs; another slot
 is used when needed. Composers keep private buffers and reserve their return

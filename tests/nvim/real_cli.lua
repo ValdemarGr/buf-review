@@ -187,7 +187,7 @@ for _, identity in ipairs({ 'own-root', assert(vim.env.BUF_REVIEW_RECEIPT_COMMEN
   home()
   local snapshot, published = active()
   for _, row in ipairs(snapshot.comments) do if row.comment.comment.id == identity then published = row end end
-  assert(published and not published.destination and not published.pending_delete, 'published fixture missing or still mutable')
+  assert(published and not published.destination, 'published fixture missing or still mutable')
   if published.fetched then
     for line, text in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
       if text:find(published.comment.comment.body, 1, true) then api.nvim_win_set_cursor(0, { line, 0 }); break end

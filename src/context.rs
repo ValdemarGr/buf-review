@@ -98,7 +98,7 @@ pub fn prepare(store: &mut Store, project: &Path, workspace: &Workspace) -> Resu
             .write
             .events
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|event| match &event.event {
                 Event::SetFileViewed {
                     commit: Some(commit),
                     ..
@@ -106,7 +106,6 @@ pub fn prepare(store: &mut Store, project: &Path, workspace: &Workspace) -> Resu
                 _ => None,
             }),
     );
-    current.extend(workspace.legacy_viewed_commits.values().cloned());
     let local = store
         .pull_request(&workspace.review.read.pull_request.id)?
         .is_some_and(|pr| matches!(pr.source, PullRequestSource::LocalIntent { .. }));

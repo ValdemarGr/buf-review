@@ -51,7 +51,7 @@ local function comment(id, body, fetched, destination)
   return {
     comment = { origin = fetched and 'read' or 'draft', comment = { id = id, body = body,
       author = { id = fetched and 'alice' or 'me', name = fetched and 'alice' or 'me' }, target = { kind = 'pull_request' } } },
-    fetched = fetched, destination = destination, done = false, pending_delete = false, conflict = false, summary = false,
+    fetched = fetched, destination = destination, done = false, conflict = false, summary = false,
   }
 end
 local conclusion = scenario:find('conclusion', 1, true) == 1

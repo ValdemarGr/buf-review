@@ -172,7 +172,6 @@ local function comment_metadata(view, row)
   if row.draft or unpublished(row) then flags[#flags + 1] = 'draft'
   elseif row.fetched then flags[#flags + 1] = row.done and 'Done 👍' or 'Todo' end
   if row.conflict then flags[#flags + 1] = 'CONFLICT' end
-  if row.pending_delete then flags[#flags + 1] = 'pending deletion' end
   if row.anchor_error then flags[#flags + 1] = 'REJECTED ANCHOR: ' .. row.anchor_error .. '; :Review relocate/delete' end
   return at, author, flags, location
 end
@@ -245,8 +244,14 @@ local function activate(buf)
   if not previous or previous.buffer ~= buf or previous.id ~= id then highlight_comment() end
 end
 
-local function get_state()
+local function get_state(prefer_tab)
   local meta = buffers[api.nvim_get_current_buf()]
+  local marker = vim.t.buf_review
+  local repository = type(marker) == 'table' and repositories[marker.repository]
+  if repository and (prefer_tab or not meta) then
+    local current = repository.current
+    return current, meta and meta.state == current and meta or nil
+  end
   if meta then
     if meta.dirty then render_reader(api.nvim_get_current_buf(), 'position') end
     activate(api.nvim_get_current_buf())
@@ -317,10 +322,47 @@ end })
 local function tab(state)
   local repository = state.repository
   local previous = repository.current
+  local marked
+  for _, page in ipairs(api.nvim_list_tabpages()) do
+    local marker = vim.t[page].buf_review
+    if type(marker) == 'table' and marker.repository == state.root then marked = page; break end
+  end
+  local function recover(current)
+    current.tab = marked
+    local windows = api.nvim_tabpage_list_wins(marked)
+    for _, key in ipairs({ 'top', 'left', 'right', 'original', 'discussion' }) do
+      local win = current[key]
+      if win and (not valid(win) or api.nvim_win_get_tabpage(win) ~= marked) then current[key], current.diff_windows = nil, nil end
+      if key ~= 'top' and valid(current[key]) then
+        local buf = api.nvim_win_get_buf(current[key])
+        local meta = buffers[buf]
+        local local_pane = key == 'right' and current.diff_panes and current.diff_panes.right
+        local native = local_pane and local_pane.kind == 'local' and api.nvim_buf_get_name(buf) == local_pane.path
+        if not (meta and meta.state == current) and not native then current[key], current.diff_windows = nil, nil end
+      end
+    end
+    if #windows == 1 then
+      current.top = windows[1]
+      if current.left ~= windows[1] then
+        current.left, current.right, current.original, current.discussion, current.diff_windows = nil, nil, nil, nil, nil
+      end
+    else
+      if not valid(current.left) and not valid(current.top) then
+        for _, key in ipairs({ 'original', 'right', 'discussion' }) do
+          if valid(current[key]) then
+            current.left, current.top, current[key], current.diff_windows = current[key], current[key], nil, nil
+            break
+          end
+        end
+      end
+      if not valid(current.top) then current.top = api.nvim_tabpage_get_win(marked) end
+    end
+  end
+  if marked then recover(previous) end
   if previous ~= state then
     settle(previous)
     guard(previous)
-    if previous.tab and api.nvim_tabpage_is_valid(previous.tab) then
+    if marked and previous.tab and api.nvim_tabpage_is_valid(previous.tab) then
       close_original(previous)
       if valid(previous.discussion) then leave_diff(previous.discussion); api.nvim_win_close(previous.discussion, false) end
       if valid(previous.right) then leave_diff(previous.right); api.nvim_win_close(previous.right, true) end
@@ -330,8 +372,9 @@ local function tab(state)
     end
     repository.current = state
   end
-  if state.tab and api.nvim_tabpage_is_valid(state.tab) then
-    api.nvim_set_current_tabpage(state.tab)
+  if marked then
+    recover(state)
+    api.nvim_set_current_tabpage(marked)
   else
     vim.cmd('keepjumps tabnew')
     state.tab = api.nvim_get_current_tabpage()
@@ -339,6 +382,7 @@ local function tab(state)
     state.left, state.right, state.discussion, state.original = nil, nil, nil, nil
     state.diff_windows = nil
   end
+  vim.t[state.tab].buf_review = { repository = state.root }
 end
 
 local function delete_motion(visual)
@@ -1040,7 +1084,7 @@ render_home = function(state, cursor)
   local pending, included = {}, {}
   for _, row in ipairs(view.comments) do
     local id = content(row).id
-    if unpublished(row) or row.draft or row.pending_delete or row.conflict then
+    if unpublished(row) or row.draft or row.conflict then
       included[id] = true
       pending[#pending + 1] = comment_entry(row, { comment = id, draft = unpublished(row), conflict = row.conflict })
     end
@@ -1886,7 +1930,6 @@ compose = function(state, options)
     row = find(view, content(row).id)
     if not row then error('Comment no longer present in this workspace') end
     if not unpublished(row) then error('Published comments are immutable; reply or create a new comment') end
-    if row.pending_delete then error('Comment has pending deletion; restore it before editing') end
   end
   local comment = row and content(row)
   local kind = options.kind or 'comment'
@@ -1927,7 +1970,7 @@ compose = function(state, options)
     if not saved then return false end
     return {
       comment = saved.comment, destination = saved.destination,
-      pending_delete = saved.pending_delete, conflict = saved.conflict,
+      conflict = saved.conflict,
       fetched = saved.fetched,
     }
   end
@@ -2101,7 +2144,6 @@ local function edit_comment(state, row)
   if not row then error('Comment no longer present in this workspace') end
   if not unpublished(row) then error('Published comments are immutable; reply or create a new comment') end
   if not owned(state, row) then error('Editing requires verified ownership of this comment') end
-  if row.pending_delete then error('Comment has pending deletion; restore it before editing') end
   if row.conflict then show_conflict(state, row); return end
   compose(state, { row = row })
 end
@@ -2111,12 +2153,10 @@ local function reply(state, row, destination, options)
   settle(state)
   row = find(require_view(state), content(row).id)
   if not row then error('Comment no longer present in this workspace') end
-  if row.pending_delete then error('Cannot reply to a comment with pending deletion') end
   local root = root_row(state.view, row)
   if not root or content(root).target.kind ~= 'diff' or root.summary then
     error('This comment does not support diff-thread replies; create a standalone PR-wide comment from the home header')
   end
-  if root.pending_delete then error('Cannot reply to a comment with pending deletion') end
   if unpublished(root) then
     if destination and destination ~= root.destination then error('Unpublished replies must share their parent destination') end
     destination = root.destination
@@ -2317,7 +2357,7 @@ function M.progress(present, visual, mode, selection)
         -- Contextual u reverses local work; explicit Todo remains progress-only.
         if not present and not mode then
           local row = find(view, object.comment)
-          if row and (row.pending_delete or unpublished(row)) then guard(state) end
+          if row and unpublished(row) then guard(state) end
           undo[#undo + 1] = object.comment
         else
           queue[#queue + 1] = { 'reaction', { comment = object.comment, present = present } }
@@ -2520,14 +2560,14 @@ end
 
 dispatch = function(command, arguments, opts)
   local count = vim.v.count1
-  local state, meta = get_state()
+  local state, meta = get_state(not command)
   local selection = state.repository.current
   if state.repository.navigating and (not command or command == 'prs' or command == 'sessions') then return end
   ready(state)
   arguments = arguments or {}
   if not command then
     guard(state)
-    if meta and meta.kind ~= 'prs' and meta.kind ~= 'sessions' and state.view then
+    if state.view and ((meta and meta.kind ~= 'prs' and meta.kind ~= 'sessions') or vim.t.buf_review) then
       home(state)
       refresh(state)
     else navigate(state, { op = 'entry' }) end
@@ -2619,7 +2659,6 @@ dispatch = function(command, arguments, opts)
     if not vim.tbl_contains({ 'local', 'remote', 'edit' }, resolution) then error('Use :Review resolve local|remote|edit') end
     local row = picked(state, meta)
     if resolution == 'edit' then
-      if row.pending_delete then error('Deletion conflicts cannot resolve through body editing') end
       local conflict
       for _, candidate in ipairs(state.view.conflicts) do if candidate.comment == content(row).id then conflict = candidate end end
       if not conflict or not conflict.remote then error('Missing remote target; use remote to abandon stale intent') end

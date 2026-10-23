@@ -43,7 +43,7 @@ local function make_view(number)
   local revision = { base = string.rep('a', 40), head = string.rep(tostring(number), 40) }
   local comment = {
     comment = { origin = 'read', comment = { id = 'comment-' .. number, body = 'Feedback ' .. number, author = { id = 'alice', name = 'alice' }, target = { kind = 'diff', target = { path = 'src/file.rs', revision = revision, range = { start = { side = 'head', line = 1 }, ['end'] = { side = 'head', line = 1 } } } } } },
-    fetched = true, done = false, pending_delete = false, conflict = false, summary = false,
+    fetched = true, done = false, conflict = false, summary = false,
   }
   return {
     id = 'objects-batch-' .. number, generation = 0, locator = 'https://github.com/acme/repo/pull/' .. number, comparison = revision,

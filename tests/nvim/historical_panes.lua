@@ -44,7 +44,7 @@ local function comment(id, revision, side, path)
     comment = { origin = 'read', comment = { id = id, body = 'Feedback ' .. id, author = { id = 'alice', name = 'alice' }, target = {
       kind = 'diff', target = { path = path or 'src/file.rs', revision = revision,
         range = { start = { side = side or 'head', line = 2 }, ['end'] = { side = side or 'head', line = 3 } } },
-    } } }, fetched = true, done = false, pending_delete = false, conflict = false, summary = false,
+    } } }, fetched = true, done = false, conflict = false, summary = false,
   }
 end
 local reply = comment('reply', old)

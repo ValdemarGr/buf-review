@@ -536,47 +536,6 @@ fn failed_import_rolls_back_canonical_metadata_and_binding() {
 }
 
 #[test]
-fn existing_provider_state_backfills_without_changing_session_or_history() {
-    let project = TempDir::new().unwrap();
-    let mut store = Store::open(project.path()).unwrap();
-    let pull = PullRequestId("original-logical-id".into());
-    let snapshot = ReviewId("original-snapshot".into());
-    store
-        .import_review(
-            &snapshot,
-            &reviewer(),
-            &read(&pull, PullRequestStatus::Open),
-            &backend("https://github.com/team/project/pull/7", &pull),
-        )
-        .unwrap();
-    let workspace = store.create_batch_workspace(&snapshot).unwrap();
-    let workspace = store
-        .mutate_workspace(
-            &workspace.id,
-            workspace.generation,
-            save("Historical draft"),
-        )
-        .unwrap();
-    let log = store.workspace_log(&workspace.id).unwrap();
-    drop(store);
-    let old = rusqlite::Connection::open(project.path().join(".review/state.sqlite3")).unwrap();
-    old.execute_batch("DROP TABLE pr_resolutions; DROP TABLE pull_requests;")
-        .unwrap();
-    drop(old);
-    let store = Store::open(project.path()).unwrap();
-    assert_eq!(store.workspace(&workspace.id).unwrap().unwrap(), workspace);
-    assert_eq!(store.workspace_log(&workspace.id).unwrap(), log);
-    let object = store.pull_request(&pull).unwrap().unwrap();
-    assert_eq!(object.id, pull);
-    assert_eq!(object.revision, 0);
-    assert_eq!(object.title, "Snapshot title");
-    assert!(matches!(
-        object.source,
-        PullRequestSource::Remote { branches: None, .. }
-    ));
-}
-
-#[test]
 fn bound_pr_can_complete_each_saved_reviewers_mapping_without_changing_identity() {
     let project = TempDir::new().unwrap();
     let mut store = Store::open(project.path()).unwrap();

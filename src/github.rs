@@ -14,12 +14,14 @@ use crate::{
     store::{IdMapping, ReviewBackend, ReviewSource},
 };
 
+pub(crate) mod batch;
+mod batch_ids;
 mod intent;
 mod publish;
 mod snapshot;
 mod workspace;
 pub use intent::*;
-pub use publish::{PublishError, PublishResult, preflight, publish};
+pub use publish::{PublishError, PublishResult, preflight};
 pub use workspace::*;
 
 #[derive(Debug, Error)]

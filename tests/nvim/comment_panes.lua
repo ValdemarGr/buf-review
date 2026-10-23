@@ -69,7 +69,7 @@ for _, case in ipairs(cases) do
   view.comments[#view.comments + 1] = {
     comment = { origin = 'read', comment = { id = case.id, body = 'Feedback ' .. case.id,
       author = { id = 'alice', name = 'alice' }, target = { kind = 'diff', target = target } } },
-    fetched = true, done = false, pending_delete = false, conflict = false, summary = false,
+    fetched = true, done = false, conflict = false, summary = false,
   }
   view.todo[#view.todo + 1] = case.id
   local revision = { base = original.head, head = selected.head }

@@ -87,33 +87,6 @@ impl Store {
         Ok(serde_json::from_str(&value)?)
     }
 
-    pub(super) fn migrate_snapshot_storage(connection: &Connection) -> Result<(), StoreError> {
-        if !connection.table_exists(Some("main"), "read_states")? {
-            return Ok(());
-        }
-        let rows = {
-            let mut statement = connection.prepare("SELECT review_id,snapshot FROM read_states")?;
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (id, snapshot) in rows {
-            let value = Self::store_json(connection, &snapshot)?;
-            connection.execute(
-                "INSERT INTO review_snapshots(review_id,value_id) VALUES (?1,?2)",
-                (&id, value),
-            )?;
-        }
-        connection.execute_batch(
-            "DROP TABLE read_states;
-             CREATE VIEW read_states AS SELECT review_id,value AS snapshot
-             FROM review_snapshots JOIN stored_values USING(value_id);",
-        )?;
-        Ok(())
-    }
-
     pub(super) fn compact_workspace(
         connection: &Connection,
         workspace: &Workspace,
@@ -121,59 +94,13 @@ impl Store {
         let mut state = serde_json::to_value(workspace)?;
         state.as_object_mut().unwrap().remove("review");
         state["review_id"] = json!(workspace.review.id);
-        // Old databases can contain historical embedded evidence that differs
-        // from the normalized row. Keep that evidence rather than changing it.
-        if Self::read_review(connection, &workspace.review.id)?.as_ref() != Some(&workspace.review)
-        {
-            state["review_value"] = json!(Self::store_value(
-                connection,
-                &serde_json::to_value(&workspace.review)?
-            )?);
-        }
-        let events = state["batch"]
-            .as_object_mut()
-            .unwrap()
-            .remove("write")
-            .unwrap();
-        let saved = Self::read_revision(
-            connection,
-            &workspace.batch.id,
-            workspace.batch.revision.number,
-        )?;
-        if saved.as_ref().is_some_and(|saved| {
-            saved
-                .write
-                .events
-                .starts_with(&workspace.batch.write.events)
-        }) {
-            state["event_count"] = json!(workspace.batch.write.events.len());
-        } else {
-            // Preserve imported historical logs even when a legacy migration
-            // did not put that exact prefix in a normalized batch revision.
-            state["event_value"] = json!(Self::store_value(connection, &events)?);
-        }
-        let results = Self::read_results(connection, &workspace.batch.id)?;
+        state["batch"].as_object_mut().unwrap().remove("write");
+        state["event_count"] = json!(workspace.batch.write.events.len());
         state.as_object_mut().unwrap().remove("results");
-        if results.starts_with(&workspace.results) {
-            state["result_count"] = json!(workspace.results.len());
-        } else {
-            let references = workspace
-                .results
-                .iter()
-                .map(|result| Self::store_value(connection, &serde_json::to_value(result)?))
-                .collect::<Result<Vec<_>, _>>()?;
-            state["result_values"] = json!(references);
-        }
-        state["completed"] = json!(workspace.completed.iter().map(|operation| {
-            if let Some(result) = results.iter().find(|result| &result.operation == operation) {
-                Ok(json!({"result":result.operation.id}))
-            } else {
-                Ok::<_, StoreError>(json!({"value":Self::store_value(connection, &serde_json::to_value(operation)?)?}))
-            }
-        }).collect::<Result<Vec<_>, _>>()?);
+        state["result_count"] = json!(workspace.results.len());
         state["comparison_files"] = json!(Self::store_value(
             connection,
-            &serde_json::to_value(&workspace.comparison_files)?
+            &serde_json::to_value(&workspace.comparison_files)?,
         )?);
         Ok(state)
     }
@@ -182,84 +109,32 @@ impl Store {
         connection: &Connection,
         mut state: Value,
     ) -> Result<Workspace, StoreError> {
-        if state.get("review").is_some() {
-            return Ok(serde_json::from_value(state)?);
-        }
-        let review = match state.get("review_value").and_then(Value::as_str) {
-            Some(id) => Self::stored_value(connection, id)?,
-            None => serde_json::to_value(
-                Self::read_review(
-                    connection,
-                    &serde_json::from_value(state["review_id"].clone())?,
-                )?
-                .ok_or(rusqlite::Error::QueryReturnedNoRows)?,
-            )?,
-        };
-        state["review"] = review;
+        let review = Self::read_review(
+            connection,
+            &serde_json::from_value(state["review_id"].clone())?,
+        )?
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        state["review"] = serde_json::to_value(review)?;
         let batch: BatchId = serde_json::from_value(state["batch"]["id"].clone())?;
-        state["batch"]["write"] = match state.get("event_value").and_then(Value::as_str) {
-            Some(id) => Self::stored_value(connection, id)?,
-            None => {
-                let revision: BatchRevision =
-                    serde_json::from_value(state["batch"]["revision"].clone())?;
-                let mut saved = Self::read_revision(connection, &batch, revision.number)?
-                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-                let count = state["event_count"]
-                    .as_u64()
-                    .ok_or(rusqlite::Error::InvalidQuery)? as usize;
-                if saved.write.events.len() < count {
-                    return Err(rusqlite::Error::InvalidQuery.into());
-                }
-                saved.write.events.truncate(count);
-                serde_json::to_value(saved.write)?
-            }
-        };
+        let revision: BatchRevision = serde_json::from_value(state["batch"]["revision"].clone())?;
+        let mut saved = Self::read_revision(connection, &batch, revision.number)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let count = state["event_count"]
+            .as_u64()
+            .ok_or(rusqlite::Error::InvalidQuery)? as usize;
+        if saved.write.events.len() < count {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+        saved.write.events.truncate(count);
+        state["batch"]["write"] = serde_json::to_value(saved.write)?;
         let results = Self::read_results(connection, &batch)?;
-        state["results"] = if let Some(count) = state["result_count"].as_u64() {
-            if results.len() < count as usize {
-                return Err(rusqlite::Error::InvalidQuery.into());
-            }
-            serde_json::to_value(&results[..count as usize])?
-        } else {
-            Value::Array(
-                state["result_values"]
-                    .as_array()
-                    .ok_or(rusqlite::Error::InvalidQuery)?
-                    .iter()
-                    .map(|id| {
-                        Self::stored_value(
-                            connection,
-                            id.as_str().ok_or(rusqlite::Error::InvalidQuery)?,
-                        )
-                    })
-                    .collect::<Result<_, _>>()?,
-            )
-        };
-        state["completed"] = Value::Array(
-            state["completed"]
-                .as_array()
-                .ok_or(rusqlite::Error::InvalidQuery)?
-                .iter()
-                .map(
-                    |reference| match reference.get("result").and_then(Value::as_str) {
-                        Some(id) => serde_json::to_value(
-                            &results
-                                .iter()
-                                .find(|result| result.operation.id == id)
-                                .ok_or(rusqlite::Error::QueryReturnedNoRows)?
-                                .operation,
-                        )
-                        .map_err(StoreError::from),
-                        None => Self::stored_value(
-                            connection,
-                            reference["value"]
-                                .as_str()
-                                .ok_or(rusqlite::Error::InvalidQuery)?,
-                        ),
-                    },
-                )
-                .collect::<Result<_, _>>()?,
-        );
+        let count = state["result_count"]
+            .as_u64()
+            .ok_or(rusqlite::Error::InvalidQuery)? as usize;
+        if results.len() < count {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+        state["results"] = serde_json::to_value(&results[..count])?;
         state["comparison_files"] = Self::stored_value(
             connection,
             state["comparison_files"]
@@ -325,6 +200,17 @@ impl Store {
         action: &Value,
     ) -> Result<Value, StoreError> {
         let mut action = action.clone();
+        if action["action"] == "publication_group" {
+            action["actions"] = Value::Array(
+                action["actions"]
+                    .as_array()
+                    .ok_or(rusqlite::Error::InvalidQuery)?
+                    .iter()
+                    .map(|child| Self::compact_action(connection, state, child))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            return Ok(action);
+        }
         match action["action"].as_str() {
             Some("set_attempt_provider") if action["provider"] == state["attempt"]["provider"] => {
                 action.as_object_mut().unwrap().remove("provider");
@@ -355,6 +241,18 @@ impl Store {
         state: &Value,
         mut action: Value,
     ) -> Result<Value, StoreError> {
+        if action["action"] == "publication_group" {
+            action["actions"] = Value::Array(
+                action["actions"]
+                    .as_array()
+                    .ok_or(rusqlite::Error::InvalidQuery)?
+                    .iter()
+                    .cloned()
+                    .map(|child| Self::expand_action(connection, state, child))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            return Ok(action);
+        }
         if let Some(field) = action.as_object_mut().unwrap().remove("state_reference") {
             let field = field.as_str().ok_or(rusqlite::Error::InvalidQuery)?;
             action[field] = state["attempt"][field].clone();
@@ -409,7 +307,7 @@ impl Store {
                  ) SELECT generation,state,action FROM history
                  WHERE NOT ?3 OR state!='[]' OR json_extract(action,'$.action') IN
                     ('open','refresh','provider_update','begin_publication','record_result',
-                     'finish_publication','suspend_publication','resume_publication')
+                     'finish_publication','suspend_publication','resume_publication','publication_group')
                  ORDER BY generation",
             )?;
             statement
@@ -428,11 +326,7 @@ impl Store {
         let mut state = "{}".to_owned();
         rows.into_iter()
             .map(|(generation, delta, action)| {
-                state = if delta.trim_start().starts_with('[') {
-                    Self::apply_delta(connection, &state, &delta)?
-                } else {
-                    delta
-                };
+                state = Self::apply_delta(connection, &state, &delta)?;
                 let value = serde_json::from_str(&state)?;
                 let action: Value = serde_json::from_str(&action)?;
                 // Provider deltas affect the next lifecycle entry; no need to
@@ -449,36 +343,5 @@ impl Store {
                 })
             })
             .collect()
-    }
-
-    pub(super) fn migrate_workspace_storage(connection: &Connection) -> Result<(), StoreError> {
-        let workspaces = {
-            let mut statement = connection.prepare("SELECT workspace_id,state FROM workspaces WHERE json_type(state,'$.review')='object'")?;
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (id, state) in workspaces {
-            let history = Self::history_states(connection, &id, None)?;
-            let mut previous = json!({});
-            for row in history {
-                let workspace: Workspace = serde_json::from_value(row.state)?;
-                let compact = Self::compact_workspace(connection, &workspace)?;
-                connection.execute(
-                    "UPDATE workspace_history SET state=?3,action=?4 WHERE workspace_id=?1 AND generation=?2",
-                    (&id, row.generation as i64, Self::state_delta(&previous, &compact)?, serde_json::to_string(&Self::compact_action(connection, &compact, &row.action)?)?),
-                )?;
-                previous = compact;
-            }
-            let workspace: Workspace = serde_json::from_str(&state)?;
-            let compact = Self::compact_workspace(connection, &workspace)?;
-            connection.execute(
-                "UPDATE workspaces SET state=?2 WHERE workspace_id=?1",
-                (&id, serde_json::to_string(&compact)?),
-            )?;
-        }
-        Ok(())
     }
 }

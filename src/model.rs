@@ -77,7 +77,7 @@ pub struct DiffLocation {
     pub position: CommentPosition,
 }
 
-/// Old snapshots retain a known comparison; imports can supply only a commit.
+/// A read anchor may retain a full comparison or only its provider commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ReadCommentRevision {
@@ -140,7 +140,6 @@ pub struct ReadComment {
     pub author: Option<User>,
     pub target: CommentTarget<ReadDiffLocation>,
     /// The fetched comment belongs to a pending provider review.
-    #[serde(default)]
     pub draft: bool,
 }
 
@@ -204,7 +203,7 @@ pub struct PullRequest {
     pub body: String,
     pub author: Option<User>,
     pub status: PullRequestStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<BranchSource>,
     pub revision: DiffRevision,
 }
@@ -232,7 +231,7 @@ pub struct ChangedFile {
     pub path: String,
     pub previous_path: Option<String>,
     pub change: FileChange,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<FileStats>,
     pub viewed: bool,
 }
@@ -279,10 +278,9 @@ pub enum ReadReviewState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadReview {
-    /// Older snapshots did not retain an identity for review resources.
+    /// The provider may omit a review resource identity.
     pub id: Option<ReviewResourceId>,
     pub author: Option<User>,
-    #[serde(alias = "conclusion")]
     pub state: ReadReviewState,
 }
 
@@ -293,7 +291,6 @@ pub struct ReadState {
     pub files: Vec<ChangedFile>,
     pub comments: Vec<ReadComment>,
     pub reactions: Vec<CommentReaction>,
-    #[serde(alias = "conclusions")]
     pub reviews: Vec<ReadReview>,
 }
 
@@ -316,7 +313,7 @@ pub enum Event {
     SetFileViewed {
         path: String,
         viewed: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         commit: Option<String>,
     },
     SetReviewConclusion {
@@ -324,8 +321,7 @@ pub enum Event {
     },
     DismissReview {
         review: ReviewResourceId,
-        /// Providers may require a reason; old logs remain readable.
-        #[serde(default)]
+        /// Providers may require a reason.
         message: Option<String>,
     },
     SetCommentReaction {
@@ -335,10 +331,31 @@ pub enum Event {
     },
 }
 
-/// An event log, not a collapsed set of backend writes.
+/// A local event with an identity independent of its position in the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedEvent {
+    pub id: String,
+    #[serde(flatten)]
+    pub event: Event,
+    /// An explicit local cancellation remains a barrier after refresh.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+}
+
+impl RecordedEvent {
+    pub fn new(event: Event) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            event,
+            cancelled: false,
+        }
+    }
+}
+
+/// An ordered event log, not a collapsed set of backend writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteState {
-    pub events: Vec<Event>,
+    pub events: Vec<RecordedEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,15 +369,13 @@ pub struct Review {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Batch {
     pub id: BatchId,
-    #[serde(default)]
     pub revision: BatchRevision,
     pub review: ReviewId,
     pub write: WriteState,
 }
 
-/// Internal log version. Legacy operation namespaces remain unchanged on import.
+/// Internal revision of the retained event log.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchRevision {
     pub number: u64,
-    pub namespace: Option<String>,
 }

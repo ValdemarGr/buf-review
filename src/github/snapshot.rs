@@ -430,6 +430,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
     let mut comment_reactions = Vec::new();
     for comment in issue_comments {
         let id = CommentId(identities.id("issue_comment", comment.full_database_id.number()?));
+        identities.mapping("issue_comment_node", &id.0, &comment.id);
         identities.mapping(&format!("created_at:{}", comment.created_at), &id.0, &id.0);
         reactions(
             &comment.id,
@@ -472,6 +473,10 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
             let comment = inline.comment;
             let numeric = comment.full_database_id.number()?;
             let id = CommentId(identities.id("review_comment", numeric));
+            identities.mapping("review_comment_node", &id.0, &comment.id);
+            if inline.reply_to.is_none() {
+                identities.mapping("review_thread", &id.0, &thread.id);
+            }
             identities.mapping(&format!("created_at:{}", comment.created_at), &id.0, &id.0);
             if let Some(review) = inline.pull_request_review {
                 identities.mapping(
@@ -601,6 +606,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
         .map(|review| {
             let numeric = review.full_database_id.number()?;
             let id = identities.id("review", numeric);
+            identities.mapping("review_resource_node", &id, &review.id);
             let author = review
                 .author
                 .map(|author| author.user(&mut identities))
@@ -678,7 +684,8 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
         "MERGED" => PullRequestStatus::Merged,
         other => return Err(FetchError::Response(format!("unknown PR state: {other}"))),
     };
-    let _node_id = pull.id;
+    let pull_id = PullRequestId(identities.id("pull_request", pull.full_database_id.number()?));
+    identities.mapping("pull_request_node", &pull_id.0, &pull.id);
     let source = pull.head_repository.map(|repository| BranchSource {
         repository: repository.url,
         branch: pull.head_ref_name,
@@ -697,7 +704,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
         reviewer,
         read: ReadState {
             pull_request: PullRequest {
-                id: PullRequestId(identities.id("pull_request", pull.full_database_id.number()?)),
+                id: pull_id,
                 title: pull.title,
                 body: pull.body,
                 author: pull

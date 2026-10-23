@@ -51,12 +51,10 @@ pub enum Resolution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicationAttempt {
     pub id: String,
-    #[serde(default)]
     pub wip: Option<String>,
     pub destination: Destination,
     pub operations: Vec<Operation>,
     pub uncertain: bool,
-    #[serde(default)]
     pub provider: serde_json::Value,
 }
 
@@ -67,33 +65,26 @@ pub struct Workspace {
     #[serde(skip)]
     pub worktree_context: bool,
     #[serde(skip)]
-    pub legacy_viewed_commits: BTreeMap<usize, String>,
+    pub viewed_versions: Option<BTreeSet<(String, String)>>,
+    pub snapshot_result_count: usize,
     pub id: String,
-    #[serde(default)]
     pub locator: Option<String>,
     pub generation: u64,
     pub review: Review,
     pub comparison: DiffRevision,
     pub comparison_files: Vec<ChangedFile>,
     pub batch: Batch,
-    pub completed: Vec<Operation>,
     pub destinations: BTreeMap<CommentId, Destination>,
     pub wip: Option<Wip>,
     pub conflicts: BTreeMap<CommentId, Conflict>,
     pub attempt: Option<PublicationAttempt>,
-    #[serde(default)]
     pub suspended_attempts: Vec<PublicationAttempt>,
-    #[serde(default)]
     pub preparation: serde_json::Value,
     pub last_error: Option<String>,
     pub saved_comment: Option<CommentId>,
-    #[serde(default)]
     pub summary_comments: BTreeSet<CommentId>,
-    #[serde(default)]
     pub results: Vec<OperationResult>,
-    #[serde(default)]
     pub chronology: BTreeMap<CommentId, String>,
-    #[serde(default)]
     pub rejected_anchors: BTreeMap<CommentId, String>,
 }
 
@@ -101,11 +92,9 @@ pub struct Workspace {
 pub struct CommentView {
     pub comment: ProjectedComment,
     pub fetched: bool,
-    #[serde(default)]
     pub draft: bool,
     pub done: bool,
     pub destination: Option<Destination>,
-    pub pending_delete: bool,
     pub anchor_error: Option<String>,
     pub conflict: bool,
     pub summary: bool,
@@ -236,6 +225,11 @@ pub enum WorkspaceError {
     Invalid(String),
 }
 
+struct ReceiptIndices {
+    operations: BTreeMap<String, usize>,
+    acknowledged: BTreeSet<String>,
+}
+
 fn parent(comment: &ProjectedComment) -> Option<&CommentId> {
     match comment {
         ProjectedComment::Read(ReadComment {
@@ -256,7 +250,8 @@ impl Workspace {
         Self {
             project_root: None,
             worktree_context: false,
-            legacy_viewed_commits: BTreeMap::new(),
+            viewed_versions: None,
+            snapshot_result_count: 0,
             comparison: review.read.pull_request.revision.clone(),
             comparison_files: review.read.files.clone(),
             batch: Batch {
@@ -269,7 +264,6 @@ impl Workspace {
             locator: None,
             generation: 0,
             review,
-            completed: vec![],
             destinations: BTreeMap::new(),
             wip: None,
             conflicts: BTreeMap::new(),
@@ -337,13 +331,20 @@ impl Workspace {
                 reaction.reaction = "👍".into();
             }
         }
+        let current_files = self
+            .review
+            .read
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.viewed))
+            .collect::<BTreeMap<_, _>>();
         review.read.files = self
             .comparison_files
             .iter()
             .map(|file| {
                 let mut file = file.clone();
-                if let Some(current) = self.review.read.files.iter().find(|f| f.path == file.path) {
-                    file.viewed = current.viewed;
+                if let Some(viewed) = current_files.get(file.path.as_str()) {
+                    file.viewed = *viewed;
                 }
                 file
             })
@@ -361,6 +362,71 @@ impl Workspace {
         review
     }
 
+    /// Compute immutable Git facts at the request boundary, outside projection.
+    pub(crate) fn prepare_viewed_versions(&mut self) -> Result<(), WorkspaceError> {
+        let acknowledged = self
+            .results
+            .iter()
+            .map(|result| result.operation.id.clone())
+            .collect::<BTreeSet<_>>();
+        let latest_ack = self
+            .batch
+            .write
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| match &record.event {
+                Event::SetFileViewed { path, .. } if acknowledged.contains(&record.id) => {
+                    Some((path.as_str(), index))
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let paths = self
+            .comparison_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut origins = BTreeMap::<String, BTreeSet<String>>::new();
+        for (index, record) in self.batch.write.events.iter().enumerate() {
+            let Event::SetFileViewed { path, commit, .. } = &record.event else {
+                continue;
+            };
+            if acknowledged.contains(&record.id)
+                || latest_ack
+                    .get(path.as_str())
+                    .is_some_and(|ack| index <= *ack)
+                || !paths.contains(path.as_str())
+            {
+                continue;
+            }
+            let Some(commit) = commit else {
+                return Err(WorkspaceError::Invalid(
+                    "viewed mark commit unavailable".into(),
+                ));
+            };
+            if commit != &self.comparison.head {
+                origins
+                    .entry(commit.clone())
+                    .or_default()
+                    .insert(path.clone());
+            }
+        }
+        let mut versions = BTreeSet::new();
+        for (commit, paths) in origins {
+            let project = self.project_root.as_deref().ok_or_else(|| {
+                WorkspaceError::Invalid("Git history unavailable for local viewed changes".into())
+            })?;
+            let paths = paths.into_iter().collect::<Vec<_>>();
+            let unchanged =
+                crate::diff::unchanged_paths(project, &commit, &self.comparison.head, &paths)
+                    .map_err(|error| WorkspaceError::Invalid(error.to_string()))?;
+            versions.extend(unchanged.into_iter().map(|path| (commit.clone(), path)));
+        }
+        self.viewed_versions = Some(versions);
+        Ok(())
+    }
+
     /// Derive effective local changes once for presentation and publication.
     pub fn get_unpublished(&self) -> Result<(core::ProjectedState, CommitState), WorkspaceError> {
         let review = self.projection_review();
@@ -370,68 +436,73 @@ impl Workspace {
             .iter()
             .map(|file| file.path.as_str())
             .collect::<BTreeSet<_>>();
-        let mut excluded = BTreeSet::new();
-        let mut local = BTreeMap::<String, Vec<(usize, String)>>::new();
-        for (index, event) in self.batch.write.events.iter().enumerate() {
-            let Event::SetFileViewed { path, commit, .. } = event else {
-                continue;
-            };
-            if !paths.contains(path.as_str()) {
-                excluded.insert(index);
-                continue;
-            }
-            if self.has_result(&core::operation_at(&self.batch, index + 1, event.clone()).id) {
-                continue;
-            }
-            let head = commit
-                .as_ref()
-                .or_else(|| self.legacy_viewed_commits.get(&index))
-                .or_else(|| {
-                    (self.project_root.is_none()
-                        && self.comparison == self.review.read.pull_request.revision)
-                        .then_some(&self.comparison.head)
-                })
-                .ok_or_else(|| WorkspaceError::Invalid("viewed mark commit unavailable".into()))?;
-            if head != &self.comparison.head {
-                local
-                    .entry(head.clone())
-                    .or_default()
-                    .push((index, path.clone()));
-            }
-        }
-        for (head, marks) in local {
-            let project = self.project_root.as_deref().ok_or_else(|| {
-                WorkspaceError::Invalid("Git history unavailable for local viewed changes".into())
-            })?;
-            let paths = marks
-                .iter()
-                .map(|(_, path)| path.clone())
-                .collect::<Vec<_>>();
-            let unchanged =
-                crate::diff::unchanged_paths(project, &head, &self.comparison.head, &paths)
-                    .map_err(|error| WorkspaceError::Invalid(error.to_string()))?;
-            excluded.extend(
-                marks
-                    .into_iter()
-                    .filter_map(|(index, path)| (!unchanged.contains(&path)).then_some(index)),
-            );
-        }
-        let sources = (0..self.batch.write.events.len())
-            .filter(|index| !excluded.contains(index))
-            .collect::<Vec<_>>();
-        let mut batch = self.batch.clone();
-        batch.write.events = sources
+        let acknowledged = self
+            .results
             .iter()
-            .map(|index| self.batch.write.events[*index].clone())
-            .collect();
-        let completed = self.completed.iter().filter(|operation| !matches!(&operation.change, Event::SetFileViewed { path, .. } if !paths.contains(path.as_str()))).cloned().collect::<Vec<_>>();
-        let projected = core::project(&review, &batch)?;
-        let mut plan = core::prepare_ordered(&review, &batch, &completed)?;
-        // Filtering must not renumber surviving event identities.
-        for operation in &mut plan.operations {
-            let source = sources[core::operation_source(&batch, &operation.change)? - 1] + 1;
-            *operation = core::operation_at(&self.batch, source, operation.change.clone());
-        }
+            .map(|result| result.operation.id.clone())
+            .collect::<BTreeSet<_>>();
+        let latest_ack = self
+            .batch
+            .write
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| match &record.event {
+                Event::SetFileViewed { path, .. } if acknowledged.contains(&record.id) => {
+                    Some((path.as_str(), index))
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let eligible = self
+            .batch
+            .write
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                let Event::SetFileViewed { path, commit, .. } = &record.event else {
+                    return None;
+                };
+                if acknowledged.contains(&record.id) || !paths.contains(path.as_str()) {
+                    return None;
+                }
+                if latest_ack
+                    .get(path.as_str())
+                    .is_some_and(|ack| index <= *ack)
+                {
+                    return Some(Ok(record.id.clone()));
+                }
+                match commit {
+                    Some(commit) if commit == &self.comparison.head => Ok(Some(record.id.clone())),
+                    Some(commit) => self
+                        .viewed_versions
+                        .as_ref()
+                        .map(|versions| {
+                            Ok(versions
+                                .contains(&(commit.clone(), path.clone()))
+                                .then(|| record.id.clone()))
+                        })
+                        .unwrap_or_else(|| {
+                            Err(WorkspaceError::Invalid(
+                                "viewed mark version eligibility unavailable".into(),
+                            ))
+                        }),
+                    None => Err(WorkspaceError::Invalid(
+                        "viewed mark commit unavailable".into(),
+                    )),
+                }
+                .transpose()
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let overlay = self
+            .results
+            .iter()
+            .skip(self.snapshot_result_count)
+            .map(|result| result.operation.clone())
+            .collect::<Vec<_>>();
+        let (projected, mut plan) =
+            core::derive(&review, &self.batch, &acknowledged, &eligible, &overlay)?;
         if self
             .wip
             .as_ref()
@@ -508,7 +579,7 @@ impl Workspace {
         Ok(item)
     }
 
-    fn root(&self, id: &CommentId) -> Result<ProjectedComment, WorkspaceError> {
+    pub(crate) fn root(&self, id: &CommentId) -> Result<ProjectedComment, WorkspaceError> {
         let mut item = self.find(id)?;
         let mut seen = BTreeSet::new();
         while let Some(id) = parent(&item) {
@@ -520,25 +591,89 @@ impl Workspace {
         Ok(item)
     }
 
+    fn progress_cancelled(&self, event: &Event) -> bool {
+        let Some(key) = progress_key(event) else {
+            return false;
+        };
+        if self.attempts().any(|attempt| {
+            (attempt.uncertain
+                || self
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|active| active.id == attempt.id))
+                && attempt.operations.iter().any(|operation| {
+                    !self.has_result(&operation.id)
+                        && progress_key(&operation.change).as_ref() == Some(&key)
+                })
+        }) {
+            return false;
+        }
+        let recent = self
+            .results
+            .iter()
+            .skip(self.snapshot_result_count)
+            .rev()
+            .find(|result| progress_key(&result.operation.change).as_ref() == Some(&key))
+            .map(|result| &result.operation.change);
+        match event {
+            Event::SetFileViewed { path, viewed, .. } => {
+                let baseline = match recent {
+                    Some(Event::SetFileViewed { viewed, .. }) => Some(*viewed),
+                    _ => self
+                        .review
+                        .read
+                        .files
+                        .iter()
+                        .find(|file| file.path == *path)
+                        .map(|file| file.viewed),
+                };
+                baseline == Some(*viewed)
+            }
+            Event::SetCommentReaction {
+                comment,
+                reaction,
+                present,
+            } => {
+                let baseline = match recent {
+                    Some(Event::SetCommentReaction { present, .. }) => *present,
+                    _ => self.review.read.reactions.iter().any(|item| {
+                        item.comment == *comment
+                            && item.author.as_ref() == Some(&self.review.reviewer.id)
+                            && item.reaction == *reaction
+                    }),
+                };
+                baseline == *present
+            }
+            _ => false,
+        }
+    }
+
     fn append(&mut self, event: Event) -> Result<(), WorkspaceError> {
-        self.batch.write.events.push(event);
+        let cancelled = self.progress_cancelled(&event);
+        let mut record = RecordedEvent::new(event);
+        record.cancelled = cancelled;
+        self.batch.write.events.push(record);
         self.projected()?;
         Ok(())
     }
 
-    fn is_delivered(&self, id: &CommentId) -> bool {
-        self.review.read.comments.iter().any(|c| &c.content.id == id) || self.completed.iter().chain(self.results.iter().map(|result| &result.operation)).any(|op| matches!(&op.change, Event::CreateComment {comment} if &comment.content.id == id))
+    pub(crate) fn is_delivered(&self, id: &CommentId) -> bool {
+        self.review
+            .read
+            .comments
+            .iter()
+            .any(|comment| &comment.content.id == id)
+            || self.results.iter().any(|result| {
+                matches!(&result.operation.change,
+                Event::CreateComment { comment } if &comment.content.id == id)
+            })
     }
 
     /// Receipts remain authoritative after their effects enter a newer baseline.
     pub fn has_result(&self, operation_id: &str) -> bool {
-        self.completed
+        self.results
             .iter()
-            .any(|operation| operation.id == operation_id)
-            || self
-                .results
-                .iter()
-                .any(|result| result.operation.id == operation_id)
+            .any(|result| result.operation.id == operation_id)
     }
 
     fn comment_mutable(&self, id: &CommentId) -> Result<(), WorkspaceError> {
@@ -586,9 +721,69 @@ impl Workspace {
     }
 
     pub fn apply(&mut self, action: Action) -> Result<(), WorkspaceError> {
+        self.apply_group(&[action])
+    }
+
+    pub(crate) fn apply_group(&mut self, actions: &[Action]) -> Result<(), WorkspaceError> {
         let mut candidate = self.clone();
-        candidate.apply_inner(action)?;
+        let mut receipts = None;
+        for action in actions {
+            if let Action::RecordResult { result } = action {
+                let indices = receipts.get_or_insert_with(|| candidate.receipt_indices());
+                candidate.record_result(result.clone(), indices)?;
+            } else {
+                candidate.apply_inner(action.clone())?;
+                if matches!(
+                    action,
+                    Action::BeginPublication { .. } | Action::ResumePublication { .. }
+                ) {
+                    receipts = None;
+                }
+            }
+        }
         *self = candidate;
+        Ok(())
+    }
+
+    fn receipt_indices(&self) -> ReceiptIndices {
+        ReceiptIndices {
+            operations: self
+                .attempt
+                .iter()
+                .flat_map(|attempt| attempt.operations.iter().enumerate())
+                .map(|(index, operation)| (operation.id.clone(), index))
+                .collect(),
+            acknowledged: self
+                .results
+                .iter()
+                .map(|result| result.operation.id.clone())
+                .collect(),
+        }
+    }
+
+    fn record_result(
+        &mut self,
+        result: OperationResult,
+        indices: &mut ReceiptIndices,
+    ) -> Result<(), WorkspaceError> {
+        self.saved_comment = None;
+        let attempt = self
+            .attempt
+            .as_ref()
+            .ok_or_else(|| WorkspaceError::Invalid("no publication attempt".into()))?;
+        if indices
+            .operations
+            .get(&result.operation.id)
+            .and_then(|index| attempt.operations.get(*index))
+            != Some(&result.operation)
+        {
+            return Err(WorkspaceError::Invalid(
+                "result is not part of this publication attempt".into(),
+            ));
+        }
+        if indices.acknowledged.insert(result.operation.id.clone()) {
+            self.results.push(result);
+        }
         Ok(())
     }
 
@@ -613,7 +808,7 @@ impl Workspace {
                 let mut restored = self.clone();
                 restored.batch.write.events.retain(|event| {
                     !matches!(
-                        event, Event::DeleteComment { comment: id } if id == &comment
+                        &event.event, Event::DeleteComment { comment: id } if id == &comment
                     )
                 });
                 restored.owned(&comment)?
@@ -662,7 +857,6 @@ impl Workspace {
         &self,
         comments: Vec<CommentId>,
     ) -> Result<Vec<Action>, WorkspaceError> {
-        let pending = self.pending()?.operations;
         let projected = self.projected()?.comments;
         let mut seen = BTreeSet::new();
         let mut deletions = Vec::new();
@@ -670,32 +864,22 @@ impl Workspace {
         for comment in comments.into_iter().filter(|id| seen.insert(id.clone())) {
             let deleted = self.batch.write.events.iter().any(|event| {
                 matches!(
-                    event, Event::DeleteComment { comment: id } if id == &comment
-                )
-            });
-            let pending_delete = pending.iter().any(|operation| {
-                matches!(
-                    &operation.change, Event::DeleteComment { comment: id } if id == &comment
+                    &event.event, Event::DeleteComment { comment: id } if id == &comment
                 )
             });
             let canceled_create = !self.is_delivered(&comment) && deleted
                 && self.batch.write.events.iter().any(|event| matches!(
-                    event, Event::CreateComment { comment: draft } if draft.content.id == comment
+                    &event.event, Event::CreateComment { comment: draft } if draft.content.id == comment
                 ));
-            if pending_delete || canceled_create {
+            if canceled_create {
                 let mut restored = self.clone();
                 restored.batch.write.events.retain(|event| {
                     !matches!(
-                        event, Event::DeleteComment { comment: id } if id == &comment
+                        &event.event, Event::DeleteComment { comment: id } if id == &comment
                     )
                 });
                 restored.owned(&comment)?;
-                // A canceled create stays inert; only a pending remote deletion is restored.
-                actions.push(if pending_delete {
-                    Action::Restore { comment }
-                } else {
-                    Action::Delete { comment }
-                });
+                actions.push(Action::Delete { comment });
             } else {
                 let item = projected
                     .iter()
@@ -760,13 +944,9 @@ impl Workspace {
                     self.find(&id)?;
                     return self.apply_inner(Action::Delete { comment: id });
                 }
-                if self
-                    .batch
-                    .write
-                    .events
-                    .iter()
-                    .any(|event| matches!(event,Event::DeleteComment{comment} if *comment==id))
-                {
+                if self.batch.write.events.iter().any(
+                    |event| matches!(&event.event,Event::DeleteComment{comment} if *comment==id),
+                ) {
                     self.apply_inner(Action::Restore {
                         comment: id.clone(),
                     })?;
@@ -963,7 +1143,7 @@ impl Workspace {
                     ));
                 }
                 if self.batch.write.events.iter().any(
-                    |event| matches!(event, Event::DeleteComment { comment: id } if id == &comment),
+                    |event| matches!(&event.event, Event::DeleteComment { comment: id } if id == &comment),
                 ) {
                     // Repeated operators can still address a deleted object in the stable buffer.
                     // Restoration validates ownership and publication guards without changing it.
@@ -994,33 +1174,13 @@ impl Workspace {
                 self.append(Event::DeleteComment { comment })?;
             }
             Action::Restore { comment } => {
-                self.comment_mutable(&comment)?;
-                if self.attempt.as_ref().is_some_and(|attempt| {
-                    attempt.operations.iter().any(
-                        |op| matches!(&op.change,Event::DeleteComment{comment:id} if *id==comment),
-                    )
+                self.unsent_comment(&comment)?;
+                if !self.batch.write.events.iter().any(|record| {
+                    matches!(&record.event,
+                    Event::CreateComment { comment: draft } if draft.content.id == comment)
                 }) {
                     return Err(WorkspaceError::Invalid(
-                        "deletion is in progress or uncertain; cannot restore".into(),
-                    ));
-                }
-                let fetched = self
-                    .review
-                    .read
-                    .comments
-                    .iter()
-                    .any(|c| c.content.id == comment);
-                let created=self.batch.write.events.iter().any(|event|matches!(event,Event::CreateComment{comment:draft} if draft.content.id==comment));
-                if !fetched && !created {
-                    return Err(WorkspaceError::Invalid(
-                        "restore only cancels an unsent deletion of a known comment".into(),
-                    ));
-                }
-                if self.completed.iter().chain(self.results.iter().map(|result|&result.operation)).any(
-                    |op| matches!(&op.change,Event::DeleteComment{comment:id} if *id == comment),
-                ) {
-                    return Err(WorkspaceError::Invalid(
-                        "deletion already sent; cannot restore a remote resource".into(),
+                        "restore requires a local draft".into(),
                     ));
                 }
                 if self.conflicts.contains_key(&comment) {
@@ -1033,16 +1193,15 @@ impl Workspace {
                     .write
                     .events
                     .iter()
-                    .any(|e| matches!(e,Event::DeleteComment{comment:id} if *id==comment))
+                    .any(|e| matches!(&e.event,Event::DeleteComment{comment:id} if *id==comment))
                 {
                     return Err(WorkspaceError::Invalid(
                         "comment has no unsent deletion to restore".into(),
                     ));
                 }
-                self.batch
-                    .write
-                    .events
-                    .retain(|e| !matches!(e,Event::DeleteComment{comment:id} if *id == comment));
+                self.batch.write.events.retain(
+                    |e| !matches!(&e.event,Event::DeleteComment{comment:id} if *id == comment),
+                );
                 self.owned(&comment)?;
             }
             Action::Undo { comments } => {
@@ -1058,11 +1217,12 @@ impl Workspace {
                     .find(|f| f.path == path)
                     .ok_or_else(|| CoreError::MissingFile(path.clone()))?;
                 if previous.viewed != viewed {
-                    self.append(Event::SetFileViewed {
+                    let event = Event::SetFileViewed {
                         path,
                         viewed,
                         commit: Some(self.comparison.head.clone()),
-                    })?;
+                    };
+                    self.append(event)?;
                 }
             }
             Action::Reaction { comment, present } => {
@@ -1140,12 +1300,12 @@ impl Workspace {
                     .events
                     .iter_mut()
                     .find(
-                        |e| matches!(e,Event::CreateComment{comment:c} if c.content.id == comment),
+                        |e| matches!(&e.event,Event::CreateComment{comment:c} if c.content.id == comment),
                     )
                     .ok_or_else(|| {
                         WorkspaceError::Invalid("draft creation event unavailable".into())
                     })?;
-                let Event::CreateComment { comment: draft } = event else {
+                let Event::CreateComment { comment: draft } = &mut event.event else {
                     unreachable!()
                 };
                 if !matches!(draft.target, CommentTarget::Diff(_)) {
@@ -1170,10 +1330,10 @@ impl Workspace {
                     .ok_or_else(|| WorkspaceError::Invalid("comment has no conflict".into()))?;
                 match resolution {
                     Resolution::Remote => {
-                        self.batch.write.events.retain(|event|!matches!(event,Event::EditComment{comment:id,..}|Event::DeleteComment{comment:id} if *id==comment));
+                        self.batch.write.events.retain(|event|!matches!(&event.event,Event::EditComment{comment:id,..}|Event::DeleteComment{comment:id} if *id==comment));
                         if conflict.remote.is_none() {
                             // A reply requires a live root; retain it as a separate blocked conflict.
-                            let replies = self.batch.write.events.iter().filter_map(|e| match e {Event::CreateComment {comment:d} if matches!(&d.target,CommentTarget::Reply(p) if p == &comment) => Some(d.content.id.clone()),_=>None}).collect::<Vec<_>>();
+                            let replies = self.batch.write.events.iter().filter_map(|e| match &e.event {Event::CreateComment {comment:d} if matches!(&d.target,CommentTarget::Reply(p) if p == &comment) => Some(d.content.id.clone()),_=>None}).collect::<Vec<_>>();
                             if !replies.is_empty() {
                                 return Err(WorkspaceError::Invalid(format!(
                                     "missing root still has unpublished replies: {}",
@@ -1191,19 +1351,22 @@ impl Workspace {
                             return Err(WorkspaceError::Invalid("remote comment was deleted; discard intent or create a new comment explicitly".into()));
                         }
                         if resolution == Resolution::Edit {
-                            if self.batch.write.events.iter().any(|event|matches!(event,Event::DeleteComment{comment:id} if *id==comment)) {return Err(WorkspaceError::Invalid("deletion conflict supports local or remote resolution only".into()));}
+                            if self.batch.write.events.iter().any(|event|matches!(&event.event,Event::DeleteComment{comment:id} if *id==comment)) {return Err(WorkspaceError::Invalid("deletion conflict supports local or remote resolution only".into()));}
                             let body = body.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
                                 WorkspaceError::Invalid(
                                     "edited resolution needs a nonblank body".into(),
                                 )
                             })?;
                             self.batch.write.events.retain(
-                                |e| !matches!(e,Event::DeleteComment{comment:id} if *id == comment),
+                                |e| !matches!(&e.event,Event::DeleteComment{comment:id} if *id == comment),
                             );
-                            self.batch.write.events.push(Event::EditComment {
-                                comment: comment.clone(),
-                                body,
-                            });
+                            self.batch
+                                .write
+                                .events
+                                .push(RecordedEvent::new(Event::EditComment {
+                                    comment: comment.clone(),
+                                    body,
+                                }));
                         }
                     }
                 }
@@ -1315,23 +1478,8 @@ impl Workspace {
                 });
             }
             Action::RecordResult { result } => {
-                let attempt = self
-                    .attempt
-                    .as_ref()
-                    .ok_or_else(|| WorkspaceError::Invalid("no publication attempt".into()))?;
-                if !attempt.operations.contains(&result.operation) {
-                    return Err(WorkspaceError::Invalid(
-                        "result is not part of this publication attempt".into(),
-                    ));
-                }
-                if !self.has_result(&result.operation.id) {
-                    if !matches!(&result.operation.change, Event::CreateComment { comment }
-                        if self.review.read.comments.iter().any(|fetched| fetched.content.id == comment.content.id))
-                    {
-                        self.completed.push(result.operation.clone());
-                    }
-                    self.results.push(result);
-                }
+                let mut indices = self.receipt_indices();
+                self.record_result(result, &mut indices)?;
             }
             Action::SetAttemptProvider { provider } => {
                 self.attempt
@@ -1385,130 +1533,6 @@ impl Workspace {
             }
         }
         Ok(())
-    }
-
-    /// Destination selection never imports drafts from the other publication style.
-    pub fn prepare(&self, destination: Destination) -> Result<CommitState, WorkspaceError> {
-        if destination == Destination::Review
-            && self.suspended_attempts.iter().any(|attempt| {
-                self.wip
-                    .as_ref()
-                    .is_some_and(|w| attempt.wip.as_ref() == Some(&w.id))
-            })
-        {
-            return Err(WorkspaceError::Invalid(
-                "review submission is uncertain; reconcile that attempt before submitting".into(),
-            ));
-        }
-        let pending = self.pending()?;
-        let mut blocked = self
-            .conflicts
-            .keys()
-            .chain(self.rejected_anchors.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut blocked_files = BTreeSet::new();
-        for attempt in &self.suspended_attempts {
-            for operation in &attempt.operations {
-                if self.has_result(&operation.id) {
-                    continue;
-                }
-                if let Some(comment) = operation_comment(&operation.change) {
-                    blocked.insert(comment.clone());
-                }
-                if let Event::SetFileViewed { path, .. } = &operation.change {
-                    blocked_files.insert(path.clone());
-                }
-            }
-        }
-        loop {
-            let before = blocked.len();
-            for op in &pending.operations {
-                if let Event::CreateComment { comment } = &op.change
-                    && let CommentTarget::Reply(parent) = &comment.target
-                    && blocked.contains(parent)
-                {
-                    blocked.insert(comment.content.id.clone());
-                }
-            }
-            if before == blocked.len() {
-                break;
-            }
-        }
-        let mut operations = vec![];
-        let mut blocked_review = vec![];
-        for operation in pending.operations {
-            let belongs = match &operation.change {
-                Event::CreateComment { comment } => {
-                    self.destinations
-                        .get(&comment.content.id)
-                        .copied()
-                        .unwrap_or(Destination::Standalone)
-                        == destination
-                }
-                Event::SetReviewConclusion { .. } => destination == Destination::Review,
-                Event::EditComment { .. }
-                | Event::DeleteComment { .. }
-                | Event::DismissReview { .. } => destination == Destination::Standalone,
-                Event::SetCommentReaction { .. } | Event::SetFileViewed { .. } => true,
-            };
-            if !belongs {
-                continue;
-            }
-            if matches!(&operation.change,Event::SetFileViewed{path,..} if blocked_files.contains(path))
-            {
-                continue;
-            }
-            if let Some(id) = operation_comment(&operation.change)
-                && blocked.contains(id)
-            {
-                if destination == Destination::Review {
-                    blocked_review.push(id.0.clone());
-                }
-                continue;
-            }
-            if let Event::CreateComment { comment } = &operation.change
-                && let CommentTarget::Reply(parent) = &comment.target
-                && !self.is_delivered(parent)
-                && self.destinations.get(parent) != Some(&destination)
-            {
-                return Err(WorkspaceError::Invalid(format!(
-                    "reply {} has an unpublished parent in another destination",
-                    comment.content.id.0
-                )));
-            }
-            operations.push(operation);
-        }
-        if !blocked_review.is_empty() {
-            return Err(WorkspaceError::Invalid(format!(
-                "review has unresolved conflicts: {}",
-                blocked_review.join(", ")
-            )));
-        }
-        if destination == Destination::Review {
-            let conclusion = self
-                .wip
-                .as_ref()
-                .and_then(|w| w.conclusion.as_ref())
-                .ok_or_else(|| {
-                    WorkspaceError::Invalid("save a review conclusion before submitting".into())
-                })?;
-            if conclusion.outcome != ReviewOutcome::Approve
-                && conclusion.body.as_ref().is_none_or(|b| b.trim().is_empty())
-            {
-                return Err(WorkspaceError::Invalid(
-                    "Comment and Request changes require a nonblank summary".into(),
-                ));
-            }
-            // Provider submission precedes independently retryable progress.
-            operations.sort_by_key(|op| {
-                matches!(
-                    op.change,
-                    Event::SetFileViewed { .. } | Event::SetCommentReaction { .. }
-                )
-            });
-        }
-        Ok(CommitState { operations })
     }
 
     /// Select every surviving local operation without skipping blocked intent.
@@ -1596,52 +1620,6 @@ impl Workspace {
         let (projected, pending) = self.get_unpublished()?;
         let pending = pending.operations;
         let mut comments = projected.comments;
-        let deleted = pending
-            .iter()
-            .filter_map(|operation| match &operation.change {
-                Event::DeleteComment { comment } => Some(comment.clone()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        for c in &self.review.read.comments {
-            if deleted.contains(&c.content.id)
-                && !comments
-                    .iter()
-                    .any(|item| item.content().id == c.content.id)
-            {
-                comments.push(ProjectedComment::Read(c.clone()));
-            }
-        }
-        for operation in &pending {
-            let Event::DeleteComment { comment: id } = &operation.change else {
-                continue;
-            };
-            if comments.iter().any(|comment| &comment.content().id == id) {
-                continue;
-            }
-            let Some(mut published) = self.completed.iter().find_map(|operation| match &operation
-                .change
-            {
-                Event::CreateComment { comment } if &comment.content.id == id => {
-                    Some(comment.clone())
-                }
-                _ => None,
-            }) else {
-                continue;
-            };
-            if let Some(body) =
-                self.completed
-                    .iter()
-                    .rev()
-                    .find_map(|operation| match &operation.change {
-                        Event::EditComment { comment, body } if comment == id => Some(body),
-                        _ => None,
-                    })
-            {
-                published.content.body = body.clone();
-            }
-            comments.push(ProjectedComment::Draft(published));
-        }
         let mut chronological = self
             .review
             .read
@@ -1662,7 +1640,7 @@ impl Workspace {
         }
         let fetched_count = order.len();
         for (index, event) in self.batch.write.events.iter().enumerate() {
-            if let Event::CreateComment { comment } = event {
+            if let Event::CreateComment { comment } = &event.event {
                 order
                     .entry(comment.content.id.clone())
                     .or_insert(fetched_count + index);
@@ -1737,34 +1715,11 @@ impl Workspace {
                     .comments
                     .iter()
                     .any(|c| &c.content.id == id);
-                let done = if deleted.contains(id) {
-                    self.batch
-                        .write
-                        .events
-                        .iter()
-                        .rev()
-                        .find_map(|event| match event {
-                            Event::SetCommentReaction {
-                                comment,
-                                reaction,
-                                present,
-                            } if comment == id && is_thumbs_up(reaction) => Some(*present),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| {
-                            self.review.read.reactions.iter().any(|r| {
-                                &r.comment == id
-                                    && r.author.as_ref() == Some(&self.review.reviewer.id)
-                                    && is_thumbs_up(&r.reaction)
-                            })
-                        })
-                } else {
-                    projected.reactions.iter().any(|r| {
-                        &r.comment == id
-                            && r.author.as_ref() == Some(&self.review.reviewer.id)
-                            && is_thumbs_up(&r.reaction)
-                    })
-                };
+                let done = projected.reactions.iter().any(|reaction| {
+                    &reaction.comment == id
+                        && reaction.author.as_ref() == Some(&self.review.reviewer.id)
+                        && is_thumbs_up(&reaction.reaction)
+                });
                 CommentView {
                     fetched,
                     draft: match &comment {
@@ -1793,7 +1748,6 @@ impl Workspace {
                     } else {
                         None
                     },
-                    pending_delete: deleted.contains(id),
                     anchor_error: self.rejected_anchors.get(id).cloned(),
                     conflict: self.conflicts.contains_key(id),
                     summary: self.summary_comments.contains(id),
@@ -1853,202 +1807,77 @@ impl Workspace {
                 "publication must be reconciled before refreshing saved intent".into(),
             ));
         }
-        let mut pending = self.pending()?.operations;
-        // An unknown earlier write can still settle after a user toggles back
-        // to the old baseline. Retain the final explicit desired progress even
-        // when it currently nets to no operation against that old baseline.
-        let uncertain_keys = self
-            .suspended_attempts
+        let pending = self.pending()?.operations;
+        let remote = review
+            .read
+            .comments
             .iter()
-            .flat_map(|attempt| attempt.operations.iter())
-            .filter(|operation| !self.has_result(&operation.id))
-            .filter_map(|operation| progress_key(&operation.change))
-            .collect::<BTreeSet<_>>();
-        let mut progress = BTreeMap::new();
-        for event in &self.batch.write.events {
-            if let Some(key) = progress_key(event)
-                && uncertain_keys.contains(&key)
-            {
-                progress.insert(key, event.clone());
-            }
-        }
-        pending.retain(|operation| {
-            progress_key(&operation.change).is_none_or(|key| !progress.contains_key(&key))
-        });
+            .map(|comment| (comment.content.id.clone(), comment))
+            .collect::<BTreeMap<_, _>>();
         let previous = self
             .review
             .read
             .comments
             .iter()
-            .map(|c| (c.content.id.clone(), c))
+            .map(|comment| (comment.content.id.clone(), comment))
             .collect::<BTreeMap<_, _>>();
-        let remote = review
-            .read
-            .comments
-            .iter()
-            .map(|c| (c.content.id.clone(), c))
-            .collect::<BTreeMap<_, _>>();
-        let mut conflicts = self.conflicts.clone();
-        for conflict in conflicts.values_mut() {
-            conflict.remote = remote.get(&conflict.comment).map(|c| (*c).clone());
+        for conflict in self.conflicts.values_mut() {
+            conflict.remote = remote
+                .get(&conflict.comment)
+                .map(|comment| (*comment).clone());
             conflict.kind = if conflict.remote.is_some() {
                 ConflictKind::Changed
             } else {
                 ConflictKind::Deleted
             };
         }
-        // A confirmed local creation is still a draft until a complete fetch
-        // includes it. Receipts do not themselves create checklist membership.
-        let unfetched = self
-            .completed
-            .iter()
-            .filter_map(|op| match &op.change {
-                Event::CreateComment { comment } if !remote.contains_key(&comment.content.id) => {
-                    Some(comment.content.id.clone())
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let retained = self
-            .completed
-            .iter()
-            .filter(|op| operation_comment(&op.change).is_some_and(|id| unfetched.contains(id)))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut events = retained
-            .iter()
-            .map(|op| op.change.clone())
-            .collect::<Vec<_>>();
-        let viewed = self
-            .batch
-            .write
-            .events
-            .iter()
-            .enumerate()
-            .filter(|(index, event)| {
-                matches!(event, Event::SetFileViewed { .. })
-                    && !self.has_result(
-                        &core::operation_at(&self.batch, index + 1, (*event).clone()).id,
-                    )
-            })
-            .map(|(index, event)| (index + 1, event.clone()))
-            .collect::<Vec<_>>();
-        let mut viewed_sources = viewed.iter().map(|(index, _)| *index);
-        for op in pending {
-            if matches!(op.change, Event::SetFileViewed { .. }) {
-                continue;
-            }
-            match &op.change {
+        for operation in pending {
+            let comment = match &operation.change {
                 Event::EditComment { comment, body } => {
-                    if let Some(new) = remote.get(comment)
-                        && new.content.body == *body
+                    if remote
+                        .get(comment)
+                        .is_some_and(|new| new.content.body == *body)
                     {
-                        conflicts.remove(comment);
+                        self.conflicts.remove(comment);
                         continue;
                     }
-                    if let Some(old) = previous.get(comment)
-                        && remote
-                            .get(comment)
-                            .is_none_or(|new| new.content.body != old.content.body)
-                    {
-                        conflicts.insert(
-                            comment.clone(),
-                            Conflict {
-                                comment: comment.clone(),
-                                previous: (*old).clone(),
-                                remote: remote.get(comment).map(|c| (*c).clone()),
-                                kind: if remote.contains_key(comment) {
-                                    ConflictKind::Changed
-                                } else {
-                                    ConflictKind::Deleted
-                                },
-                            },
-                        );
-                    }
+                    comment
                 }
                 Event::DeleteComment { comment } => {
                     if !remote.contains_key(comment) {
-                        conflicts.remove(comment);
                         continue;
                     }
-                    if let Some(old) = previous.get(comment)
-                        && remote[comment].content.body != old.content.body
-                    {
-                        conflicts.insert(
-                            comment.clone(),
-                            Conflict {
-                                comment: comment.clone(),
-                                previous: (*old).clone(),
-                                remote: Some(remote[comment].clone()),
-                                kind: ConflictKind::Changed,
-                            },
-                        );
-                    }
+                    comment
                 }
-                Event::SetCommentReaction { comment, .. } if !remote.contains_key(comment) => {
-                    continue;
-                }
-                Event::CreateComment { comment } => {
-                    if remote.contains_key(&comment.content.id) {
-                        continue;
-                    }
-                    if let CommentTarget::Reply(parent) = &comment.target
-                        && !remote.contains_key(parent)
-                        && let Some(old) = previous.get(parent)
-                    {
-                        conflicts.insert(
-                            parent.clone(),
-                            Conflict {
-                                comment: parent.clone(),
-                                previous: (*old).clone(),
-                                remote: None,
-                                kind: ConflictKind::Deleted,
-                            },
-                        );
-                    }
-                }
-                _ => {}
-            }
-            events.push(op.change);
-        }
-        events.extend(viewed.iter().map(|(_, event)| event.clone()));
-        for event in progress.into_values() {
-            if matches!(event, Event::SetFileViewed { .. }) {
-                continue;
-            }
-            if matches!(&event,Event::SetCommentReaction{comment,..} if !remote.contains_key(comment))
+                Event::CreateComment { comment } => match &comment.target {
+                    CommentTarget::Reply(parent) if !remote.contains_key(parent) => parent,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            if let Some(old) = previous.get(comment)
+                && remote
+                    .get(comment)
+                    .is_none_or(|new| new.content.body != old.content.body)
             {
-                continue;
+                self.conflicts.insert(
+                    comment.clone(),
+                    Conflict {
+                        comment: comment.clone(),
+                        previous: (*old).clone(),
+                        remote: remote.get(comment).map(|new| (*new).clone()),
+                        kind: if remote.contains_key(comment) {
+                            ConflictKind::Changed
+                        } else {
+                            ConflictKind::Deleted
+                        },
+                    },
+                );
             }
-            events.push(event);
         }
-        // Preserve interleaving as well as creation chronology when rebasing intent.
-        let mut events = events
-            .into_iter()
-            .map(|event| {
-                let source = if matches!(event, Event::SetFileViewed { .. }) {
-                    viewed_sources
-                        .next()
-                        .expect("retained viewed event has source")
-                } else {
-                    core::operation_source(&self.batch, &event)?
-                };
-                Ok((source, event))
-            })
-            .collect::<Result<Vec<_>, CoreError>>()?;
-        events.sort_by_key(|(source, event)| {
-            (matches!(event, Event::SetReviewConclusion { .. }), *source)
-        });
-        let events = events.into_iter().map(|(_, event)| event).collect();
         self.review = review;
-        self.batch = Batch {
-            id: self.batch.id.clone(),
-            revision: self.batch.revision.clone(),
-            review: self.review.id.clone(),
-            write: WriteState { events },
-        };
-        self.completed = retained;
-        self.conflicts = conflicts;
+        self.batch.review = self.review.id.clone();
+        self.snapshot_result_count = self.results.len();
         if self.suspended_attempts.is_empty() {
             self.last_error = None;
         }

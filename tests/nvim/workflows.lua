@@ -16,7 +16,7 @@ local messages = {}
 vim.notify = function(message) messages[#messages + 1] = tostring(message) end
 local revision = { base = string.rep('a', 40), head = string.rep('b', 40) }
 local function read_comment(id, author, line, draft)
-  return { comment = { origin = draft and 'draft' or 'read', comment = { id = id, body = 'Feedback ' .. id, author = { id = author, name = author }, target = { kind = 'diff', target = { revision = revision, path = 'src/file.rs', range = { start = { side = 'head', line = line }, ['end'] = { side = 'head', line = line } } } } } }, fetched = not draft, draft = draft or false, destination = draft and 'review' or nil, done = false, pending_delete = false, conflict = false, summary = false }
+  return { comment = { origin = draft and 'draft' or 'read', comment = { id = id, body = 'Feedback ' .. id, author = { id = author, name = author }, target = { kind = 'diff', target = { revision = revision, path = 'src/file.rs', range = { start = { side = 'head', line = line }, ['end'] = { side = 'head', line = line } } } } } }, fetched = not draft, draft = draft or false, destination = draft and 'review' or nil, done = false, conflict = false, summary = false }
 end
 local initial = {
   id = 'workspace-1', generation = 0,
@@ -549,7 +549,7 @@ for _, line in ipairs({ 2, 3 }) do
   api.nvim_win_set_cursor(0, { line, 0 })
   local before_immutable_delete = #requests('delete')
   input('dd')
-  assert(#requests('delete') == before_immutable_delete and not state().comments[2].pending_delete and messages[#messages]:find('immutable', 1, true), 'chooser deleted fetched comment')
+  assert(#requests('delete') == before_immutable_delete and messages[#messages]:find('immutable', 1, true), 'chooser deleted fetched comment')
   local restored, reversed = #requests('restore'), #requests('reaction')
   input('u')
   wait(function() return #requests('reaction') == reversed + 1 end)
@@ -660,31 +660,6 @@ require('buf_review').enter()
 assert(kind() == 'thread')
 command('reply')
 assert(kind() == 'thread')
-
--- Conflict view preserves panes; each explicit resolution updates saved intent.
-for _, resolution in ipairs({ 'local', 'remote', 'edit' }) do
-  next_state = state()
-  local row = next_state.comments[2]
-  row.conflict = true
-  local previous = vim.deepcopy(row.comment.comment)
-  local remote = vim.deepcopy(previous)
-  remote.body = 'Remote body'
-  next_state.conflicts = { { comment = previous.id, previous = previous, remote = remote, kind = 'changed' } }
-  write('state.json', next_state)
-  command('')
-  wait(function() return kind() == 'home' and state().generation > next_state.generation end)
-  home_row('CONFLICT')
-  require('buf_review').enter()
-  assert(kind() == 'conflict')
-  local conflict_text = table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n')
-  assert(conflict_text:find('## Local', 1, true) and conflict_text:find('## Remote', 1, true) and conflict_text:find('## Previously observed', 1, true))
-  command('resolve ' .. resolution)
-  if resolution == 'edit' then
-    assert(kind() == 'conflict' and messages[#messages]:find('immutable', 1, true), 'legacy fetched conflict became editable')
-    command('resolve remote')
-  end
-  wait(function() return #state().conflicts == 0 end)
-end
 
 -- Empty Approve summary is valid and remains queued until explicit publication.
 command('')
@@ -899,7 +874,7 @@ receipt_view.comments[#receipt_view.comments + 1] = {
     id = 'receipt-root', body = 'Published root before first refetch', author = initial.review.reviewer,
     target = { kind = 'diff', target = { revision = revision, path = 'src/file.rs', range = { start = { side = 'head', line = 1 }, ['end'] = { side = 'head', line = 1 } } } },
   } },
-  fetched = false, done = false, pending_delete = false, conflict = false, summary = false,
+  fetched = false, done = false, conflict = false, summary = false,
 }
 write('state.json', receipt_view)
 command('refresh')
@@ -1003,7 +978,7 @@ input('dd')
 assert(#requests('delete') == before_unbound_delete and #messages == before_unbound_notice, 'discussion blank dd targeted root')
 api.nvim_win_set_cursor(0, { body_line, 0 })
 input('dd')
-assert(#requests('delete') == before_unbound_delete and not state().comments[1].pending_delete, 'fetched discussion deletion changed saved state')
+assert(#requests('delete') == before_unbound_delete, 'fetched discussion deletion changed saved state')
 local before_gap_restore, before_gap_reaction = #requests('restore'), #requests('reaction')
 for _, line in ipairs({ 1, body_line - 1 }) do
   api.nvim_win_set_cursor(0, { line, 0 })
@@ -1170,7 +1145,7 @@ assert(#requests('publish') == before_blank_publish and #requests('submit') == b
 
 -- Delete restrictions must fail without discarding the typed whitespace.
 local restricted = state()
-local parent = { comment = { origin = 'draft', comment = { id = 'blank-parent', body = 'Parent with local reply', author = { id = 'me', name = 'me' }, target = { kind = 'pull_request' } } }, fetched = false, done = false, destination = 'standalone', pending_delete = false, conflict = false, summary = false }
+local parent = { comment = { origin = 'draft', comment = { id = 'blank-parent', body = 'Parent with local reply', author = { id = 'me', name = 'me' }, target = { kind = 'pull_request' } } }, fetched = false, done = false, destination = 'standalone', conflict = false, summary = false }
 local child = vim.deepcopy(parent)
 child.comment.comment.id, child.comment.comment.body = 'blank-child', 'Local child'
 child.comment.comment.target = { kind = 'reply', target = 'blank-parent' }
@@ -1265,7 +1240,7 @@ for _, forbidden in ipairs({ 'foreign', 'summary', 'unselected-child', 'selected
     assert(#state().comments == 0, 'explicitly selected local thread was not cancelled')
   else
     assert(#requests('delete') == before, forbidden .. ' selection partially deleted allowed objects')
-    assert(#state().comments == 2 and not state().comments[1].pending_delete, forbidden .. ' selection changed saved state')
+    assert(#state().comments == 2, forbidden .. ' selection changed saved state')
   end
 end
 
@@ -1328,26 +1303,6 @@ for _, reader in ipairs({ 'selector', 'thread' }) do
   assert(not api.nvim_win_is_valid(discussion_window) and api.nvim_get_current_win() == source_window
     and api.nvim_get_current_buf() == source_buffer, 'empty ' .. reader .. ' did not close back to source code')
 end
-
--- A fetched pending deletion remains in its reader so u can restore it.
-cancelled_roots.generation = state().generation + 1
-cancelled_roots.comments = { read_comment('pending-visible', 'me', 1) }
-cancelled_roots.comments[1].pending_delete = true
-cancelled_roots.todo, cancelled_roots.done, cancelled_roots.pending = { 'pending-visible' }, {}, {}
-write('state.json', cancelled_roots)
-command('')
-wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Feedback pending-visible', 1, true) end)
-home_row('Feedback pending-visible'); require('buf_review').enter()
-wait(function() return kind() == 'thread' end)
-local pending_window, pending_buffer = api.nvim_get_current_win(), api.nvim_get_current_buf()
-assert(state().comments[1].pending_delete, 'legacy deletion fixture lost pending state')
-assert(kind() == 'thread' and api.nvim_win_is_valid(pending_window) and api.nvim_get_current_buf() == pending_buffer,
-  'fetched pending deletion closed its undoable discussion')
-home_row('Feedback pending-visible')
-assert(not vim.tbl_contains(api.nvim_buf_get_lines(0, 0, -1, false), '-----------------------------'), 'pending single-comment discussion retained a divider')
-input('u')
-wait(function() return not state().comments[1].pending_delete end)
-assert(kind() == 'thread' and api.nvim_get_current_buf() == pending_buffer, 'pending deletion restore replaced its discussion')
 
 -- Empty body newlines are objects only for linewise or explicit visual deletion.
 for _, case in ipairs({ { keys = 'D', deleted = false }, { keys = 'd$', deleted = false }, { keys = 'dd', deleted = true }, { keys = 'vd', deleted = true }, { keys = 'vx', deleted = true } }) do
@@ -1432,94 +1387,7 @@ local repeated = requests('delete')
 assert(repeated[before_repeat + 1].comment == 'repeat-a' and repeated[before_repeat + 2].comment == 'repeat-b', 'dot repeated stale object instead of current row')
 for register, saved in pairs(registers) do assert(vim.fn.getreg(register) == saved[1] and vim.fn.getregtype(register) == saved[2], 'review deletion changed register ' .. register) end
 
--- Restore permissions remain enforced; structural rows cannot restore a root fallback.
-local restore_view = state()
-restore_view.generation = restore_view.generation + 1
-restore_view.comments = { read_comment('restore-owned', 'me', 1), read_comment('restore-reply', 'me', 1), read_comment('restore-foreign', 'alice', 2) }
-restore_view.comments[1].pending_delete, restore_view.comments[3].pending_delete = true, true
-restore_view.comments[2].comment.comment.target = { kind = 'reply', target = 'restore-owned' }
-restore_view.todo, restore_view.pending, restore_view.done = { 'restore-owned', 'restore-reply', 'restore-foreign' }, {}, {}
-write('state.json', restore_view)
-command('')
-wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Feedback restore-foreign', 1, true) end)
-local before_protected_restore = #requests('restore')
-home_row('Feedback restore-foreign')
-api.nvim_win_set_cursor(0, { api.nvim_win_get_cursor(0)[1], 0 })
-input('u')
-assert(#requests('restore') == before_protected_restore and state().comments[3].pending_delete and messages[#messages]:find('verified ownership', 1, true), 'u bypassed restore ownership')
-home_row('Feedback restore-owned')
-require('buf_review').enter()
-wait(function() return kind() == 'thread' end)
-local before_restore_gap_notice = #messages
-for _, line in ipairs({ 1, home_row('---') }) do api.nvim_win_set_cursor(0, { line, 0 }); input('u') end
-assert(#requests('restore') == before_protected_restore and #messages == before_restore_gap_notice and state().comments[1].pending_delete, 'thread divider/margin u was not a quiet no-op')
-home_row('Feedback restore-owned')
-api.nvim_win_set_cursor(0, { api.nvim_win_get_cursor(0)[1], 4 })
-input('u')
-wait(function() return not state().comments[1].pending_delete end)
-assert(requests('restore')[#requests('restore')].comment == 'restore-owned', 'nonzero-column u restored wrong object')
-
--- One reverse action handles mixed objects, once per object across duplicate rows.
-local reverse_view = state()
-reverse_view.generation = reverse_view.generation + 1
-reverse_view.comments = { read_comment('reverse-deleted', 'me', 1), read_comment('reverse-done', 'alice', 2) }
-reverse_view.comments[1].pending_delete, reverse_view.comments[2].done = true, true
-reverse_view.pending = { { id = 'reverse-delete-op', change = { kind = 'delete_comment', comment = 'reverse-deleted' } } }
-reverse_view.todo, reverse_view.done = { 'reverse-deleted' }, { 'reverse-done' }
-reverse_view.files = { { path = 'src/reverse.rs', viewed = true } }
-reverse_view.conflicts, reverse_view.wip = {}, nil
-write('state.json', reverse_view)
-command('')
-wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('src/reverse.rs', 1, true) end)
-local before_reverse_restore, before_reverse_reaction, before_reverse_viewed = #requests('restore'), #requests('reaction'), #requests('viewed')
-input('ggVGu')
-wait(function() return #requests('restore') == before_reverse_restore + 1 and #requests('reaction') == before_reverse_reaction + 1 and #requests('viewed') == before_reverse_viewed + 1 and not state().comments[1].pending_delete and not state().comments[2].done and not state().files[1].viewed end)
-assert(#requests('restore') == before_reverse_restore + 1 and requests('restore')[before_reverse_restore + 1].comment == 'reverse-deleted', 'mixed visual u failed to deduplicate restoration')
-assert(#requests('reaction') == before_reverse_reaction + 1 and requests('reaction')[before_reverse_reaction + 1].comment == 'reverse-done' and requests('reaction')[before_reverse_reaction + 1].present == false, 'mixed visual u changed deleted comment progress')
-assert(not state().comments[1].pending_delete and not state().comments[2].done and not state().files[1].viewed, 'mixed visual u failed to reverse selected state')
-
--- A later forbidden object prevents every write in a mixed selection.
-reverse_view = state()
-reverse_view.generation = reverse_view.generation + 1
-reverse_view.comments = { read_comment('reverse-allowed', 'me', 1), read_comment('reverse-forbidden', 'alice', 2) }
-for _, row in ipairs(reverse_view.comments) do row.pending_delete = true end
-reverse_view.todo, reverse_view.done, reverse_view.pending = { 'reverse-allowed', 'reverse-forbidden' }, {}, {}
-write('state.json', reverse_view)
-command('')
-wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Feedback reverse-forbidden', 1, true) end)
-before_reverse_restore, before_reverse_reaction, before_reverse_viewed = #requests('restore'), #requests('reaction'), #requests('viewed')
-input('ggVGu')
-assert(#requests('restore') == before_reverse_restore and #requests('reaction') == before_reverse_reaction and #requests('viewed') == before_reverse_viewed and messages[#messages]:find('verified ownership', 1, true), 'mixed visual u wrote before ownership preflight finished')
-assert(state().comments[1].pending_delete and state().comments[2].pending_delete, 'failed visual u partially restored selection')
-home_row('Feedback reverse-allowed')
-local before_todo_generation, before_todo_notices = state().generation, #messages
-command('todo')
-wait(function() return #messages > before_todo_notices end, 'explicit Todo pending deletion validation missing')
-assert(#requests('restore') == before_reverse_restore and #requests('reaction') == before_reverse_reaction + 1 and state().generation == before_todo_generation and state().comments[1].pending_delete, 'explicit Todo did not reject fetched pending deletion')
-
-
--- Explicit Todo remains progress-only; plain u restores published, unfetched rows.
-reverse_view = state()
-reverse_view.generation = reverse_view.generation + 1
-reverse_view.comments = { read_comment('reverse-receipt', 'me', 1) }
-reverse_view.comments[1].fetched, reverse_view.comments[1].pending_delete = false, true
-reverse_view.todo, reverse_view.done = {}, {}
-reverse_view.pending = { { id = 'reverse-receipt-delete', change = { kind = 'delete_comment', comment = 'reverse-receipt' } } }
-write('state.json', reverse_view)
-command('')
-wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Feedback reverse-receipt', 1, true) end)
-home_row('Feedback reverse-receipt')
-before_reverse_restore, before_reverse_reaction = #requests('restore'), #requests('reaction')
-before_todo_generation, before_todo_notices = state().generation, #messages
-command('todo')
-wait(function() return #messages > before_todo_notices end, 'explicit Todo unfetched validation missing')
-assert(#requests('restore') == before_reverse_restore and #requests('reaction') == before_reverse_reaction + 1 and state().generation == before_todo_generation and state().comments[1].pending_delete, 'explicit Todo unexpectedly restored deletion')
-before_reverse_reaction = #requests('reaction')
-local receipt_position = vim.fn.winsaveview()
-input('u')
-wait(function() return not state().comments[1].pending_delete end)
-stationary_view(receipt_position, 'unpublished deletion restore')
-assert(#requests('restore') == before_reverse_restore + 1 and #requests('reaction') == before_reverse_reaction, 'unfetched deletion u sent checklist progress')
+local before_todo_generation, before_todo_notices
 
 -- Contextual u cancels creation in either destination; explicit Todo stays progress-only.
 do
@@ -1570,10 +1438,10 @@ do
   mixed.generation = mixed.generation + 1
   local draft = vim.deepcopy(parent)
   draft.comment.comment.id, draft.comment.comment.body = 'mixed-new', 'Cancel mixed draft'
-  mixed.comments = { draft, read_comment('mixed-deleted', 'me', 1), read_comment('mixed-done', 'alice', 2) }
-  mixed.comments[2].pending_delete, mixed.comments[3].done = true, true
-  mixed.todo, mixed.done = { 'mixed-deleted' }, { 'mixed-done' }
-  mixed.pending = { { id = 'mixed-delete', change = { kind = 'delete_comment', comment = 'mixed-deleted' } } }
+  mixed.comments = { draft, read_comment('mixed-done', 'alice', 2) }
+  mixed.comments[2].done = true
+  mixed.todo, mixed.done = {}, { 'mixed-done' }
+  mixed.pending = {}
   mixed.files = { { path = 'src/mixed.rs', viewed = true } }
   mixed.wip = nil
   write('state.json', mixed)
@@ -1581,8 +1449,8 @@ do
   wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Cancel mixed draft', 1, true) end)
   local before_cancel, before_restore, before_progress, before_viewed = #requests('delete'), #requests('restore'), #requests('reaction'), #requests('viewed')
   input('ggVGu')
-  wait(function() return #requests('delete') == before_cancel + 1 and #requests('restore') == before_restore + 1 and #requests('reaction') == before_progress + 1 and #requests('viewed') == before_viewed + 1 and #state().comments == 2 and not state().comments[1].pending_delete and not state().comments[2].done and not state().files[1].viewed end)
-  assert(requests('delete')[before_cancel + 1].comment == 'mixed-new' and requests('restore')[before_restore + 1].comment == 'mixed-deleted' and requests('reaction')[before_progress + 1].comment == 'mixed-done', 'mixed visual u expanded, duplicated, or misclassified selected objects')
+  wait(function() return #requests('delete') == before_cancel + 1 and #requests('restore') == before_restore and #requests('reaction') == before_progress + 1 and #requests('viewed') == before_viewed + 1 and #state().comments == 1 and not state().comments[1].done and not state().files[1].viewed end)
+  assert(requests('delete')[before_cancel + 1].comment == 'mixed-new' and requests('reaction')[before_progress + 1].comment == 'mixed-done', 'mixed visual u expanded, duplicated, or misclassified selected objects')
 
   -- Preflight the whole selection; selected local children cancel before parents.
   for _, case in ipairs({ 'unselected-child', 'selected-child', 'foreign' }) do
@@ -1635,7 +1503,7 @@ end
 
 local first_failure = run('workflows', { BUF_REVIEW_FIRST_FAILURE = '1' })
 assert(first_failure.code == 0, first_failure.stderr)
-for _, name in ipairs({ 'sessions', 'append', 'performance', 'object_fetch', 'commit_comparison', 'historical_panes', 'comment_panes', 'local_panes', 'mark_move', 'diff_lifecycle', 'annotations', 'navigation', 'log', 'native_commands', 'composer_native', 'append_native', 'action_queue', 'overview_stats', 'diff_scroll', 'checkout_git', 'checkout_ui', 'local_pr', 'local_pr_cli', 'post_publish', 'mappings', 'jumplist', 'reader_reuse', 'review_queue' }) do
+for _, name in ipairs({ 'sessions', 'review_tab', 'append', 'performance', 'object_fetch', 'commit_comparison', 'historical_panes', 'comment_panes', 'local_panes', 'mark_move', 'diff_lifecycle', 'annotations', 'navigation', 'log', 'native_commands', 'composer_native', 'append_native', 'action_queue', 'overview_stats', 'diff_scroll', 'checkout_git', 'checkout_ui', 'local_pr', 'local_pr_cli', 'post_publish', 'mappings', 'jumplist', 'reader_reuse', 'review_queue' }) do
   local child = run(name)
   assert(child.code == 0, name .. ': ' .. child.stderr)
 end

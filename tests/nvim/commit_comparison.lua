@@ -6,6 +6,8 @@ vim.g.buf_review_executable = repository .. '/tests/nvim/fixture_pr.py'
 vim.opt.runtimepath:append(repository)
 local notices = {}
 local history_ready, hold_objects, held_objects = false, false, nil
+local refreshes_inflight = 0
+local objects_inflight = 0
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end
 local function write(name, value) vim.fn.writefile({ vim.json.encode(value) }, fixture .. '/' .. name) end
 local function read(name) return vim.json.decode(table.concat(vim.fn.readfile(fixture .. '/' .. name), '\n')) end
@@ -41,18 +43,27 @@ local function project(view)
   return view
 end
 client.request = function(root, request, callback)
+  if request.op == 'fetch_refresh' then refreshes_inflight = refreshes_inflight + 1 end
+  if request.op == 'fetch_objects' then objects_inflight = objects_inflight + 1 end
   return native_request(root, request, function(response, err)
     if request.op == 'fetch_objects' and not err then
       history_ready = true
       response.workspace = project(read('state.json'))
       response.revision = vim.deepcopy(worktree)
-      if hold_objects then held_objects = function() callback(response, err) end; return end
+      if hold_objects then
+        held_objects = function() callback(response, err); objects_inflight = objects_inflight - 1 end
+        return
+      end
     end
     if response and response.workspace then
       project(response.workspace)
       if response.workspace.generation >= read('state.json').generation then write('state.json', response.workspace) end
     end
     callback(response, err)
+    if request.op == 'fetch_objects' then objects_inflight = objects_inflight - 1 end
+    if request.op == 'apply_refresh' or request.op == 'fetch_refresh' and err then
+      refreshes_inflight = refreshes_inflight - 1
+    end
   end)
 end
 vim.cmd('runtime plugin/buf_review.lua')
@@ -132,6 +143,7 @@ assert(not vim.tbl_contains(vim.fn.getcompletion('Review ', 'cmdline'), 'compare
 -- replace the newer projection, even when comparison and review still match.
 vim.cmd('Review')
 wait(function() return kind() == 'home' end, 'home missing before delayed preparation')
+wait(function() return refreshes_inflight == 0 and objects_inflight == 0 end, 'previous background refresh did not settle')
 local fresh = read('state.json')
 fresh.review.id = 'fresh-object-snapshot'
 write('state.json', fresh)

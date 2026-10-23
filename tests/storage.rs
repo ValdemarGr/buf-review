@@ -9,6 +9,51 @@ use rusqlite::{Connection, types::ValueRef};
 use serde_json::json;
 use tempfile::tempdir;
 
+#[test]
+fn current_database_format_is_initialized_once_and_reopens() {
+    let project = tempdir().unwrap();
+    drop(Store::open(project.path()).unwrap());
+    let database = project.path().join(".review/state.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    let before = fs::read(&database).unwrap();
+    drop(Store::open(project.path()).unwrap());
+    assert_eq!(fs::read(&database).unwrap(), before);
+}
+
+#[test]
+fn unsupported_database_formats_are_rejected_without_modification() {
+    for version in [0, 2] {
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join(".review")).unwrap();
+        let database = project.path().join(".review/state.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch("CREATE TABLE preserved(value TEXT NOT NULL); INSERT INTO preserved VALUES ('untouched');").unwrap();
+        connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&database).unwrap();
+        let error = match Store::open(project.path()) {
+            Ok(_) => panic!("unsupported database opened"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported review database format"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&database).unwrap(), before);
+    }
+}
+
 fn user() -> User {
     User {
         id: UserId("reviewer".into()),
@@ -307,7 +352,7 @@ fn identical_imports_share_payload_without_losing_per_snapshot_provider_identiti
 }
 
 #[test]
-fn migration_preserves_authoritative_refresh_local_intent_and_every_historical_generation() {
+fn reopening_preserves_authoritative_refresh_local_intent_and_every_historical_generation() {
     let source = tempdir().unwrap();
     let mut store = Store::open(source.path()).unwrap();
     let old = ReviewId("old".into());
@@ -356,16 +401,6 @@ fn migration_preserves_authoritative_refresh_local_intent_and_every_historical_g
             error: None,
         },
     );
-    // Retain an edit staged by an older version; current fetched comments are immutable.
-    workspace = store
-        .update_workspace(&workspace.id, workspace.generation, |workspace| {
-            workspace.batch.write.events.push(Event::EditComment {
-                comment: CommentId("remote".into()),
-                body: "Local edit against old remote text".into(),
-            });
-            Ok(())
-        })
-        .unwrap();
     apply(
         &mut store,
         &mut workspace,
@@ -434,11 +469,6 @@ fn migration_preserves_authoritative_refresh_local_intent_and_every_historical_g
     assert_eq!(workspace.comparison, read.pull_request.revision);
     assert_eq!(workspace.comparison_files, read.files);
     assert_eq!(workspace.suspended_attempts, suspended);
-    assert!(
-        workspace
-            .conflicts
-            .contains_key(&CommentId("remote".into()))
-    );
     let view = workspace.view().unwrap();
     assert!(
         view.comments
@@ -457,158 +487,10 @@ fn migration_preserves_authoritative_refresh_local_intent_and_every_historical_g
         serde_json::to_value(store.publication_history(&workspace).unwrap()).unwrap();
     let expected_view = serde_json::to_value(store.workspace_view(&workspace.id).unwrap()).unwrap();
 
-    // Seed an actual pre-compaction database: full Workspace JSON in both the
-    // current row and every generation, with independent baseline/event/result
-    // tables. No normalized-storage tables are copied into this fixture.
-    let legacy = tempdir().unwrap();
-    fs::create_dir(legacy.path().join(".review")).unwrap();
-    let connection = Connection::open(legacy.path().join(".review/state.sqlite3")).unwrap();
-    connection.execute_batch(r#"
-        CREATE TABLE pull_requests(pull_request_id TEXT PRIMARY KEY NOT NULL,object TEXT NOT NULL);
-        CREATE TABLE reviews(review_id TEXT PRIMARY KEY NOT NULL,reviewer TEXT NOT NULL);
-        CREATE TABLE read_states(review_id TEXT PRIMARY KEY NOT NULL,snapshot TEXT NOT NULL);
-        CREATE TABLE batches(batch_id TEXT PRIMARY KEY NOT NULL,review_id TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE batch_revisions(batch_id TEXT NOT NULL,revision INTEGER NOT NULL,review_id TEXT NOT NULL,namespace TEXT NOT NULL,PRIMARY KEY(batch_id,revision));
-        CREATE TABLE write_events(batch_id TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0,sequence INTEGER NOT NULL,event TEXT NOT NULL,PRIMARY KEY(batch_id,revision,sequence));
-        CREATE TABLE review_sources(review_id TEXT PRIMARY KEY NOT NULL,backend TEXT NOT NULL,locator TEXT NOT NULL);
-        CREATE TABLE id_mappings(review_id TEXT NOT NULL,resource TEXT NOT NULL,core_id TEXT NOT NULL,remote_id TEXT NOT NULL,PRIMARY KEY(review_id,resource,core_id),UNIQUE(review_id,resource,remote_id));
-        CREATE TABLE operation_results(batch_id TEXT NOT NULL,operation_id TEXT NOT NULL,sequence INTEGER NOT NULL,operation TEXT NOT NULL,mappings TEXT NOT NULL,response TEXT NOT NULL,PRIMARY KEY(batch_id,operation_id),UNIQUE(batch_id,sequence));
-        CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY NOT NULL,reviewer_id TEXT NOT NULL,pull_request_id TEXT NOT NULL,locator TEXT,generation INTEGER NOT NULL,state TEXT NOT NULL);
-        CREATE TABLE workspace_history(workspace_id TEXT NOT NULL,generation INTEGER NOT NULL,state TEXT NOT NULL,action TEXT NOT NULL,PRIMARY KEY(workspace_id,generation));
-        CREATE TABLE workspace_active(reviewer_id TEXT PRIMARY KEY NOT NULL,workspace_id TEXT NOT NULL,selected INTEGER NOT NULL);
-    "#).unwrap();
-    let pull = store
-        .pull_request(&workspace.review.read.pull_request.id)
-        .unwrap()
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO pull_requests VALUES (?1,?2)",
-            (&pull.id.0, serde_json::to_string(&pull).unwrap()),
-        )
-        .unwrap();
-    for id in store.review_ids().unwrap() {
-        let review = store.get_review(&id).unwrap().unwrap();
-        connection
-            .execute(
-                "INSERT INTO reviews VALUES (?1,?2)",
-                (&id.0, serde_json::to_string(&review.reviewer).unwrap()),
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO read_states VALUES (?1,?2)",
-                (&id.0, serde_json::to_string(&review.read).unwrap()),
-            )
-            .unwrap();
-        let metadata = store.review_backend(&id).unwrap().unwrap();
-        connection
-            .execute(
-                "INSERT INTO review_sources VALUES (?1,?2,?3)",
-                (&id.0, &metadata.source.backend, &metadata.source.locator),
-            )
-            .unwrap();
-        for mapping in metadata.mappings {
-            connection
-                .execute(
-                    "INSERT INTO id_mappings VALUES (?1,?2,?3,?4)",
-                    (&id.0, mapping.resource, mapping.core_id, mapping.remote_id),
-                )
-                .unwrap();
-        }
-    }
-    connection
-        .execute(
-            "INSERT INTO batches VALUES (?1,?2,?3)",
-            (
-                &workspace.batch.id.0,
-                &workspace.batch.review.0,
-                workspace.batch.revision.number as i64,
-            ),
-        )
-        .unwrap();
-    for revision in 0..=workspace.batch.revision.number {
-        let batch = store
-            .batch_revision(&workspace.batch.id, revision)
-            .unwrap()
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO batch_revisions VALUES (?1,?2,?3,?4)",
-                (
-                    &batch.id.0,
-                    revision as i64,
-                    &batch.review.0,
-                    batch.revision.namespace.as_deref().unwrap_or(&batch.id.0),
-                ),
-            )
-            .unwrap();
-        for (index, event) in batch.write.events.iter().enumerate() {
-            connection
-                .execute(
-                    "INSERT INTO write_events VALUES (?1,?2,?3,?4)",
-                    (
-                        &batch.id.0,
-                        revision as i64,
-                        (index + 1) as i64,
-                        serde_json::to_string(event).unwrap(),
-                    ),
-                )
-                .unwrap();
-        }
-    }
-    for (index, result) in workspace.results.iter().enumerate() {
-        connection
-            .execute(
-                "INSERT INTO operation_results VALUES (?1,?2,?3,?4,?5,?6)",
-                (
-                    &workspace.batch.id.0,
-                    &result.operation.id,
-                    (index + 1) as i64,
-                    serde_json::to_string(&result.operation).unwrap(),
-                    serde_json::to_string(&result.mappings).unwrap(),
-                    serde_json::to_string(&result.response).unwrap(),
-                ),
-            )
-            .unwrap();
-    }
-    connection
-        .execute(
-            "INSERT INTO workspaces VALUES (?1,?2,?3,?4,?5,?6)",
-            (
-                &workspace.id,
-                &workspace.review.reviewer.id.0,
-                &workspace.review.read.pull_request.id.0,
-                &workspace.locator,
-                workspace.generation as i64,
-                serde_json::to_string(&workspace).unwrap(),
-            ),
-        )
-        .unwrap();
-    for entry in &history {
-        connection
-            .execute(
-                "INSERT INTO workspace_history VALUES (?1,?2,?3,?4)",
-                (
-                    &workspace.id,
-                    entry.generation as i64,
-                    serde_json::to_string(&entry.state).unwrap(),
-                    serde_json::to_string(&entry.action).unwrap(),
-                ),
-            )
-            .unwrap();
-    }
-    connection
-        .execute(
-            "INSERT INTO workspace_active VALUES (?1,?2,1)",
-            (&workspace.review.reviewer.id.0, &workspace.id),
-        )
-        .unwrap();
-    drop(connection);
     drop(store);
 
     for _ in 0..2 {
-        let mut reopened = Store::open(legacy.path()).unwrap();
+        let mut reopened = Store::open(source.path()).unwrap();
         assert_eq!(
             serde_json::to_value(reopened.workspace(&workspace.id).unwrap().unwrap()).unwrap(),
             serde_json::to_value(&workspace).unwrap()
@@ -626,9 +508,9 @@ fn migration_preserves_authoritative_refresh_local_intent_and_every_historical_g
             serde_json::to_value(reopened.workspace_view(&workspace.id).unwrap()).unwrap(),
             expected_view
         );
-        let migrated = reopened.batch_history(&workspace.batch.id).unwrap();
-        assert_eq!(migrated.len(), history.len());
-        for (expected, actual) in history.iter().zip(migrated) {
+        let restored = reopened.batch_history(&workspace.batch.id).unwrap();
+        assert_eq!(restored.len(), history.len());
+        for (expected, actual) in history.iter().zip(restored) {
             assert_eq!(actual.generation, expected.generation);
             assert_eq!(actual.action, expected.action);
             assert_eq!(

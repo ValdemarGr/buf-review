@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::core::{CoreError, Operation, validate_events};
+use crate::core::{CoreError, Operation};
 use crate::model::{
     Batch, BatchId, BatchRevision, BranchPair, CommentTarget, Event, PullRequestId,
     PullRequestObject, PullRequestResolution, PullRequestSource, ReadCommentRevision, ReadState,
-    Review, ReviewId, User, WriteState,
+    RecordedEvent, Review, ReviewId, User, WriteState,
 };
 
 #[path = "store_state.rs"]
@@ -134,216 +134,30 @@ impl Store {
         let directory = project_root.as_ref().join(".review");
         fs::create_dir_all(&directory)?;
         let mut connection = Connection::open(directory.join("state.sqlite3"))?;
-        connection.pragma_update(None, "foreign_keys", false)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let compacting = transaction.table_exists(Some("main"), "read_states")?
-            || (transaction.table_exists(Some("main"), "workspaces")?
-                && transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM workspaces WHERE json_type(state,'$.review')='object')",
-                    [], |row| row.get::<_, bool>(0),
-                )?);
-        let has_pull_requests = transaction.table_exists(Some("main"), "pull_requests")?;
-        let versioned = transaction.column_exists(Some("main"), "write_events", "revision")?;
-        let has_batches = transaction.table_exists(Some("main"), "batches")?;
-        let legacy = transaction.column_exists(Some("main"), "write_events", "review_id")?;
-        if legacy {
-            transaction.execute_batch("ALTER TABLE write_events RENAME TO legacy_write_events")?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let empty: bool = connection.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !empty && version != 1 || empty && version != 0 {
+            return Err(crate::workspace::WorkspaceError::Invalid(format!(
+                "unsupported review database format {version}; expected 1; existing database was not changed"
+            )).into());
         }
-        if has_batches && !versioned {
-            transaction.execute_batch("ALTER TABLE write_events RENAME TO unversioned_write_events; ALTER TABLE batches ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;")?;
-        }
-        transaction.execute_batch(include_str!("schema.sql"))?;
-        if !has_pull_requests {
-            Self::migrate_pull_requests(&transaction)?;
-        }
-        if has_batches && !versioned {
-            transaction.execute_batch("INSERT INTO write_events(batch_id,revision,sequence,event) SELECT batch_id,0,sequence,event FROM unversioned_write_events; DROP TABLE unversioned_write_events;")?;
-        }
-        if legacy {
-            transaction.execute(
-                "INSERT INTO batches (batch_id, review_id) SELECT review_id, review_id FROM reviews",
-                (),
-            )?;
-            transaction.execute(
-                "INSERT INTO write_events (batch_id, sequence, event)
-                 SELECT review_id, sequence, event FROM legacy_write_events",
-                (),
-            )?;
-        }
-        transaction.execute("INSERT OR IGNORE INTO batch_revisions(batch_id,revision,review_id,namespace) SELECT batch_id,0,review_id,batch_id FROM batches", [])?;
-        Self::migrate_batch_workspaces(&transaction)?;
-        Self::migrate_snapshot_storage(&transaction)?;
-        Self::migrate_workspace_storage(&transaction)?;
-        Self::adopt_native_batches(&transaction)?;
-        let violations: i64 =
-            transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })?;
-        if violations != 0 {
-            return Err(rusqlite::Error::InvalidQuery.into());
-        }
-        transaction.commit()?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        // Reclaim replaced checkpoints only after their replacement committed.
-        // No historical events, snapshots or receipts are pruned.
-        if compacting {
-            connection.execute_batch("VACUUM")?;
+        if empty {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(include_str!("schema.sql"))?;
+            transaction.pragma_update(None, "user_version", 1)?;
+            transaction.commit()?;
         }
         Ok(Self {
             connection,
             directory,
             worktree_context: false,
         })
-    }
-
-    fn migrate_pull_requests(connection: &Connection) -> Result<(), StoreError> {
-        let mut statement = connection.prepare(
-            "SELECT snapshot, locator FROM read_states JOIN review_sources USING(review_id)
-             ORDER BY COALESCE((SELECT MAX(generation) FROM workspaces
-                WHERE json_extract(state,'$.review.id')=read_states.review_id),-1) DESC,
-                read_states.review_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (snapshot, locator) = row?;
-            let read: ReadState = serde_json::from_str(&snapshot)?;
-            let pull = read.pull_request;
-            let object = PullRequestObject {
-                id: pull.id,
-                revision: 0,
-                source: PullRequestSource::Remote {
-                    locator,
-                    branches: None,
-                },
-                title: pull.title,
-                body: pull.body,
-            };
-            connection.execute(
-                "INSERT OR IGNORE INTO pull_requests(pull_request_id,object) VALUES (?1,?2)",
-                (&object.id.0, serde_json::to_string(&object)?),
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Canonicalize pre-session workspace identities without changing receipt IDs.
-    fn migrate_batch_workspaces(connection: &Connection) -> Result<(), StoreError> {
-        let has_unique: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_index_list('workspaces') WHERE origin='u')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_unique {
-            return Ok(());
-        }
-        let rows = {
-            let mut stmt = connection
-                .prepare("SELECT workspace_id,state FROM workspaces ORDER BY workspace_id")?;
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
-        // Rebuild the parent under the same name; child FK declarations remain valid.
-        connection.execute_batch("CREATE TABLE migrated_workspaces(workspace_id TEXT PRIMARY KEY NOT NULL,reviewer_id TEXT NOT NULL,pull_request_id TEXT NOT NULL,locator TEXT,generation INTEGER NOT NULL CHECK(generation>=0),state TEXT NOT NULL CHECK(json_valid(state))) STRICT;")?;
-        for (old_id, state) in rows {
-            let mut current: crate::workspace::Workspace = serde_json::from_str(&state)?;
-            let canonical = current.batch.id.clone();
-            let histories = {
-                let mut stmt=connection.prepare("SELECT generation,state,action FROM workspace_history WHERE workspace_id=?1 ORDER BY generation")?;
-                stmt.query_map([&old_id], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)? as u64,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-            };
-            let mut namespaces = Vec::<String>::new();
-            for (_, state, _) in &histories {
-                let ws: crate::workspace::Workspace = serde_json::from_str(state)?;
-                if !namespaces.contains(&ws.batch.id.0) {
-                    namespaces.push(ws.batch.id.0);
-                }
-            }
-            if !namespaces.contains(&canonical.0) {
-                namespaces.push(canonical.0.clone());
-            }
-            // Copy every old immutable log before replacing the canonical pointer.
-            let mut logs = Vec::new();
-            for namespace in &namespaces {
-                if let Some(batch) = Self::read_batch(connection, &BatchId(namespace.clone()))? {
-                    logs.push(batch);
-                }
-            }
-            connection.execute("DELETE FROM write_events WHERE batch_id=?1", [&canonical.0])?;
-            connection.execute(
-                "DELETE FROM batch_revisions WHERE batch_id=?1",
-                [&canonical.0],
-            )?;
-            for (revision, namespace) in namespaces.iter().enumerate() {
-                if let Some(batch) = logs.iter().find(|batch| &batch.id.0 == namespace) {
-                    connection.execute("INSERT INTO batch_revisions(batch_id,revision,review_id,namespace) VALUES (?1,?2,?3,?4)",(&canonical.0,revision as i64,&batch.review.0,namespace))?;
-                    for (index, event) in batch.write.events.iter().enumerate() {
-                        connection.execute("INSERT INTO write_events(batch_id,revision,sequence,event) VALUES (?1,?2,?3,?4)",(&canonical.0,revision as i64,(index+1) as i64,serde_json::to_string(event)?))?;
-                    }
-                }
-                if namespace != &canonical.0 {
-                    connection.execute(
-                        "INSERT OR REPLACE INTO batch_aliases(alias,batch_id) VALUES (?1,?2)",
-                        (namespace, &canonical.0),
-                    )?;
-                    connection.execute("INSERT OR IGNORE INTO operation_results(batch_id,operation_id,sequence,operation,mappings,response) SELECT ?1,operation_id,(SELECT COALESCE(MAX(sequence),0) FROM operation_results WHERE batch_id=?1)+ROW_NUMBER() OVER(ORDER BY sequence),operation,mappings,response FROM operation_results WHERE batch_id=?2",(&canonical.0,namespace))?;
-                }
-            }
-            let revision = namespaces.iter().position(|id| id == &canonical.0).unwrap() as u64;
-            current.id = canonical.0.clone();
-            current.batch.revision = BatchRevision {
-                number: revision,
-                namespace: Some(canonical.0.clone()),
-            };
-            connection.execute(
-                "UPDATE batches SET review_id=?2,revision=?3 WHERE batch_id=?1",
-                (&canonical.0, &current.batch.review.0, revision as i64),
-            )?;
-            connection.execute("INSERT INTO migrated_workspaces(workspace_id,reviewer_id,pull_request_id,locator,generation,state) VALUES (?1,?2,?3,?4,?5,?6)",(&canonical.0,&current.review.reviewer.id.0,&current.review.read.pull_request.id.0,&current.locator,current.generation as i64,serde_json::to_string(&current)?))?;
-            connection.execute(
-                "DELETE FROM workspace_history WHERE workspace_id=?1",
-                [&old_id],
-            )?;
-            for (generation, state, action) in histories {
-                let mut ws: crate::workspace::Workspace = serde_json::from_str(&state)?;
-                let namespace = ws.batch.id.0.clone();
-                ws.id = canonical.0.clone();
-                ws.batch.id = canonical.clone();
-                ws.batch.revision = BatchRevision {
-                    number: namespaces.iter().position(|id| id == &namespace).unwrap() as u64,
-                    namespace: Some(namespace),
-                };
-                connection.execute("INSERT INTO workspace_history(workspace_id,generation,state,action) VALUES (?1,?2,?3,?4)",(&canonical.0,generation as i64,serde_json::to_string(&ws)?,action))?;
-            }
-            connection.execute(
-                "UPDATE workspace_active SET workspace_id=?1 WHERE workspace_id=?2",
-                (&canonical.0, &old_id),
-            )?;
-            connection.execute(
-                "UPDATE workspace_publication_lock SET workspace_id=?1 WHERE workspace_id=?2",
-                (&canonical.0, &old_id),
-            )?;
-            if old_id != canonical.0 {
-                connection.execute(
-                    "INSERT OR REPLACE INTO batch_aliases(alias,batch_id) VALUES (?1,?2)",
-                    (&old_id, &canonical.0),
-                )?;
-            }
-        }
-        connection.execute_batch(
-            "DROP TABLE workspaces; ALTER TABLE migrated_workspaces RENAME TO workspaces;",
-        )?;
-        Ok(())
     }
 
     fn read_results(
@@ -363,71 +177,6 @@ impl Store {
                 })
             })?
             .collect()
-    }
-
-    fn adopt_native_batches(connection: &Connection) -> Result<(), StoreError> {
-        let ids = {
-            let mut statement=connection.prepare("SELECT batch_id FROM batches WHERE batch_id NOT IN (SELECT alias FROM batch_aliases) AND batch_id NOT IN (SELECT workspace_id FROM workspaces) ORDER BY batch_id")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for id in ids {
-            let batch = Self::read_batch(connection, &BatchId(id.clone()))?
-                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-            let review = Self::read_review(connection, &batch.review)?
-                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-            let mut workspace = crate::workspace::Workspace::new(review);
-            workspace.id = id;
-            workspace.batch = batch;
-            workspace.results = Self::read_results(connection, &workspace.batch.id)?;
-            workspace.completed = workspace
-                .results
-                .iter()
-                .map(|result| result.operation.clone())
-                .collect();
-            for event in &workspace.batch.write.events {
-                match event {
-                    Event::CreateComment { comment } => {
-                        workspace.destinations.insert(
-                            comment.content.id.clone(),
-                            crate::workspace::Destination::Standalone,
-                        );
-                    }
-                    Event::SetReviewConclusion { conclusion } => {
-                        workspace.wip = Some(crate::workspace::Wip {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            active: true,
-                            conclusion: Some(conclusion.clone()),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            if workspace.wip.is_some()
-                && workspace.pending().is_ok_and(|pending| {
-                    !pending.operations.iter().any(|operation| {
-                        matches!(operation.change, Event::SetReviewConclusion { .. })
-                    })
-                })
-            {
-                workspace.wip = None;
-            }
-            Self::insert_workspace(connection, &mut workspace)?;
-        }
-        Ok(())
-    }
-
-    fn canonical_batch(connection: &Connection, id: &BatchId) -> Result<BatchId, StoreError> {
-        Ok(connection
-            .query_row(
-                "SELECT batch_id FROM batch_aliases WHERE alias=?1",
-                [&id.0],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(BatchId)
-            .unwrap_or_else(|| id.clone()))
     }
 
     /// An OS-held lease prevents concurrent processes from resuming the same
@@ -1224,7 +973,6 @@ impl Store {
     }
 
     fn read_batch(connection: &Connection, id: &BatchId) -> Result<Option<Batch>, StoreError> {
-        let id = Self::canonical_batch(connection, id)?;
         let revision = connection
             .query_row(
                 "SELECT revision FROM batches WHERE batch_id=?1",
@@ -1233,7 +981,7 @@ impl Store {
             )
             .optional()?;
         revision
-            .map(|revision| Self::read_revision(connection, &id, revision as u64))
+            .map(|revision| Self::read_revision(connection, id, revision as u64))
             .transpose()
             .map(Option::flatten)
     }
@@ -1245,19 +993,19 @@ impl Store {
     ) -> Result<Option<Batch>, StoreError> {
         let metadata = connection
             .query_row(
-                "SELECT review_id,namespace FROM batch_revisions WHERE batch_id=?1 AND revision=?2",
+                "SELECT review_id FROM batch_revisions WHERE batch_id=?1 AND revision=?2",
                 (&id.0, revision as i64),
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| row.get::<_, String>(0),
             )
             .optional()?;
-        metadata.map(|(review,namespace)|{
+        metadata.map(|review|{
             let mut statement=connection.prepare("SELECT event FROM write_events WHERE batch_id=?1 AND revision=?2 ORDER BY sequence")?;
             let events=statement.query_and_then((&id.0,revision as i64),|row|{
                 let event:String=row.get(0)?;
-                Ok::<Event,StoreError>(serde_json::from_str(&event)?)
+                Ok::<RecordedEvent,StoreError>(serde_json::from_str(&event)?)
             })?.collect::<Result<Vec<_>,_>>()?;
             Ok(Batch{
-                id:id.clone(),revision:BatchRevision{number:revision,namespace:Some(namespace)},
+                id:id.clone(),revision:BatchRevision{number:revision},
                 review:ReviewId(review),write:WriteState{events},
             })
         }).transpose()
@@ -1265,8 +1013,7 @@ impl Store {
 
     /// Reads an immutable superseded log without moving the canonical batch.
     pub fn batch_revision(&self, id: &BatchId, revision: u64) -> Result<Option<Batch>, StoreError> {
-        let id = Self::canonical_batch(&self.connection, id)?;
-        Self::read_revision(&self.connection, &id, revision)
+        Self::read_revision(&self.connection, id, revision)
     }
 
     /// Appends without replacing or collapsing earlier events. Old batches stay
@@ -1289,9 +1036,53 @@ impl Store {
             )
             .into());
         }
+        if let Event::EditComment { comment, .. } | Event::DeleteComment { comment } = event
+            && workspace.is_delivered(comment)
+        {
+            return Err(crate::workspace::WorkspaceError::Invalid(
+                "published comments are immutable; create a new comment or reply".into(),
+            )
+            .into());
+        }
         let generation = workspace.generation;
-        workspace.batch.write.events.push(event.clone());
-        validate_events(&workspace.review, &workspace.batch)?;
+        let mut recorded = RecordedEvent::new(event.clone());
+        if let Event::SetFileViewed { commit, .. } = &mut recorded.event
+            && commit.is_none()
+        {
+            *commit = Some(workspace.comparison.head.clone());
+        }
+        workspace.batch.write.events.push(recorded);
+        let acknowledged = workspace
+            .results
+            .iter()
+            .map(|result| &result.operation.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let created = workspace
+            .results
+            .iter()
+            .filter_map(|result| match &result.operation.change {
+                Event::CreateComment { comment } => Some(&comment.content.id),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Event::CreateComment { comment } = event
+            && created.contains(&comment.content.id)
+        {
+            return Err(CoreError::DuplicateComment(comment.content.id.clone()).into());
+        }
+        let mut validation = workspace.batch.clone();
+        validation
+            .write
+            .events
+            .retain(|record| !acknowledged.contains(&record.id)
+                && !matches!(&record.event, Event::EditComment { comment, .. } if created.contains(comment)));
+        let overlay = workspace
+            .results
+            .iter()
+            .skip(workspace.snapshot_result_count)
+            .map(|result| result.operation.clone())
+            .collect::<Vec<_>>();
+        crate::core::validate_events(&workspace.review, &validation, &overlay)?;
         match event {
             Event::CreateComment { comment } => {
                 workspace.destinations.insert(
@@ -1334,21 +1125,19 @@ impl Store {
     pub fn batch_ids(&self, review: &ReviewId) -> Result<Vec<BatchId>, StoreError> {
         let mut statement = self
             .connection
-            .prepare("SELECT batch_id FROM batches WHERE review_id = ?1 AND batch_id NOT IN (SELECT alias FROM batch_aliases) ORDER BY batch_id")?;
+            .prepare("SELECT batch_id FROM batches WHERE review_id = ?1 ORDER BY batch_id")?;
         let ids = statement
             .query_map([&review.0], |row| row.get(0).map(BatchId))?
             .collect::<Result<_, _>>()?;
         Ok(ids)
     }
 
-    /// Reads the full successful-write ledger in execution order. Historical
-    /// receipts remain after refresh; Workspace.completed is the current delta.
+    /// Reads the immutable successful-write ledger in execution order.
     pub fn operation_results(
         &mut self,
         batch: &BatchId,
     ) -> Result<Vec<OperationResult>, StoreError> {
         let transaction = self.connection.transaction()?;
-        let batch = Self::canonical_batch(&transaction, batch)?;
         let exists = transaction.query_row(
             "SELECT EXISTS (SELECT 1 FROM batches WHERE batch_id = ?1)",
             [&batch.0],
@@ -1357,7 +1146,7 @@ impl Store {
         if !exists {
             return Err(StoreError::BatchNotFound(batch.clone()));
         }
-        let results = Self::read_results(&transaction, &batch)?;
+        let results = Self::read_results(&transaction, batch)?;
         transaction.commit()?;
         Ok(results)
     }
@@ -1385,7 +1174,6 @@ impl Store {
             return Err(rusqlite::Error::InvalidQuery.into());
         }
         let generation = workspace.generation;
-        workspace.completed.push(operation.clone());
         workspace.results.push(OperationResult {
             operation: operation.clone(),
             mappings: mappings.to_vec(),
@@ -1412,7 +1200,7 @@ impl Store {
         project: &Path,
         worktree_context: bool,
     ) -> Result<Option<crate::workspace::Workspace>, StoreError> {
-        let id = Self::canonical_batch(connection, &BatchId(id.into()))?;
+        let id = BatchId(id.into());
         connection
             .query_row(
                 "SELECT state FROM workspaces WHERE workspace_id = ?1",
@@ -1423,110 +1211,12 @@ impl Store {
             .map(|state| {
                 let mut workspace =
                     Self::hydrate_workspace(connection, serde_json::from_str(&state)?)?;
-                workspace.batch = Self::read_batch(connection, &id)?
-                    .ok_or_else(|| StoreError::BatchNotFound(id.clone()))?;
-                workspace.results = Self::read_results(connection, &id)?;
-                workspace.review = Self::read_review(connection, &workspace.batch.review)?
-                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
                 Self::load_summary_ids(connection, &mut workspace)?;
                 workspace.project_root = Some(project.to_path_buf());
-                if workspace
-                    .batch
-                    .write
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, Event::SetFileViewed { commit: None, .. }))
-                {
-                    let history = Self::history_states(connection, &id.0, None)?;
-                    let mut previous = Vec::<(String, bool, Option<String>)>::new();
-                    let mut previous_batch = None;
-                    for row in history {
-                        let batch = (
-                            row.state["batch"].clone(),
-                            row.state["event_count"].clone(),
-                            row.state["event_value"].clone(),
-                        );
-                        if previous_batch.as_ref() == Some(&batch) {
-                            continue;
-                        }
-                        previous_batch = Some(batch);
-                        let saved = Self::hydrate_workspace(connection, row.state)?;
-                        let mut offset = 0;
-                        let viewed = saved
-                            .batch
-                            .write
-                            .events
-                            .iter()
-                            .filter_map(|event| {
-                                let Event::SetFileViewed {
-                                    path,
-                                    viewed,
-                                    commit,
-                                } = event
-                                else {
-                                    return None;
-                                };
-                                let retained = previous[offset..].iter().position(
-                                    |(old_path, old_viewed, _)| {
-                                        old_path == path && old_viewed == viewed
-                                    },
-                                );
-                                let retained = retained.map(|index| {
-                                    offset += index + 1;
-                                    previous[offset - 1].2.clone()
-                                });
-                                let head = commit.clone().or_else(|| {
-                                    if let Some(head) = retained {
-                                        head
-                                    } else if row.action["action"] == "viewed"
-                                        && row.action["path"] == *path
-                                        && row.action["viewed"] == *viewed
-                                    {
-                                        Some(saved.comparison.head.clone())
-                                    } else if saved.comparison.head
-                                        == saved.review.read.pull_request.revision.head
-                                    {
-                                        Some(saved.comparison.head.clone())
-                                    } else {
-                                        None
-                                    }
-                                });
-                                Some((path.clone(), *viewed, head))
-                            })
-                            .collect();
-                        previous = viewed;
-                    }
-                    let mut offset = 0;
-                    for (index, event) in workspace.batch.write.events.iter().enumerate() {
-                        let Event::SetFileViewed {
-                            path,
-                            viewed,
-                            commit: None,
-                        } = event
-                        else {
-                            continue;
-                        };
-                        let head = previous[offset..]
-                            .iter()
-                            .position(|(old_path, old_viewed, _)| {
-                                old_path == path && old_viewed == viewed
-                            })
-                            .map(|position| {
-                                offset += position + 1;
-                                previous[offset - 1].2.clone()
-                            });
-                        if let Some(head) = head.unwrap_or_else(|| {
-                            (workspace.comparison.head
-                                == workspace.review.read.pull_request.revision.head)
-                                .then(|| workspace.comparison.head.clone())
-                        }) {
-                            workspace.legacy_viewed_commits.insert(index, head);
-                        }
-                    }
-                }
                 if worktree_context {
                     workspace.use_worktree()?;
                 }
+                workspace.prepare_viewed_versions()?;
                 Ok(workspace)
             })
             .transpose()
@@ -1546,7 +1236,7 @@ impl Store {
         id: &str,
         generation: u64,
     ) -> Result<Option<crate::workspace::Workspace>, StoreError> {
-        let id = Self::canonical_batch(&self.connection, &BatchId(id.into()))?;
+        let id = BatchId(id.into());
         Self::history_states(&self.connection, &id.0, Some(generation))?
             .into_iter()
             .find(|row| row.generation == generation)
@@ -1724,7 +1414,6 @@ impl Store {
     }
 
     pub fn batch_history(&self, id: &BatchId) -> Result<Vec<BatchHistoryEntry>, StoreError> {
-        let id = Self::canonical_batch(&self.connection, id)?;
         Self::history_states(&self.connection, &id.0, None)?
             .into_iter()
             .map(|row| {
@@ -1786,17 +1475,17 @@ impl Store {
                 .map_or(0, |batch| batch.write.events.len())
         } else {
             workspace.batch.revision.number = existing.as_ref().unwrap().revision.number + 1;
-            workspace.batch.revision.namespace = Some(format!(
-                "{}:revision:{}",
-                workspace.batch.id.0, workspace.batch.revision.number
-            ));
             0
         };
-        if workspace.batch.revision.namespace.is_none() {
-            workspace.batch.revision.namespace = Some(workspace.batch.id.0.clone());
-        }
         connection.execute("INSERT INTO batches(batch_id,review_id,revision) VALUES (?1,?2,?3) ON CONFLICT(batch_id) DO UPDATE SET review_id=excluded.review_id,revision=excluded.revision",(&workspace.batch.id.0,&workspace.batch.review.0,workspace.batch.revision.number as i64))?;
-        connection.execute("INSERT OR IGNORE INTO batch_revisions(batch_id,revision,review_id,namespace) VALUES (?1,?2,?3,?4)",(&workspace.batch.id.0,workspace.batch.revision.number as i64,&workspace.batch.review.0,&workspace.batch.revision.namespace))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO batch_revisions(batch_id,revision,review_id) VALUES (?1,?2,?3)",
+            (
+                &workspace.batch.id.0,
+                workspace.batch.revision.number as i64,
+                &workspace.batch.review.0,
+            ),
+        )?;
         for (index, event) in workspace.batch.write.events.iter().enumerate().skip(start) {
             connection.execute(
                 "INSERT INTO write_events(batch_id,revision,sequence,event) VALUES (?1,?2,?3,?4)",
@@ -1818,25 +1507,24 @@ impl Store {
         action: &Value,
     ) -> Result<(), StoreError> {
         use crate::workspace::WorkspaceError;
-        let actual = Self::read_workspace(
-            connection,
-            &workspace.id,
-            workspace.project_root.as_deref().unwrap_or(Path::new(".")),
-            workspace.worktree_context,
-        )?
+        let actual = connection.query_row(
+            "SELECT generation,reviewer_id,pull_request_id,state FROM workspaces WHERE workspace_id=?1",
+            [&workspace.id], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+        ).optional()?
         .ok_or_else(|| WorkspaceError::NotFound(workspace.id.clone()))?;
-        if actual.generation != expected {
+        if actual.0 != expected {
             return Err(WorkspaceError::StaleGeneration {
                 expected,
-                actual: actual.generation,
+                actual: actual.0,
             }
             .into());
         }
-        if workspace.id != workspace.batch.id.0 || workspace.batch.id != actual.batch.id {
+        let previous: Value = serde_json::from_str(&actual.3)?;
+        if workspace.id != workspace.batch.id.0 || previous["batch"]["id"] != workspace.batch.id.0 {
             return Err(WorkspaceError::Invalid("batch identity is immutable".into()).into());
         }
-        if workspace.review.reviewer.id != actual.review.reviewer.id
-            || workspace.review.read.pull_request.id != actual.review.read.pull_request.id
+        if workspace.review.reviewer.id.0 != actual.1
+            || workspace.review.read.pull_request.id.0 != actual.2
         {
             return Err(WorkspaceError::Invalid("workspace identity is immutable".into()).into());
         }
@@ -1864,7 +1552,18 @@ impl Store {
         workspace.generation = expected + 1;
         Self::persist_workspace_batch(connection, workspace)?;
         // Successful results, identities and generation are committed atomically.
-        for result in &workspace.results {
+        let previous_results = {
+            let mut statement = connection
+                .prepare("SELECT operation_id FROM operation_results WHERE batch_id=?1")?;
+            statement
+                .query_map([&workspace.batch.id.0], |row| row.get::<_, String>(0))?
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+        };
+        for result in workspace
+            .results
+            .iter()
+            .filter(|result| !previous_results.contains(&result.operation.id))
+        {
             connection.execute("INSERT OR IGNORE INTO operation_results(batch_id,operation_id,sequence,operation,mappings,response)
                 SELECT ?1,?2,COALESCE(MAX(sequence),0)+1,?3,?4,?5 FROM operation_results WHERE batch_id=?1",
                 (&workspace.batch.id.0,&result.operation.id,serde_json::to_string(&result.operation)?,serde_json::to_string(&result.mappings)?,serde_json::to_string(&result.response)?))?;
@@ -1872,13 +1571,6 @@ impl Store {
             // snapshot. A refresh may give the same remote review its fetched
             // ReviewResourceId; replaying the conclusion operation ID here
             // would collide with that distinct, authoritative resource identity.
-            if actual
-                .results
-                .iter()
-                .any(|previous| previous.operation.id == result.operation.id)
-            {
-                continue;
-            }
             for mapping in &result.mappings {
                 let source_exists = connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM review_sources WHERE review_id=?1)",
@@ -1906,12 +1598,6 @@ impl Store {
         }
         // Relational metadata can hydrate fields beyond the last saved state.
         // Changes must start at the stored generation, not that hydrated view.
-        let previous: String = connection.query_row(
-            "SELECT state FROM workspaces WHERE workspace_id=?1",
-            [&workspace.id],
-            |row| row.get(0),
-        )?;
-        let previous: Value = serde_json::from_str(&previous)?;
         let state = Self::compact_workspace(connection, workspace)?;
         connection.execute(
             "UPDATE workspaces SET generation=?2,state=?3 WHERE workspace_id=?1",
@@ -1952,6 +1638,7 @@ impl Store {
             .into());
         }
         update(&mut workspace)?;
+        workspace.prepare_viewed_versions()?;
         Self::persist_workspace(
             &transaction,
             generation,
@@ -2137,6 +1824,9 @@ impl Store {
                     failure = Some((index, error));
                     break 'actions;
                 }
+                if workspace.comparison != previous.comparison {
+                    workspace.prepare_viewed_versions()?;
+                }
                 if workspace != previous {
                     let recorded = match (&action, &child) {
                         (Action::DeleteComments { .. }, Action::Delete { comment }) => {
@@ -2180,6 +1870,17 @@ impl Store {
         attempt_id: &str,
         action: crate::workspace::Action,
     ) -> Result<crate::workspace::Workspace, StoreError> {
+        self.mutate_publication_group(id, attempt_id, vec![action])
+    }
+
+    /// Commit a provider response and all confirmed siblings in one local transaction.
+    pub fn mutate_publication_group(
+        &mut self,
+        id: &str,
+        attempt_id: &str,
+        actions: Vec<crate::workspace::Action>,
+    ) -> Result<crate::workspace::Workspace, StoreError> {
+        use crate::workspace::Action;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2201,12 +1902,99 @@ impl Store {
             .into());
         }
         let generation = workspace.generation;
-        workspace.apply(action.clone())?;
+        let mut known = workspace
+            .results
+            .iter()
+            .map(|result| (result.operation.id.clone(), result))
+            .collect::<BTreeMap<_, _>>();
+        for action in &actions {
+            if let Action::RecordResult { result } = action {
+                if let Some(previous) = known.get(&result.operation.id) {
+                    let conflict = previous.operation != result.operation
+                        || result.mappings.iter().any(|mapping| {
+                            previous.mappings.iter().any(|saved| {
+                                saved.resource == mapping.resource
+                                    && ((saved.core_id == mapping.core_id
+                                        && saved.remote_id != mapping.remote_id)
+                                        || (saved.remote_id == mapping.remote_id
+                                            && saved.core_id != mapping.core_id))
+                            })
+                        });
+                    if conflict {
+                        return Err(crate::workspace::WorkspaceError::Invalid("confirmed publication receipt conflicts with existing execution evidence".into()).into());
+                    }
+                } else {
+                    known.insert(result.operation.id.clone(), result);
+                }
+            }
+        }
+        // Install provider preparation before reconciling any comment which a
+        // concurrent refresh fetched under its remote identity.
+        let provider_actions = actions
+            .iter()
+            .filter(|action| matches!(action, Action::SetAttemptProvider { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        workspace.apply_group(&provider_actions)?;
+        let backend = Self::read_backend(&transaction, &workspace.review.id)?;
+        let fetched = workspace
+            .review
+            .read
+            .comments
+            .iter()
+            .map(|comment| comment.content.id.0.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let identities = backend
+            .as_ref()
+            .into_iter()
+            .flat_map(|backend| &backend.mappings)
+            .map(|mapping| {
+                (
+                    (mapping.resource.as_str(), mapping.remote_id.as_str()),
+                    mapping.core_id.as_str(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let fetched_identity = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::RecordResult { result }
+                    if matches!(result.operation.change, Event::CreateComment { .. }) =>
+                {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .any(|result| {
+                result.mappings.iter().any(|mapping| {
+                    identities
+                        .get(&(mapping.resource.as_str(), mapping.remote_id.as_str()))
+                        .is_some_and(|existing| {
+                            **existing != mapping.core_id && fetched.contains(existing)
+                        })
+                })
+            });
+        if fetched_identity {
+            let active = workspace.attempt.take().unwrap();
+            workspace.suspended_attempts.push(active.clone());
+            let snapshot = workspace.review.clone();
+            Self::reconcile_workspace_snapshot(&transaction, &mut workspace, snapshot)?;
+            workspace
+                .suspended_attempts
+                .retain(|attempt| attempt.id != active.id);
+            workspace.attempt = Some(active);
+        }
+        let outcomes = actions
+            .iter()
+            .filter(|action| !matches!(action, Action::SetAttemptProvider { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        workspace.apply_group(&outcomes)?;
         Self::persist_workspace(
             &transaction,
             generation,
             &mut workspace,
-            &serde_json::to_value(action)?,
+            &serde_json::json!({"action":"publication_group","actions":actions}),
         )?;
         transaction.commit()?;
         Ok(workspace)
@@ -2229,6 +2017,7 @@ impl Store {
             runtime = workspace.clone();
             runtime.project_root = Some(self.project_root().to_path_buf());
             runtime.use_worktree()?;
+            runtime.prepare_viewed_versions()?;
             &runtime
         } else {
             workspace
@@ -2302,6 +2091,7 @@ impl Store {
         self.update_workspace(id, generation, |workspace| {
             workspace.comparison = revision.clone();
             workspace.comparison_files = files;
+            workspace.prepare_viewed_versions()?;
             workspace.projected()?;
             Ok(())
         })
@@ -2315,6 +2105,22 @@ impl Store {
     ) -> Result<Vec<crate::sessions::PublicationDetail>, StoreError> {
         let history = Self::publication_states(&self.connection, &workspace.id)?
             .into_iter()
+            .flat_map(|row| {
+                if row.action["action"] == "publication_group" {
+                    row.action["actions"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|action| state::HistoryRow {
+                            generation: row.generation,
+                            state: row.state.clone(),
+                            action: action.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![row]
+                }
+            })
             .filter(|row| {
                 matches!(
                     row.action["action"].as_str(),
@@ -2357,41 +2163,21 @@ impl Store {
     }
 
     pub fn workspace_log(&self, id: &str) -> Result<Vec<Value>, StoreError> {
-        let id = Self::canonical_batch(&self.connection, &BatchId(id.into()))?.0;
+        let id = id.to_owned();
         Ok(Self::history_states(&self.connection, &id, None)?
             .into_iter()
             .map(|row| serde_json::json!({"generation":row.generation,"action":row.action}))
             .collect())
     }
 
-    pub fn refresh_workspace(
-        &mut self,
-        id: &str,
-        generation: u64,
-        review: &ReviewId,
-    ) -> Result<crate::workspace::Workspace, StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut workspace = Self::read_workspace(
-            &transaction,
-            id,
-            self.directory.parent().unwrap(),
-            self.worktree_context,
-        )?
-        .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()))?;
-        if workspace.generation != generation {
-            return Err(crate::workspace::WorkspaceError::StaleGeneration {
-                expected: generation,
-                actual: workspace.generation,
-            }
-            .into());
-        }
-        let mut review =
-            Self::read_review(&transaction, review)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    fn reconcile_workspace_snapshot(
+        connection: &Transaction<'_>,
+        workspace: &mut crate::workspace::Workspace,
+        mut review: Review,
+    ) -> Result<(), StoreError> {
         // Remote identities connect new snapshots to fetched and published local IDs.
         let mappings = |review: &ReviewId| -> Result<Vec<IdMapping>, StoreError> {
-            let mut statement = transaction
+            let mut statement = connection
                 .prepare("SELECT resource,core_id,remote_id FROM id_mappings WHERE review_id=?1")?;
             Ok(statement
                 .query_map([&review.0], |row| {
@@ -2470,7 +2256,7 @@ impl Store {
             // Keep imported evidence intact; reuse equivalent canonical evidence
             // only when reviewer, snapshot and all provider identities agree.
             let incoming_id = review.id.clone();
-            let mut backend = Self::read_backend(&transaction, &incoming_id)?
+            let mut backend = Self::read_backend(connection, &incoming_id)?
                 .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
             backend.mappings.clear();
             for mapping in incoming.iter().chain(previous.iter()) {
@@ -2487,13 +2273,13 @@ impl Store {
                 }
             }
             if let Some(id) =
-                Self::matching_review(&transaction, &review.reviewer, &review.read, Some(&backend))?
+                Self::matching_review(connection, &review.reviewer, &review.read, Some(&backend))?
             {
                 review.id = id;
             } else {
                 review.id = ReviewId(uuid::Uuid::new_v4().to_string());
-                Self::insert_review(&transaction, &review.id, &review.reviewer, &review.read)?;
-                transaction.execute(
+                Self::insert_review(connection, &review.id, &review.reviewer, &review.read)?;
+                connection.execute(
                     "INSERT INTO review_sources(review_id,backend,locator) VALUES (?1,?2,?3)",
                     (
                         &review.id.0,
@@ -2502,7 +2288,7 @@ impl Store {
                     ),
                 )?;
                 for mapping in &backend.mappings {
-                    transaction.execute("INSERT INTO id_mappings(review_id,resource,core_id,remote_id) VALUES (?1,?2,?3,?4)",(&review.id.0,&mapping.resource,&mapping.core_id,&mapping.remote_id))?;
+                    connection.execute("INSERT INTO id_mappings(review_id,resource,core_id,remote_id) VALUES (?1,?2,?3,?4)",(&review.id.0,&mapping.resource,&mapping.core_id,&mapping.remote_id))?;
                 }
             }
         }
@@ -2524,7 +2310,36 @@ impl Store {
             }
         }
         workspace.refresh(review)?;
-        Self::load_summary_ids(&transaction, &mut workspace)?;
+        Self::load_summary_ids(connection, workspace)?;
+        Ok(())
+    }
+
+    pub fn refresh_workspace(
+        &mut self,
+        id: &str,
+        generation: u64,
+        review: &ReviewId,
+    ) -> Result<crate::workspace::Workspace, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut workspace = Self::read_workspace(
+            &transaction,
+            id,
+            self.directory.parent().unwrap(),
+            self.worktree_context,
+        )?
+        .ok_or_else(|| crate::workspace::WorkspaceError::NotFound(id.into()))?;
+        if workspace.generation != generation {
+            return Err(crate::workspace::WorkspaceError::StaleGeneration {
+                expected: generation,
+                actual: workspace.generation,
+            }
+            .into());
+        }
+        let review =
+            Self::read_review(&transaction, review)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        Self::reconcile_workspace_snapshot(&transaction, &mut workspace, review)?;
         Self::persist_workspace(
             &transaction,
             generation,

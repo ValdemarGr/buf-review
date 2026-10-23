@@ -4,10 +4,10 @@ use std::{
     process::Stdio,
 };
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::*;
-use crate::core::{Change, CommitState, Operation};
+use crate::core::{Change, CommitState};
 
 #[derive(Debug, Error)]
 pub enum PublishError {
@@ -172,256 +172,6 @@ pub fn preflight(
     Ok(())
 }
 
-/// Publishes one core-processed operation. The caller persists its returned
-/// metadata before attempting the next operation.
-pub fn publish(
-    review: &Review,
-    backend: &ReviewBackend,
-    operation: &Operation,
-) -> Result<PublishResult, PublishError> {
-    let address = address(backend)?;
-    let repository = format!("repos/{}/{}", address.owner, address.repo);
-    let pull = format!("{repository}/pulls/{}", address.number);
-    let mut mappings = Vec::new();
-    let response = match &operation.change {
-        Change::CreateComment { comment } => {
-            let (endpoint, body, resource) = match &comment.target {
-                CommentTarget::PullRequest => (
-                    format!("{repository}/issues/{}/comments", address.number),
-                    json!({"body": comment.content.body}),
-                    "issue_comment",
-                ),
-                CommentTarget::Diff(location) => {
-                    let body = inline_payload(comment, location);
-                    (format!("{pull}/comments"), body, "review_comment")
-                }
-                CommentTarget::Reply(parent) => {
-                    let (resource, id) = comment_remote(backend, parent)?;
-                    if resource != "review_comment" {
-                        return Err(unsupported("replies require a diff comment"));
-                    }
-                    let root = match read_root(review, parent)? {
-                        Some(root) => remote(backend, "review_comment", &root.0)?,
-                        None => {
-                            // A parent published in an earlier operation need not
-                            // be present in the immutable fetched snapshot.
-                            let response: RemoteReplyParent = api(
-                                &format!("{repository}/pulls/comments/{id}"),
-                                &["--method", "GET"],
-                            )?;
-                            if response.id != id || response.in_reply_to_id == Some(0) {
-                                return Err(unsupported(
-                                    "reply target response has an invalid resource identity",
-                                ));
-                            }
-                            response.in_reply_to_id.unwrap_or(id)
-                        }
-                    };
-                    (
-                        format!("{pull}/comments/{root}/replies"),
-                        json!({"body": comment.content.body}),
-                        "review_comment",
-                    )
-                }
-            };
-            let response = request(&endpoint, "POST", &body)?;
-            mappings.push(created_mapping(resource, &comment.content.id.0, &response)?);
-            response
-        }
-        Change::EditComment { comment, body } => {
-            let (resource, id) = comment_remote(backend, comment)?;
-            if resource == "review_summary" {
-                request(
-                    &format!("{pull}/reviews/{id}"),
-                    "PUT",
-                    &json!({"body":body}),
-                )?
-            } else {
-                request(
-                    &comment_endpoint(&repository, backend, comment)?,
-                    "PATCH",
-                    &json!({"body":body}),
-                )?
-            }
-        }
-        Change::DeleteComment { comment } => {
-            if comment_remote(backend, comment)?.0 == "review_summary" {
-                return Err(unsupported("submitted review summaries cannot be deleted"));
-            }
-            request(
-                &comment_endpoint(&repository, backend, comment)?,
-                "DELETE",
-                &Value::Null,
-            )?
-        }
-        Change::SetFileViewed { path, viewed, .. } => {
-            let node = match backend.mappings.iter().find(|mapping| {
-                mapping.resource == "pull_request_node"
-                    && mapping.core_id == review.read.pull_request.id.0
-                    && !mapping.remote_id.is_empty()
-            }) {
-                Some(mapping) => mapping.remote_id.clone(),
-                None => {
-                    let pull_response: Value = api(&pull, &["--method", "GET"])?;
-                    let node = pull_response
-                        .get("node_id")
-                        .and_then(Value::as_str)
-                        .filter(|node| !node.is_empty())
-                        .ok_or_else(|| unsupported("pull request response lacks node_id"))?
-                        .to_owned();
-                    mappings.push(IdMapping {
-                        resource: "pull_request_node".into(),
-                        core_id: review.read.pull_request.id.0.clone(),
-                        remote_id: node.clone(),
-                    });
-                    node
-                }
-            };
-            let mutation = if *viewed {
-                "markFileAsViewed"
-            } else {
-                "unmarkFileAsViewed"
-            };
-            let query = format!(
-                "mutation($input: {}Input!) {{ {mutation}(input: $input) {{ clientMutationId }} }}",
-                if *viewed {
-                    "MarkFileAsViewed"
-                } else {
-                    "UnmarkFileAsViewed"
-                }
-            );
-            let response = request(
-                "graphql",
-                "POST",
-                &json!({"query":query,"variables":{"input":{
-                "pullRequestId":node,"path":path,"clientMutationId":operation.id}}}),
-            )?;
-            if response
-                .get("errors")
-                .and_then(Value::as_array)
-                .is_some_and(|errors| !errors.is_empty())
-                || response
-                    .pointer(&format!("/data/{mutation}"))
-                    .is_none_or(Value::is_null)
-            {
-                return Err(unsupported(format!(
-                    "viewed-file mutation failed: {response}"
-                )));
-            }
-            response
-        }
-        Change::SetReviewConclusion { conclusion } => {
-            let event = match conclusion.outcome {
-                ReviewOutcome::Comment => "COMMENT",
-                ReviewOutcome::Approve => "APPROVE",
-                ReviewOutcome::RequestChanges => "REQUEST_CHANGES",
-            };
-            let mut body =
-                json!({"event": event,"commit_id":review.read.pull_request.revision.head});
-            if let Some(text) = &conclusion.body {
-                body["body"] = json!(text);
-            }
-            let response = request(&format!("{pull}/reviews"), "POST", &body)?;
-            mappings.push(created_mapping("review", &operation.id, &response)?);
-            response
-        }
-        Change::DismissReview { review, message } => {
-            let id = remote(backend, "review", &review.0)?;
-            request(
-                &format!("{pull}/reviews/{id}/dismissals"),
-                "PUT",
-                &json!({"message":message,"event":"DISMISS"}),
-            )?
-        }
-        Change::SetCommentReaction {
-            comment,
-            reaction,
-            present,
-        } => {
-            if comment_remote(backend, comment)?.0 == "review_summary" {
-                let node = backend
-                    .mappings
-                    .iter()
-                    .find(|mapping| {
-                        mapping.resource == "review_node" && mapping.core_id == comment.0
-                    })
-                    .ok_or_else(|| {
-                        unsupported("review summary lacks its provider node identity")
-                    })?;
-                let mutation = if *present {
-                    "addReaction"
-                } else {
-                    "removeReaction"
-                };
-                let content = super::workspace::graphql_reaction(reaction)?;
-                let query = format!(
-                    "mutation($input: {}Input!) {{ {mutation}(input:$input) {{ clientMutationId }} }}",
-                    if *present {
-                        "AddReaction"
-                    } else {
-                        "RemoveReaction"
-                    }
-                );
-                let response = request(
-                    "graphql",
-                    "POST",
-                    &json!({"query":query,"variables":{"input":{"subjectId":node.remote_id,"content":content,"clientMutationId":operation.id}}}),
-                )?;
-                super::workspace::graphql_data(&response, mutation)?;
-                return Ok(PublishResult { mappings, response });
-            }
-            let endpoint = format!(
-                "{}/reactions",
-                comment_endpoint(&repository, backend, comment)?
-            );
-            let content = reaction_content(reaction)?;
-            if *present {
-                request(&endpoint, "POST", &json!({"content":content}))?
-            } else {
-                let user: RestUser = api("user", &["--method", "GET"])?;
-                if user.id != remote(backend, "user", &review.reviewer.id.0)? {
-                    return Err(unsupported(
-                        "authenticated user differs from the fetched reviewer",
-                    ));
-                }
-                let reactions: Vec<RemoteReaction> = list(&format!("{endpoint}?per_page=100"))?;
-                match reactions.into_iter().find(|reaction| {
-                    reaction.content == content
-                        && reaction
-                            .user
-                            .as_ref()
-                            .is_some_and(|author| author.id == user.id)
-                }) {
-                    Some(reaction) => request(
-                        &format!("{endpoint}/{}", reaction.id),
-                        "DELETE",
-                        &Value::Null,
-                    )?,
-                    None => Value::Null,
-                }
-            }
-        }
-    };
-    Ok(PublishResult { mappings, response })
-}
-
-pub(super) fn inline_payload(comment: &DraftComment, location: &DiffLocation) -> Value {
-    let mut body = json!({"body": comment.content.body,
-        "commit_id": location.revision.head, "path": location.position.path});
-    match &location.position.range {
-        Some(range) => {
-            body["line"] = json!(range.end.line);
-            body["side"] = json!(side(range.end.side));
-            if range.start != range.end {
-                body["start_line"] = json!(range.start.line);
-                body["start_side"] = json!(side(range.start.side));
-            }
-        }
-        None => body["subject_type"] = json!("file"),
-    }
-    body
-}
-
 fn address(backend: &ReviewBackend) -> Result<Address, PublishError> {
     if backend.source.backend != "github" {
         return Err(unsupported("review backend is not GitHub"));
@@ -479,24 +229,6 @@ fn root_comment<'a>(
     }
 }
 
-fn read_root(review: &Review, comment: &CommentId) -> Result<Option<CommentId>, PublishError> {
-    let targets = review
-        .read
-        .comments
-        .iter()
-        .map(|comment| (comment.content.id.clone(), Target::from(&comment.target)))
-        .collect();
-    if !review
-        .read
-        .comments
-        .iter()
-        .any(|value| value.content.id == *comment)
-    {
-        return Ok(None);
-    }
-    Ok(Some(root_comment(&targets, comment)?.clone()))
-}
-
 fn remote(backend: &ReviewBackend, resource: &str, core_id: &str) -> Result<u64, PublishError> {
     backend
         .mappings
@@ -532,46 +264,6 @@ fn comment_remote<'a>(
     ))
 }
 
-fn comment_endpoint(
-    repository: &str,
-    backend: &ReviewBackend,
-    comment: &CommentId,
-) -> Result<String, PublishError> {
-    let (resource, id) = comment_remote(backend, comment)?;
-    Ok(format!(
-        "{repository}/{}/comments/{id}",
-        if resource == "issue_comment" {
-            "issues"
-        } else {
-            "pulls"
-        }
-    ))
-}
-
-fn created_mapping(
-    resource: &str,
-    core_id: &str,
-    response: &Value,
-) -> Result<IdMapping, PublishError> {
-    let id = response
-        .get("id")
-        .and_then(Value::as_u64)
-        .filter(|id| *id > 0)
-        .ok_or_else(|| unsupported("successful create response lacks a resource ID"))?;
-    Ok(IdMapping {
-        resource: resource.into(),
-        core_id: core_id.into(),
-        remote_id: id.to_string(),
-    })
-}
-
-fn side(value: DiffSide) -> &'static str {
-    match value {
-        DiffSide::Base => "LEFT",
-        DiffSide::Head => "RIGHT",
-    }
-}
-
 fn reaction_content(value: &str) -> Result<&'static str, PublishError> {
     match value {
         "👍" => Ok("+1"),
@@ -584,19 +276,6 @@ fn reaction_content(value: &str) -> Result<&'static str, PublishError> {
         "👀" => Ok("eyes"),
         _ => Err(unsupported(format!("unsupported reaction: {value}"))),
     }
-}
-
-#[derive(Deserialize)]
-struct RemoteReaction {
-    id: u64,
-    content: String,
-    user: Option<RestUser>,
-}
-
-#[derive(Deserialize)]
-struct RemoteReplyParent {
-    id: u64,
-    in_reply_to_id: Option<u64>,
 }
 
 pub(super) fn request(endpoint: &str, method: &str, body: &Value) -> Result<Value, PublishError> {
@@ -622,6 +301,21 @@ pub(super) fn request(endpoint: &str, method: &str, body: &Value) -> Result<Valu
     if !output.status.success() {
         let mut details = vec![String::from_utf8_lossy(&output.stderr).trim().to_owned()];
         if let Ok(response) = serde_json::from_slice::<Value>(&output.stdout) {
+            if endpoint == "graphql"
+                && (response.get("data").is_some()
+                    || response
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .is_some_and(|errors| {
+                            errors.iter().any(|error| {
+                                ["path", "locations", "type", "extensions"]
+                                    .iter()
+                                    .any(|field| error.get(*field).is_some())
+                            })
+                        }))
+            {
+                return Ok(response);
+            }
             if let Some(message) = response.get("message").and_then(Value::as_str) {
                 details.push(message.into());
             }

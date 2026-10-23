@@ -94,10 +94,6 @@ fn reopening_preserves_baseline_and_uncollapsed_ordered_history() {
         },
     };
     let events = vec![
-        Event::EditComment {
-            comment: CommentId("fetched-comment".into()),
-            body: "Edited fetched comment".into(),
-        },
         draft("draft", CommentTarget::Diff(location), "Initial draft"),
         Event::EditComment {
             comment: CommentId("draft".into()),
@@ -125,12 +121,12 @@ fn reopening_preserves_baseline_and_uncollapsed_ordered_history() {
         Event::SetFileViewed {
             path: "src/model.rs".into(),
             viewed: true,
-            commit: None,
+            commit: Some(read.pull_request.revision.head.clone()),
         },
         Event::SetFileViewed {
             path: "src/model.rs".into(),
             viewed: false,
-            commit: None,
+            commit: Some(read.pull_request.revision.head.clone()),
         },
         Event::DismissReview {
             review: ReviewResourceId("fetched-review".into()),
@@ -150,6 +146,7 @@ fn reopening_preserves_baseline_and_uncollapsed_ordered_history() {
         },
     ];
 
+    let recorded_events;
     {
         let mut store = Store::open(project.path()).unwrap();
         store.create_review(&id, &user(), &read).unwrap();
@@ -157,6 +154,14 @@ fn reopening_preserves_baseline_and_uncollapsed_ordered_history() {
         for event in &events {
             store.append_event(&batch, event).unwrap();
         }
+        recorded_events = store.get_batch(&batch).unwrap().unwrap().write.events;
+        assert_eq!(
+            recorded_events
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>(),
+            events
+        );
     }
 
     assert!(project.path().join(".review/state.sqlite3").is_file());
@@ -172,13 +177,12 @@ fn reopening_preserves_baseline_and_uncollapsed_ordered_history() {
     assert_eq!(
         reopened.get_batch(&batch).unwrap(),
         Some(Batch {
-            revision: buf_review::model::BatchRevision {
-                number: 0,
-                namespace: Some(batch.0.clone())
-            },
+            revision: buf_review::model::BatchRevision { number: 0 },
             id: batch,
             review: id,
-            write: WriteState { events },
+            write: WriteState {
+                events: recorded_events
+            },
         })
     );
 }
@@ -204,11 +208,27 @@ fn older_batches_remain_editable_after_newer_batches_are_created() {
     store.append_event(&first, &edit).unwrap();
 
     assert_eq!(
-        store.get_batch(&first).unwrap().unwrap().write.events,
+        store
+            .get_batch(&first)
+            .unwrap()
+            .unwrap()
+            .write
+            .events
+            .into_iter()
+            .map(|record| record.event)
+            .collect::<Vec<_>>(),
         vec![first_event, edit]
     );
     assert_eq!(
-        store.get_batch(&second).unwrap().unwrap().write.events,
+        store
+            .get_batch(&second)
+            .unwrap()
+            .unwrap()
+            .write
+            .events
+            .into_iter()
+            .map(|record| record.event)
+            .collect::<Vec<_>>(),
         vec![second_event]
     );
     assert_eq!(store.batch_ids(&review).unwrap(), vec![first, second]);
@@ -238,7 +258,15 @@ fn reviews_of_same_pull_request_keep_independent_snapshots_and_batches() {
         second_read
     );
     assert_eq!(
-        store.get_batch(&first_batch).unwrap().unwrap().write.events,
+        store
+            .get_batch(&first_batch)
+            .unwrap()
+            .unwrap()
+            .write
+            .events
+            .into_iter()
+            .map(|record| record.event)
+            .collect::<Vec<_>>(),
         vec![event]
     );
     assert!(
@@ -364,13 +392,13 @@ fn concurrent_connections_append_without_overwriting_each_others_events() {
     for writer in 0..2 {
         let actual: Vec<_> = events
             .iter()
-            .filter(|event| match event {
+            .filter(|record| match &record.event {
                 Event::CreateComment { comment } => {
                     comment.content.id.0.starts_with(&format!("{writer}-"))
                 }
                 _ => false,
             })
-            .cloned()
+            .map(|record| record.event.clone())
             .collect();
         let expected: Vec<_> = (0..24)
             .map(|index| {
@@ -463,13 +491,41 @@ fn invalid_events_are_rejected_without_poisoning_the_log() {
         assert_eq!(store.get_batch(&batch).unwrap(), Some(original.clone()));
     }
 
+    for event in [
+        Event::EditComment {
+            comment: CommentId("fetched-comment".into()),
+            body: "Cannot edit published history".into(),
+        },
+        Event::DeleteComment {
+            comment: CommentId("fetched-comment".into()),
+        },
+    ] {
+        assert!(
+            store
+                .append_event(&batch, &event)
+                .unwrap_err()
+                .to_string()
+                .contains("immutable")
+        );
+        assert_eq!(store.get_batch(&batch).unwrap(), Some(original.clone()));
+    }
+    let next = draft("next-draft", CommentTarget::PullRequest, "New draft");
+    store.append_event(&batch, &next).unwrap();
     let edit = Event::EditComment {
-        comment: CommentId("fetched-comment".into()),
+        comment: CommentId("next-draft".into()),
         body: "Still editable".into(),
     };
     store.append_event(&batch, &edit).unwrap();
     let retained = store.get_batch(&batch).unwrap().unwrap();
-    assert_eq!(retained.write.events, vec![created, deleted, edit]);
+    assert_eq!(
+        retained
+            .write
+            .events
+            .iter()
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>(),
+        vec![created, deleted, next, edit]
+    );
     let snapshot = store.get_review(&review).unwrap().unwrap();
     assert!(project(&snapshot, &retained).is_ok());
     assert_eq!(
@@ -688,7 +744,6 @@ fn refresh_keeps_batch_identity_and_historical_receipts_out_of_delivered_delta()
         .unwrap();
     assert_eq!(refreshed.batch.id, batch);
     assert_eq!(refreshed.id, batch.0);
-    assert!(refreshed.completed.is_empty());
     assert_eq!(refreshed.results.len(), 1);
     assert!(refreshed.pending().unwrap().operations.is_empty());
     assert_eq!(
@@ -703,7 +758,100 @@ fn refresh_keeps_batch_identity_and_historical_receipts_out_of_delivered_delta()
     let store = Store::open(project.path()).unwrap();
     let reopened = store.workspace(&batch.0).unwrap().unwrap();
     assert!(reopened.pending().unwrap().operations.is_empty());
-    assert!(reopened.completed.is_empty());
     assert_eq!(reopened.results.len(), 1);
     assert!(!reopened.is_unfinished().unwrap());
+}
+
+#[test]
+fn stable_event_identity_and_planning_do_not_depend_on_historical_snapshots() {
+    let project = tempdir().unwrap();
+    let mut store = Store::open(project.path()).unwrap();
+    let initial = ReviewId("identity-initial".into());
+    store.create_review(&initial, &user(), &baseline()).unwrap();
+    let batch = BatchId("identity-batch".into());
+    store.create_batch(&batch, &initial).unwrap();
+    store
+        .append_event(&batch, &draft("local", CommentTarget::PullRequest, "first"))
+        .unwrap();
+    store
+        .append_event(
+            &batch,
+            &Event::EditComment {
+                comment: CommentId("local".into()),
+                body: "edited".into(),
+            },
+        )
+        .unwrap();
+    let before = store.workspace(&batch.0).unwrap().unwrap();
+    let records = before.batch.write.events.clone();
+    for record in &records {
+        assert_eq!(
+            uuid::Uuid::parse_str(&record.id).unwrap().get_version_num(),
+            4
+        );
+    }
+    assert_ne!(records[0].id, records[1].id);
+    let pending = before.publication_plan().unwrap();
+    assert_eq!(pending.operations.len(), 1);
+    assert_eq!(pending.operations[0].id, records[0].id);
+    assert!(matches!(&pending.operations[0].change,
+        Event::CreateComment { comment } if comment.content.body == "edited"));
+
+    let fresh = ReviewId("identity-fresh".into());
+    let mut read = baseline();
+    read.pull_request.title = "Fresh snapshot".into();
+    store.create_review(&fresh, &user(), &read).unwrap();
+    let refreshed = store
+        .refresh_workspace(&batch.0, before.generation, &fresh)
+        .unwrap();
+    assert_eq!(refreshed.batch.write.events, records);
+    assert_eq!(refreshed.publication_plan().unwrap(), pending);
+    drop(store);
+
+    let store = Store::open(project.path()).unwrap();
+    // Historical inspection may require these rows; current planning must not.
+    let connection =
+        rusqlite::Connection::open(project.path().join(".review/state.sqlite3")).unwrap();
+    connection
+        .execute(
+            "DELETE FROM workspace_history WHERE workspace_id=?1",
+            [&batch.0],
+        )
+        .unwrap();
+    let reopened = store.workspace(&batch.0).unwrap().unwrap();
+    assert_eq!(reopened.batch.write.events, records);
+    assert_eq!(reopened.publication_plan().unwrap(), pending);
+}
+
+#[test]
+fn refresh_of_deleted_remote_comment_makes_its_local_reaction_irrelevant() {
+    use buf_review::workspace::Action;
+    let project = tempdir().unwrap();
+    let mut store = Store::open(project.path()).unwrap();
+    let initial = ReviewId("reaction-before-deletion".into());
+    store.create_review(&initial, &user(), &baseline()).unwrap();
+    let workspace = store.create_batch_workspace(&initial).unwrap();
+    let workspace = store
+        .mutate_workspace(
+            &workspace.id,
+            workspace.generation,
+            Action::Reaction {
+                comment: CommentId("fetched-comment".into()),
+                present: false,
+            },
+        )
+        .unwrap();
+    let records = workspace.batch.write.events.clone();
+    assert_eq!(workspace.publication_plan().unwrap().operations.len(), 1);
+    let mut fresh = baseline();
+    fresh.comments.clear();
+    fresh.reactions.clear();
+    let next = ReviewId("reaction-after-deletion".into());
+    store.create_review(&next, &user(), &fresh).unwrap();
+    let workspace = store
+        .refresh_workspace(&workspace.id, workspace.generation, &next)
+        .unwrap();
+    assert!(workspace.publication_plan().unwrap().operations.is_empty());
+    assert!(workspace.projected().unwrap().comments.is_empty());
+    assert_eq!(workspace.batch.write.events, records);
 }

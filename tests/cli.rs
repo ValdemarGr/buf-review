@@ -176,7 +176,15 @@ fn explicit_batches_preserve_log_while_plans_collapse_cancelled_changes() {
     )))
     .unwrap();
     assert_eq!(opened.review, id);
-    assert_eq!(opened.write.events, events);
+    assert_eq!(
+        opened
+            .write
+            .events
+            .iter()
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>(),
+        events
+    );
     let second_batch: Batch = serde_json::from_str(&success(run(
         project.path(),
         &["batch", "open", &second],
@@ -204,7 +212,15 @@ fn explicit_batches_preserve_log_while_plans_collapse_cancelled_changes() {
         None,
     )))
     .unwrap();
-    assert_eq!(reopened.write.events, events);
+    assert_eq!(
+        reopened
+            .write
+            .events
+            .iter()
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>(),
+        events
+    );
 }
 
 #[test]
@@ -300,7 +316,15 @@ fn invalid_event_is_rejected_and_batch_remains_usable() {
             .map(str::to_owned),
     };
     let retained = store.get_batch(&batch).unwrap().unwrap();
-    assert_eq!(retained.write.events, vec![valid]);
+    assert_eq!(
+        retained
+            .write
+            .events
+            .iter()
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>(),
+        vec![valid]
+    );
     let state: Value =
         serde_json::from_str(&success(run(project.path(), &["state", "batch"], None))).unwrap();
     assert_eq!(state["files"][0]["viewed"], true);

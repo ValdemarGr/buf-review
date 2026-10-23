@@ -179,6 +179,67 @@ fn mapped(backend: &ReviewBackend, resource: &str, remote_id: &str) -> String {
 }
 
 #[test]
+fn snapshot_provider_nodes_persist_with_distinct_review_and_root_thread_identities() {
+    let fake = FakeGh::new();
+    let id = fetched_id(fake.fetch(URL, None));
+    let mut store = fake.store();
+    let backend = store.review_backend(&id).unwrap().unwrap();
+    for (numeric_resource, numeric, node_resource, node) in [
+        ("pull_request", "70", "pull_request_node", "PR_70"),
+        ("issue_comment", "101", "issue_comment_node", "IC_101"),
+        ("review_comment", "201", "review_comment_node", "RC_201"),
+        ("review_comment", "202", "review_comment_node", "RC_202"),
+        ("review", "301", "review_resource_node", "R_301"),
+        ("review", "303", "review_resource_node", "R_303"),
+        ("review_summary", "301", "review_node", "R_301"),
+    ] {
+        assert_eq!(
+            mapped(&backend, numeric_resource, numeric),
+            mapped(&backend, node_resource, node)
+        );
+    }
+    assert_ne!(
+        mapped(&backend, "review", "301"),
+        mapped(&backend, "review_summary", "301")
+    );
+    let root = mapped(&backend, "review_comment", "201");
+    let reply = mapped(&backend, "review_comment", "202");
+    assert_eq!(mapped(&backend, "review_thread", "T201"), root);
+    assert_eq!(
+        mapped(&backend, "review_thread", "T203"),
+        mapped(&backend, "review_comment", "203")
+    );
+    assert_eq!(
+        backend
+            .mappings
+            .iter()
+            .filter(|mapping| mapping.resource == "review_thread")
+            .count(),
+        2
+    );
+    assert!(
+        !backend
+            .mappings
+            .iter()
+            .any(|mapping| mapping.resource == "review_thread" && mapping.core_id == reply)
+    );
+    assert!(
+        !backend
+            .mappings
+            .iter()
+            .any(|mapping| mapping.resource == "review_node" && mapping.remote_id == "R_303")
+    );
+    drop(store);
+
+    // Reopening and importing the identical snapshot exercise the persisted
+    // uniqueness constraints, including one provider node used by two resource kinds.
+    let second = fetched_id(fake.fetch(URL, None));
+    assert_eq!(second, id);
+    let mut store = fake.store();
+    assert_eq!(store.review_backend(&id).unwrap().unwrap(), backend);
+}
+
+#[test]
 fn fetch_normalizes_all_pages_and_retains_read_history_without_creating_a_batch() {
     let fake = FakeGh::new();
     let id = fetched_id(fake.fetch(URL, None));
@@ -852,16 +913,6 @@ fn pending_comments_preserve_paginated_roots_replies_and_identity_after_submissi
     }
     assert_eq!(store.get_review(&id).unwrap().unwrap().read, read);
     assert!(store.batch_ids(&submitted).unwrap().is_empty());
-}
-
-#[test]
-fn old_read_comments_default_to_submitted() {
-    let comment: ReadComment = serde_json::from_value(json!({
-        "id":"legacy-comment", "body":"Existing snapshot", "author":null,
-        "target":{"kind":"pull_request"}
-    }))
-    .unwrap();
-    assert!(!comment.draft);
 }
 
 #[test]

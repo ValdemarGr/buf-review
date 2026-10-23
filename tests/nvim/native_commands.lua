@@ -9,7 +9,7 @@ local notices = {}
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end
 local revision = { base = string.rep('a', 40), head = string.rep('b', 40) }
 local function comment(id)
-  return { comment = { origin = 'read', comment = { id = id, body = id, author = { id = 'me', name = 'me' }, target = { kind = 'diff', target = { path = 'src/file.rs', revision = revision, range = { start = { side = 'head', line = 1 }, ['end'] = { side = 'head', line = 1 } } } } } }, fetched = true, done = false, pending_delete = false, conflict = false, summary = false }
+  return { comment = { origin = 'read', comment = { id = id, body = id, author = { id = 'me', name = 'me' }, target = { kind = 'diff', target = { path = 'src/file.rs', revision = revision, range = { start = { side = 'head', line = 1 }, ['end'] = { side = 'head', line = 1 } } } } } }, fetched = true, done = false, conflict = false, summary = false }
 end
 local initial = {
   id = 'native-session', generation = 0, locator = 'https://github.com/acme/repo/pull/1', comparison = revision,
@@ -164,7 +164,7 @@ vim.cmd('normal ddu')
 sent = batch_since(before, 2)
 wait(function() return notices[#notices]:find('immutable', 1, true) end, 'published deletion was not rejected')
 assert(sent.actions[1].action == 'delete_comments' and sent.actions[2].action == 'undo'
-  and not state().comments[1].pending_delete and #state().comments == 2,
+  and #state().comments == 2,
   'immutable comment deletion changed saved state')
 reset({ 'Undo-twice' })
 local twice = state()
@@ -178,25 +178,6 @@ vim.cmd('normal uu')
 sent = batch_since(before, 2)
 wait(function() return state().generation >= sent.generation + 2 end, 'repeated undo did not finish')
 assert(sent.actions[1].action == 'undo' and sent.actions[2].action == 'undo' and not state().comments[1].done, 'undo intents coalesced across contextual state change')
-
--- Later actions validate against restored state, rather than the stale reader.
-for _, keys in ipairs({ 'us', 'udd' }) do
-  reset({ 'Restore-intent' })
-  local deleted = state()
-  deleted.comments[1].pending_delete = true
-  deleted.pending = { { id = 'restore-intent-delete', change = { kind = 'delete_comment', comment = 'Restore-intent' } } }
-  write('state.json', deleted)
-  vim.cmd('Review')
-  wait(function() return text():find('pending deletion', 1, true) end, 'pending deletion did not load')
-  row('Restore-intent')
-  before = #requests('actions')
-  vim.cmd('normal ' .. keys)
-  sent = batch_since(before, 2)
-  wait(function() return not state().comments[1].pending_delete end, 'restore followed by action did not finish')
-  assert(sent.actions[1].action == 'undo', 'restore was resolved outside Rust')
-  if keys == 'us' then assert(state().comments[1].done and not state().comments[1].pending_delete, 'mark used stale deletion flag')
-  else assert(not state().comments[1].pending_delete and #state().comments == 1, 'immutable restored comment was deleted') end
-end
 
 -- A queued cancellation removes a local child before the later parent delete.
 reset({ 'Parent-intent', 'Child-intent' }, { drafts = true })

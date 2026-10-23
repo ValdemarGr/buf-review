@@ -1,2 +1,4 @@
 /target/
 /.review/
+__pycache__/
+*.py[cod]

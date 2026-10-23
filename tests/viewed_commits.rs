@@ -1,7 +1,6 @@
 use std::{fs, path::Path, process::Command};
 
 use buf_review::{model::*, store::Store, workspace::Action};
-use rusqlite::Connection;
 use tempfile::tempdir;
 
 fn git(project: &Path, arguments: &[&str]) -> String {
@@ -42,7 +41,7 @@ fn baseline(base: &str, head: &str) -> ReadState {
     ReadState {
         pull_request: PullRequest {
             id: PullRequestId("pull".into()),
-            title: "Legacy viewed marks".into(),
+            title: "Viewed commit versions".into(),
             body: String::new(),
             author: None,
             status: PullRequestStatus::Open,
@@ -66,7 +65,7 @@ fn baseline(base: &str, head: &str) -> ReadState {
 }
 
 #[test]
-fn repeated_legacy_marks_recover_distinct_original_commits_through_refresh() {
+fn marks_preserve_distinct_commit_versions_through_refresh_and_reopen() {
     let project = tempdir().unwrap();
     git(project.path(), &["init", "-q"]);
     let base = commit(project.path(), "base");
@@ -127,37 +126,44 @@ fn repeated_legacy_marks_recover_distinct_original_commits_through_refresh() {
     let batch = workspace.id.clone();
     drop(store);
 
-    // Reproduce pre-stamp event storage without rewriting comparison history.
-    let connection = Connection::open(project.path().join(".review/state.sqlite3")).unwrap();
-    connection
-        .execute(
-            "UPDATE write_events SET event=json_remove(event,'$.commit') WHERE batch_id=?1",
-            [&batch],
-        )
-        .unwrap();
-    drop(connection);
-
     let mut store = Store::open(project.path()).unwrap();
     let mut workspace = store.workspace(&batch).unwrap().unwrap();
     assert_eq!(workspace.batch.write.events.len(), 3);
-    assert_eq!(workspace.legacy_viewed_commits.get(&0), Some(&head_a));
-    assert_eq!(workspace.legacy_viewed_commits.get(&1), Some(&head_b));
-    assert_eq!(workspace.legacy_viewed_commits.get(&2), Some(&head_b));
-    assert!(
-        workspace
-            .batch
-            .write
-            .events
-            .iter()
-            .all(|event| matches!(event, Event::SetFileViewed { commit: None, .. }))
+    let commits = workspace
+        .batch
+        .write
+        .events
+        .iter()
+        .map(|record| match &record.event {
+            Event::SetFileViewed { commit, .. } => commit.clone(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        commits,
+        vec![
+            Some(head_a.clone()),
+            Some(head_b.clone()),
+            Some(head_b.clone())
+        ]
     );
+    assert!(workspace.batch.write.events.iter().all(|event| matches!(
+        &event.event,
+        Event::SetFileViewed {
+            commit: Some(_),
+            ..
+        }
+    )));
     assert!(!workspace.projected().unwrap().files[0].viewed);
     assert!(workspace.pending().unwrap().operations.is_empty());
 
     workspace = store
         .compare_saved(&batch, workspace.generation, &head_a)
         .unwrap();
-    assert!(workspace.projected().unwrap().files[0].viewed);
+    assert!(
+        workspace.projected().unwrap().files[0].viewed,
+        "{workspace:?}"
+    );
     assert_eq!(workspace.pending().unwrap().operations.len(), 1);
     assert_eq!(
         workspace.pending().unwrap().operations[0].id,
@@ -172,7 +178,7 @@ fn repeated_legacy_marks_recover_distinct_original_commits_through_refresh() {
 }
 
 #[test]
-fn raw_legacy_mark_at_its_original_baseline_remains_readable() {
+fn raw_mark_records_its_active_comparison_commit() {
     let project = tempdir().unwrap();
     let reviewer = User {
         id: UserId("reviewer".into()),
@@ -191,16 +197,15 @@ fn raw_legacy_mark_at_its_original_baseline_remains_readable() {
     };
     store.append_event(&workspace.batch.id, &event).unwrap();
     let recovered = store.workspace(&workspace.id).unwrap().unwrap();
-    assert_eq!(
-        recovered.legacy_viewed_commits.get(&0).map(String::as_str),
-        Some("head")
+    assert!(
+        matches!(&recovered.batch.write.events[0].event, Event::SetFileViewed { commit: Some(commit), .. } if commit == "head")
     );
     assert!(recovered.projected().unwrap().files[0].viewed);
-    assert_eq!(recovered.batch.write.events, vec![event]);
+    assert_eq!(recovered.batch.write.events.len(), 1);
 }
 
 #[test]
-fn stale_legacy_mark_without_origin_evidence_is_not_assigned_current_head() {
+fn raw_mark_uses_selected_comparison_commit() {
     let project = tempdir().unwrap();
     let reviewer = User {
         id: UserId("reviewer".into()),
@@ -225,13 +230,8 @@ fn stale_legacy_mark_without_origin_evidence_is_not_assigned_current_head() {
     };
     store.append_event(&workspace.batch.id, &event).unwrap();
     let recovered = store.workspace(&workspace.id).unwrap().unwrap();
-    assert!(!recovered.legacy_viewed_commits.contains_key(&0));
     assert!(
-        recovered
-            .pending()
-            .unwrap_err()
-            .to_string()
-            .contains("viewed mark commit unavailable")
+        matches!(&recovered.batch.write.events[0].event, Event::SetFileViewed { commit: Some(commit), .. } if commit == "another-head")
     );
-    assert_eq!(recovered.batch.write.events, vec![event]);
+    assert!(recovered.projected().unwrap().files[0].viewed);
 }

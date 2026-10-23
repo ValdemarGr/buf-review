@@ -45,7 +45,7 @@ local function watch(buf)
 end
 local revision = { base = string.rep('a', 40), head = string.rep('b', 40) }
 local function comment(id, author)
-  return { comment = { origin = 'read', comment = { id = id, body = id, author = { id = author or 'me', name = author or 'me' }, target = { kind = 'diff', target = { path = 'src/file.rs', revision = revision, range = { start = { side = 'head', line = 1 }, ['end'] = { side = 'head', line = 1 } } } } } }, fetched = true, done = false, pending_delete = false, conflict = false, summary = false }
+  return { comment = { origin = 'read', comment = { id = id, body = id, author = { id = author or 'me', name = author or 'me' }, target = { kind = 'diff', target = { path = 'src/file.rs', revision = revision, range = { start = { side = 'head', line = 1 }, ['end'] = { side = 'head', line = 1 } } } } } }, fetched = true, done = false, conflict = false, summary = false }
 end
 local initial = {
   id = 'performance-batch', generation = 0, locator = 'https://github.com/acme/repo/pull/1', comparison = revision,
@@ -186,7 +186,7 @@ local first = row('owned-preflight') - 1
 api.nvim_win_set_cursor(0, { first, 0 })
 local before = #requests('actions')
 input('V3jd')
-assert(#requests('actions') == before + 1 and not state().comments[1].pending_delete and notices[#notices]:find('verified ownership', 1, true), 'batched deletion bypassed preflight')
+assert(#requests('actions') == before + 1 and notices[#notices]:find('verified ownership', 1, true), 'batched deletion bypassed preflight')
 
 -- Late failure commits only the successful prefix and renders final state once.
 local drafts = {}

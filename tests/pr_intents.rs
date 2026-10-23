@@ -88,7 +88,7 @@ impl Fixture {
         fs::create_dir(root.join("bin")).unwrap();
         let executable = root.join("bin/gh");
         fs::write(&executable, r#"#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys
+import json, os, pathlib, re, subprocess, sys
 root = pathlib.Path(os.environ['INTENT_ROOT'])
 state_path = root / 'provider.json'
 state = json.loads(state_path.read_text())
@@ -100,7 +100,7 @@ with (root / 'requests.jsonl').open('a') as out:
  out.write(json.dumps({'args':args,'method':method,'body':body})+'\n')
 def save(): state_path.write_text(json.dumps(state))
 def pull():
- return {'id':70,'number':7,'html_url':'https://github.com/target/repo/pull/7','state':'open','title':state.get('created_title','Remote title'),'body':state.get('created_body','Remote body'),'head':{'ref':'feature','repo':{'full_name':'fork/repo'},'sha':state['head']},'base':{'ref':'master','repo':{'full_name':'target/repo'},'sha':state['base']}}
+ return {'id':70,'node_id':'PR_70','number':7,'html_url':'https://github.com/target/repo/pull/7','state':'open','title':state.get('created_title','Remote title'),'body':state.get('created_body','Remote body'),'head':{'ref':'feature','repo':{'full_name':'fork/repo'},'sha':state['head']},'base':{'ref':'master','repo':{'full_name':'target/repo'},'sha':state['base']}}
 def connection(nodes=[]):
  return {'totalCount':len(nodes),'nodes':nodes,'pageInfo':{'hasNextPage':False,'endCursor':None}}
 if args[0]=='repo': print(json.dumps({'nameWithOwner':'target/repo'}))
@@ -125,6 +125,17 @@ elif endpoint=='repos/target/repo/pulls' and method=='POST':
  if mode in ('uncertain','uncertain_absent'): print('HTTP 502',file=sys.stderr);sys.exit(1)
  if mode=='race': print('HTTP 422',file=sys.stderr);sys.exit(1)
  print(json.dumps(pull()))
+elif endpoint=='graphql' and 'PublicationBatch' in body['query']:
+ data={}
+ for alias,field in re.findall(r'(op\d+)\s*:\s*(\w+)\s*\(',body['query']):
+  assert field=='addComment',body
+  value=body['variables']['input'+alias[2:]]
+  assert value['subjectId']=='PR_70',body
+  state['comment_id']=state.get('comment_id',100)+1
+  identity=state['comment_id']
+  state.setdefault('comments',[]).append(dict(body=value['body'],author=state.get('user',7),identity=identity))
+  data[alias]=dict(clientMutationId=value['clientMutationId'],commentEdge=dict(node=dict(id='C'+str(identity),fullDatabaseId=str(identity))))
+ save();print(json.dumps(dict(data=data)))
 elif endpoint=='graphql':
  assert 'ReviewSnapshot' in body['query'],body
  user={'login':'reviewer','databaseId':7}
@@ -220,7 +231,7 @@ else:
             .collect()
     }
     fn pull(&self) -> Value {
-        json!({"id":70,"number":7,"html_url":"https://github.com/target/repo/pull/7","state":"open","title":"Remote title","body":"Remote body","head":{"ref":"feature","repo":{"full_name":"fork/repo"},"sha":self.head},"base":{"ref":"master","repo":{"full_name":"target/repo"},"sha":self.base}})
+        json!({"id":70,"node_id":"PR_70","number":7,"html_url":"https://github.com/target/repo/pull/7","state":"open","title":"Remote title","body":"Remote body","head":{"ref":"feature","repo":{"full_name":"fork/repo"},"sha":self.head},"base":{"ref":"master","repo":{"full_name":"target/repo"},"sha":self.base}})
     }
 }
 
@@ -438,19 +449,38 @@ fn publication_binds_every_batch_before_sending_comments() {
         published["workspace"]["comments"][0]["comment"]["comment"]["id"],
         first_comment
     );
+    assert_eq!(
+        published_other["workspace"]["comments"][0]["comment"]["comment"]["id"],
+        second_comment
+    );
     let requests = fixture.requests();
     let writes = requests
         .iter()
         .filter(|request| request["method"] == "POST")
         .map(|request| request["args"][1].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(
-        writes,
-        [
-            "repos/target/repo/pulls",
-            "repos/target/repo/issues/7/comments",
-            "repos/target/repo/issues/7/comments"
-        ]
+    assert_eq!(writes, ["repos/target/repo/pulls", "graphql", "graphql"]);
+    for request in requests
+        .iter()
+        .filter(|request| request["args"][1] == "graphql" && request["method"] == "POST")
+    {
+        assert!(
+            request["body"]["query"]
+                .as_str()
+                .unwrap()
+                .contains("PublicationBatch")
+        );
+        assert_eq!(request["body"]["variables"]["input0"]["subjectId"], "PR_70");
+    }
+    let first_batch = requests
+        .iter()
+        .position(|request| request["args"][1] == "graphql" && request["method"] == "POST")
+        .unwrap();
+    assert!(
+        !requests[..first_batch]
+            .iter()
+            .any(|request| request["args"][1] == "repos/target/repo/pulls/7"),
+        "creation response node was fetched again before publication"
     );
 }
 
@@ -692,7 +722,34 @@ fn second_reviewer_publishes_shared_local_pr_with_own_provider_identity() {
             .unwrap()
             .is_empty()
     );
-    let store = buf_review::store::Store::open(fixture.root()).unwrap();
+    let mut store = buf_review::store::Store::open(fixture.root()).unwrap();
+    let provider: Value =
+        serde_json::from_slice(&fs::read(fixture.root().join("provider.json")).unwrap()).unwrap();
+    assert_eq!(provider["comments"][0]["author"], 8);
+    assert_eq!(provider["comments"][0]["body"], "Second reviewer's comment");
+    let backend = store
+        .review_backend(&buf_review::model::ReviewId(
+            second_published["workspace"]["review"]["id"]
+                .as_str()
+                .unwrap()
+                .into(),
+        ))
+        .unwrap()
+        .unwrap();
+    assert!(backend.mappings.iter().any(|mapping| {
+        mapping.resource == "user"
+            && mapping.core_id
+                == second_published["workspace"]["review"]["reviewer"]["id"]
+                    .as_str()
+                    .unwrap()
+            && mapping.remote_id == "8"
+    }));
+    assert!(
+        backend
+            .mappings
+            .iter()
+            .any(|mapping| mapping.resource == "pull_request_node" && mapping.remote_id == "PR_70")
+    );
     assert_eq!(
         store
             .workspace(second["id"].as_str().unwrap())

@@ -311,13 +311,9 @@ pub fn run(directory: &Path, request: Value) -> Result<Value> {
             let prepared = fetch_refresh(&mut store, &workspace);
             apply_refresh(&mut store, &bound.workspace, &prepared)
         }
-        "submit" => Err(io::Error::other(
-            "only publish may write to the provider; stage publish_review first",
-        )
-        .into()),
         "publish" => {
             let result =
-                github::publish_workspace(&mut store, &bound.workspace, generation(&bound)?, false);
+                github::publish_workspace(&mut store, &bound.workspace, generation(&bound)?);
             match result {
                 Ok(_) => Ok(json!({"workspace":store.workspace_view(&bound.workspace)?})),
                 Err(error) => Ok(
@@ -531,11 +527,8 @@ fn apply_refresh(store: &mut Store, id: &str, prepared: &PreparedRefresh) -> Res
                 }
                 RefreshOutcome::Snapshot { review } => {
                     let workspace = store.refresh_workspace(id, latest.generation, review)?;
-                    crate::context::prepare(
-                        store,
-                        &store.project_root().to_path_buf(),
-                        &workspace,
-                    )?;
+                    let project = store.project_root().to_path_buf();
+                    crate::context::prepare(store, &project, &workspace)?;
                     let workspace = store
                         .workspace(id)?
                         .ok_or_else(|| io::Error::other("workspace does not exist"))?;

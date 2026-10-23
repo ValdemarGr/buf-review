@@ -529,7 +529,6 @@ fn blank_and_nonblank_saves_cancel_then_restore_same_local_comment_identity() {
         .find(|row| row["comment"]["comment"]["id"] == comment)
         .unwrap();
     assert_eq!(row["comment"]["comment"]["body"], "Restored reply");
-    assert_eq!(row["pending_delete"], false);
     assert_eq!(
         comments
             .iter()
@@ -1862,7 +1861,7 @@ cat "$REFRESH_FIXTURES/$fixture.json"
                     },
                 )
                 .unwrap();
-            let operations = latest.prepare(Destination::Review).unwrap().operations;
+            let operations = latest.publication_plan().unwrap().operations;
             latest = store
                 .mutate_workspace(
                     &id,
@@ -1885,7 +1884,7 @@ cat "$REFRESH_FIXTURES/$fixture.json"
                     },
                 )
                 .unwrap();
-            let operations = latest.prepare(Destination::Standalone).unwrap().operations;
+            let operations = latest.publication_plan().unwrap().operations;
             latest = store
                 .mutate_workspace(
                     &id,
@@ -2023,7 +2022,7 @@ fn headless_neovim_uses_real_cached_cli_without_network_or_source_mutation() {
             )
             .unwrap();
         let receipt_comment = workspace.saved_comment.clone().unwrap();
-        let plan = workspace.prepare(Destination::Standalone).unwrap();
+        let plan = workspace.publication_plan().unwrap();
         let workspace = store
             .mutate_workspace(
                 &id,
@@ -2096,7 +2095,7 @@ fn headless_neovim_uses_real_cached_cli_without_network_or_source_mutation() {
         .env("BUF_REVIEW_RECEIPT_COMMENT", &receipt_comment.0)
         .env("PATH", std::env::join_paths(path).unwrap())
         .output()
-        .expect("headless integration requires nvim >=0.10; use nix develop");
+        .expect("headless integration requires nvim >=0.10 on PATH");
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -2122,24 +2121,17 @@ fn headless_neovim_uses_real_cached_cli_without_network_or_source_mutation() {
         fs::read_to_string(root.path().join("file.rs")).unwrap(),
         "after\n"
     );
-    assert_eq!(
-        workspace.completed.len(),
-        1,
-        "only seeded synthetic receipt expected"
-    );
     assert_eq!(workspace.results.len(), 1, "UI must not publish");
     assert!(
         view.comments
             .iter()
-            .any(|row| row.comment.content().id.0 == "own-root" && !row.pending_delete),
+            .any(|row| row.comment.content().id.0 == "own-root"),
         "fetched comments remain immutable"
     );
     assert!(
         view.comments
             .iter()
-            .any(|row| row.comment.content().id == receipt_comment
-                && !row.pending_delete
-                && !row.fetched)
+            .any(|row| row.comment.content().id == receipt_comment && !row.fetched)
     );
     assert!(!view.todo.contains(&receipt_comment) && !view.done.contains(&receipt_comment));
 }
@@ -2794,7 +2786,6 @@ fn ordered_actions_resolve_contextual_undo_after_each_preceding_write() {
     );
     let store = Store::open(root.path()).unwrap();
     let workspace = store.workspace(&id).unwrap().unwrap();
-    assert!(workspace.completed.is_empty());
     assert!(workspace.results.is_empty());
     assert_eq!(
         store.workspace_log(&id).unwrap().last().unwrap()["action"]["action"],
@@ -2935,7 +2926,7 @@ cat "$fixture_dir/$fixture.json"
 }
 
 #[test]
-fn queued_conclusion_is_local_and_legacy_submit_cannot_write() {
+fn queued_conclusion_is_local() {
     let (root, id) = fixture();
     let response = api(
         root.path(),
@@ -2964,34 +2955,4 @@ fn queued_conclusion_is_local_and_legacy_submit_cannot_write() {
         Event::SetReviewConclusion { .. }
     ));
     assert!(workspace.results.is_empty() && workspace.attempt.is_none());
-    use std::os::unix::fs::PermissionsExt;
-    let bin = root.path().join("no-provider");
-    fs::create_dir(&bin).unwrap();
-    fs::write(
-        bin.join("gh"),
-        "#!/bin/sh\nprintf 'unexpected provider invocation' >&2\nexit 1\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .unwrap();
-    let rejected = command_with_path(
-        root.path(),
-        &json!({
-            "op":"submit", "workspace":id, "generation":workspace.generation
-        }),
-        Some(&path),
-    );
-    assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("only publish may write"));
-    assert_eq!(
-        Store::open(root.path())
-            .unwrap()
-            .workspace(&id)
-            .unwrap()
-            .unwrap(),
-        workspace
-    );
 }

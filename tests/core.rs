@@ -1,10 +1,10 @@
 use std::num::NonZeroU32;
 
-use buf_review::core::{Change, CoreError, ProjectedComment, prepare, prepare_ordered, project};
+use buf_review::core::{Change, CoreError, ProjectedComment, prepare, project};
 use buf_review::model::*;
 
 #[test]
-fn cached_pull_request_without_branch_source_remains_readable() {
+fn pull_request_branch_source_is_optional() {
     let cached = serde_json::to_value(review().read.pull_request).unwrap();
     assert!(cached.get("source").is_none());
     let mut pull: PullRequest = serde_json::from_value(cached.clone()).unwrap();
@@ -21,7 +21,7 @@ fn cached_pull_request_without_branch_source_remains_readable() {
 }
 
 #[test]
-fn changed_file_without_cached_stats_remains_unknown_and_zero_counts_round_trip() {
+fn optional_file_stats_preserve_unknown_and_zero_counts() {
     let cached = serde_json::json!({
         "path": "src/lib.rs", "previous_path": null, "change": "modified", "viewed": false
     });
@@ -149,7 +149,9 @@ fn batch(events: Vec<Event>) -> Batch {
         revision: Default::default(),
         id: BatchId("batch".into()),
         review: ReviewId("review".into()),
-        write: WriteState { events },
+        write: WriteState {
+            events: events.into_iter().map(RecordedEvent::new).collect(),
+        },
     }
 }
 fn create(value: &str, target: CommentTarget) -> Event {
@@ -259,8 +261,6 @@ fn unsent_changes_cancel_without_erasing_history() {
         edit("draft", "edited"),
         reaction("draft", true),
         delete("draft"),
-        edit("general", "edited"),
-        edit("general", "general body"),
         viewed(true),
         viewed(false),
         reaction("general", false),
@@ -272,43 +272,24 @@ fn unsent_changes_cancel_without_erasing_history() {
             .operations
             .is_empty()
     );
-    assert_eq!(batch.write.events.len(), 10);
+    assert_eq!(batch.write.events.len(), 8);
     assert_eq!(project(&review(), &batch).unwrap().comments.len(), 2);
 }
 
 #[test]
-fn create_edit_collapses_then_successful_create_becomes_edit_then_delete() {
-    let mut batch = batch(vec![
+fn create_edits_coalesce_and_confirmed_creation_consumes_the_group() {
+    let events = batch(vec![
         create("draft", CommentTarget::PullRequest),
-        edit("draft", "first edit"),
+        edit("draft", "edited"),
     ]);
-    let first = prepare(&review(), &batch, &[]).unwrap().operations;
-    assert_eq!(first.len(), 1);
+    let sent = prepare(&review(), &events, &[]).unwrap().operations;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].id, events.write.events[0].id);
     assert!(
-        matches!(&first[0].change, Change::CreateComment { comment } if comment.content.body == "first edit")
+        matches!(&sent[0].change, Change::CreateComment { comment } if comment.content.body == "edited")
     );
     assert!(
-        prepare(&review(), &batch, &first)
-            .unwrap()
-            .operations
-            .is_empty()
-    );
-    batch.write.events.push(edit("draft", "second edit"));
-    let second = prepare(&review(), &batch, &first).unwrap().operations;
-    assert!(
-        matches!(&second[0].change, Change::EditComment { comment, body } if *comment == id("draft") && body == "second edit")
-    );
-    assert_ne!(first[0].id, second[0].id);
-    let mut receipts = first;
-    receipts.extend(second);
-    batch.write.events.push(delete("draft"));
-    let last = prepare(&review(), &batch, &receipts).unwrap().operations;
-    assert!(
-        matches!(&last[0].change, Change::DeleteComment { comment } if *comment == id("draft"))
-    );
-    receipts.extend(last);
-    assert!(
-        prepare(&review(), &batch, &receipts)
+        prepare(&review(), &events, &sent)
             .unwrap()
             .operations
             .is_empty()
@@ -316,18 +297,14 @@ fn create_edit_collapses_then_successful_create_becomes_edit_then_delete() {
 }
 
 #[test]
-fn delivered_edits_and_toggles_reverse_even_when_intent_returns_to_baseline() {
-    let mut batch = batch(vec![
-        edit("general", "changed"),
-        viewed(true),
-        reaction("general", false),
-    ]);
+fn delivered_toggles_reverse_even_when_intent_returns_to_baseline() {
+    let mut batch = batch(vec![viewed(true), reaction("general", false)]);
     let sent = prepare(&review(), &batch, &[]).unwrap().operations;
-    batch.write.events.extend([
-        edit("general", "general body"),
-        viewed(false),
-        reaction("general", true),
-    ]);
+    batch.write.events.extend(
+        ([viewed(false), reaction("general", true)])
+            .into_iter()
+            .map(RecordedEvent::new),
+    );
     assert!(
         prepare(&review(), &batch, &[])
             .unwrap()
@@ -335,16 +312,13 @@ fn delivered_edits_and_toggles_reverse_even_when_intent_returns_to_baseline() {
             .is_empty()
     );
     let reversal = prepare(&review(), &batch, &sent).unwrap().operations;
-    assert_eq!(reversal.len(), 3);
-    assert!(
-        matches!(&reversal[0].change, Change::EditComment { body, .. } if body == "general body")
-    );
+    assert_eq!(reversal.len(), 2);
     assert!(matches!(
-        &reversal[1].change,
+        &reversal[0].change,
         Change::SetFileViewed { viewed: false, .. }
     ));
     assert!(matches!(
-        &reversal[2].change,
+        &reversal[1].change,
         Change::SetCommentReaction { present: true, .. }
     ));
     let receipts = sent.into_iter().chain(reversal).collect::<Vec<_>>();
@@ -383,7 +357,7 @@ fn partial_receipts_skip_only_successes_and_keep_operation_ids_stable() {
 }
 
 #[test]
-fn nested_draft_threads_create_parent_first_delete_child_first() {
+fn nested_draft_threads_create_parent_first_and_cancel_locally() {
     let mut batch = batch(vec![
         create("z-root", CommentTarget::Diff(location())),
         create("a-reply", CommentTarget::Reply(id("z-root"))),
@@ -393,36 +367,23 @@ fn nested_draft_threads_create_parent_first_delete_child_first() {
     assert!(
         matches!(&sent[0].change, Change::CreateComment { comment } if comment.content.id == id("z-root"))
     );
-    batch
-        .write
-        .events
-        .extend([delete("z-root"), delete("a-reply"), delete("b-reply")]);
+    batch.write.events.extend(
+        ([delete("b-reply"), delete("a-reply"), delete("z-root")])
+            .into_iter()
+            .map(RecordedEvent::new),
+    );
     assert!(
         prepare(&review(), &batch, &[])
             .unwrap()
             .operations
             .is_empty()
     );
-    let deletes = prepare(&review(), &batch, &sent).unwrap().operations;
-    assert_eq!(
-        deletes
-            .iter()
-            .map(|operation| match &operation.change {
-                Change::DeleteComment { comment } => comment.clone(),
-                _ => panic!(),
-            })
-            .collect::<Vec<_>>(),
-        vec![id("b-reply"), id("a-reply"), id("z-root")]
-    );
 }
 
 #[test]
 fn fetched_anchors_remain_read_only_and_can_receive_replies() {
     let read = review();
-    let batch = batch(vec![
-        edit("diff", "new body"),
-        create("reply", CommentTarget::Reply(id("diff"))),
-    ]);
+    let batch = batch(vec![create("reply", CommentTarget::Reply(id("diff")))]);
     let projection = project(&read, &batch).unwrap();
     let fetched = projection.comments.iter().find(|comment| matches!(comment, ProjectedComment::Read(comment) if comment.content.id == id("diff"))).unwrap();
     let ProjectedComment::Read(fetched) = fetched else {
@@ -430,8 +391,8 @@ fn fetched_anchors_remain_read_only_and_can_receive_replies() {
     };
     assert_eq!(fetched.target, read.read.comments[1].target);
     assert_eq!(fetched.author, None);
-    assert_eq!(fetched.content.body, "new body");
-    assert_eq!(prepare(&read, &batch, &[]).unwrap().operations.len(), 2);
+    assert_eq!(fetched.content.body, read.read.comments[1].content.body);
+    assert_eq!(prepare(&read, &batch, &[]).unwrap().operations.len(), 1);
 }
 
 #[test]
@@ -451,10 +412,9 @@ fn explicit_new_review_is_sent_even_when_matching_snapshot_then_skipped_on_retry
             .operations
             .is_empty()
     );
-    batch
-        .write
-        .events
-        .push(conclusion(ReviewOutcome::RequestChanges));
+    batch.write.events.push(RecordedEvent::new(conclusion(
+        ReviewOutcome::RequestChanges,
+    )));
     let next = prepare(&review(), &batch, &sent).unwrap().operations;
     assert_eq!(next.len(), 1);
     assert_ne!(sent[0].id, next[0].id);
@@ -518,8 +478,9 @@ fn unsupported_and_dangling_replies_fail_explicitly_without_cascades() {
         prepare(
             &review(),
             &batch(vec![
-                create("reply", CommentTarget::Reply(id("diff"))),
-                delete("diff"),
+                create("local-root", CommentTarget::Diff(location())),
+                create("reply", CommentTarget::Reply(id("local-root"))),
+                delete("local-root"),
                 delete("reply")
             ]),
             &[]
@@ -570,7 +531,7 @@ fn invalid_write_anchors_and_identity_reuse_fail() {
     ));
     assert!(matches!(
         project(&review(), &batch(vec![edit("missing", "body")])),
-        Err(CoreError::MissingComment(_))
+        Err(CoreError::Invalid(_))
     ));
     let mut wrong = batch(vec![]);
     wrong.review = ReviewId("another".into());
@@ -619,18 +580,6 @@ fn incomplete_fetched_reply_ancestry_is_preserved_without_restricting_existing_o
     let empty = batch(vec![]);
     assert!(project(&read, &empty).is_ok());
     assert!(prepare(&read, &empty, &[]).unwrap().operations.is_empty());
-    let edits = prepare(&read, &batch(vec![edit("orphan", "Revised reply")]), &[])
-        .unwrap()
-        .operations;
-    assert!(
-        matches!(&edits[0].change, Change::EditComment { comment, .. } if *comment == id("orphan"))
-    );
-    let deletes = prepare(&read, &batch(vec![delete("orphan")]), &[])
-        .unwrap()
-        .operations;
-    assert!(
-        matches!(&deletes[0].change, Change::DeleteComment { comment } if *comment == id("orphan"))
-    );
     assert!(
         prepare(
             &read,
@@ -645,71 +594,17 @@ fn incomplete_fetched_reply_ancestry_is_preserved_without_restricting_existing_o
 }
 
 #[test]
-fn deleting_fetched_root_preserves_independent_fetched_replies() {
-    let mut read = review();
-    read.read.comments.push(ReadComment {
-        draft: false,
-        content: CommentContent {
-            id: id("remote-reply"),
-            body: "Keep this reply".into(),
-        },
-        author: None,
-        target: CommentTarget::Reply(id("diff")),
-    });
-    let deletion = batch(vec![delete("diff")]);
-    let projected = project(&read, &deletion).unwrap();
-    assert!(
-        projected
-            .comments
-            .iter()
-            .any(|comment| comment.content().id == id("remote-reply"))
-    );
-    let plan = prepare(&read, &deletion, &[]).unwrap();
-    assert_eq!(plan.operations.len(), 1);
-    assert!(
-        matches!(&plan.operations[0].change,Change::DeleteComment{comment} if *comment==id("diff"))
-    );
-    assert!(
-        prepare(&read, &deletion, &plan.operations)
-            .unwrap()
-            .operations
-            .is_empty()
-    );
-    let invalid = batch(vec![
-        delete("diff"),
-        create("new", CommentTarget::Reply(id("remote-reply"))),
-    ]);
-    assert!(project(&read, &invalid).is_err());
-}
-
-#[test]
-fn internal_revision_namespace_preserves_legacy_receipts_and_separates_rewritten_logs() {
+fn recorded_identity_survives_batch_and_audit_revision_changes() {
     let review = review();
-    let legacy = batch(vec![create("draft", CommentTarget::PullRequest)]);
-    let original = prepare(&review, &legacy, &[]).unwrap().operations[0]
+    let mut events = batch(vec![create("draft", CommentTarget::PullRequest)]);
+    let original = prepare(&review, &events, &[]).unwrap().operations[0]
         .id
         .clone();
-    let mut migrated = legacy.clone();
-    migrated.id = BatchId("canonical-batch".into());
-    migrated.revision = BatchRevision {
-        number: 3,
-        namespace: Some(legacy.id.0.clone()),
-    };
+    events.id = BatchId("other-batch".into());
+    events.revision.number += 1;
     assert_eq!(
-        prepare(&review, &migrated, &[]).unwrap().operations[0].id,
+        prepare(&review, &events, &[]).unwrap().operations[0].id,
         original
-    );
-    migrated.revision = BatchRevision {
-        number: 4,
-        namespace: Some("canonical-batch:revision:4".into()),
-    };
-    let rewritten = prepare(&review, &migrated, &[]).unwrap().operations[0]
-        .id
-        .clone();
-    assert_ne!(rewritten, original);
-    assert_eq!(
-        prepare(&review, &migrated, &[]).unwrap().operations[0].id,
-        rewritten
     );
 }
 
@@ -740,7 +635,7 @@ fn ordered_plan_preserves_surviving_event_order_and_terminal_conclusion() {
         },
         create("reply", CommentTarget::Reply(id("root"))),
     ]);
-    let plan = prepare_ordered(&review, &batch, &[]).unwrap();
+    let plan = prepare(&review, &batch, &[]).unwrap();
     assert!(matches!(
         &plan.operations[0].change,
         Event::SetCommentReaction { present: false, .. }
@@ -759,6 +654,64 @@ fn ordered_plan_preserves_surviving_event_order_and_terminal_conclusion() {
         &plan.operations[4].change,
         Event::SetReviewConclusion { .. }
     ));
-    let remaining = prepare_ordered(&review, &batch, &plan.operations[..2]).unwrap();
+    let remaining = prepare(&review, &batch, &plan.operations[..2]).unwrap();
     assert_eq!(remaining.operations, plan.operations[2..]);
+}
+
+#[test]
+fn indexed_reactions_preserve_fetched_order_and_append_new_entries() {
+    let mut read = review();
+    read.read.reactions = vec![
+        CommentReaction {
+            comment: id("general"),
+            author: Some(UserId("other".into())),
+            reaction: "👍".into(),
+        },
+        CommentReaction {
+            comment: id("diff"),
+            author: Some(read.reviewer.id.clone()),
+            reaction: "👍".into(),
+        },
+        CommentReaction {
+            comment: id("diff"),
+            author: Some(UserId("other".into())),
+            reaction: "👍".into(),
+        },
+    ];
+    let events = batch(vec![reaction("general", true), reaction("diff", false)]);
+    let projected = project(&read, &events).unwrap();
+    assert_eq!(
+        projected.reactions,
+        vec![
+            read.read.reactions[0].clone(),
+            read.read.reactions[2].clone(),
+            CommentReaction {
+                comment: id("general"),
+                author: Some(read.reviewer.id),
+                reaction: "👍".into()
+            },
+        ]
+    );
+}
+
+#[test]
+fn duplicate_event_identity_cannot_consume_unrelated_intent() {
+    let mut events = batch(vec![viewed(true), reaction("general", true)]);
+    events.write.events[1].id = events.write.events[0].id.clone();
+    assert!(
+        matches!(project(&review(), &events), Err(CoreError::Invalid(message)) if message == "missing or duplicate event identity")
+    );
+}
+
+#[test]
+fn recorded_event_identity_is_required_and_fetched_comments_are_immutable() {
+    assert!(
+        serde_json::from_value::<RecordedEvent>(serde_json::json!({
+            "kind": "set_file_viewed", "path": "a", "viewed": true
+        }))
+        .is_err()
+    );
+    for event in [edit("general", "changed"), delete("general")] {
+        assert!(prepare(&review(), &batch(vec![event]), &[]).is_err());
+    }
 }

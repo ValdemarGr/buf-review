@@ -96,17 +96,6 @@ fn apply(store: &mut Store, w: &mut Workspace, action: Action) {
     *w = store.mutate_workspace(&w.id, w.generation, action).unwrap();
 }
 
-// Persist intent written by older versions without reopening removed editing APIs.
-fn legacy_event(store: &mut Store, w: &mut Workspace, event: Event) {
-    *w = store
-        .update_workspace(&w.id, w.generation, |w| {
-            w.batch.write.events.push(event);
-            w.projected()?;
-            Ok(())
-        })
-        .unwrap();
-}
-
 #[test]
 fn same_location_threads_keep_chronology_through_receipts_refresh_and_restart() {
     let project = tempdir().unwrap();
@@ -203,16 +192,19 @@ fn same_location_threads_keep_chronology_through_receipts_refresh_and_restart() 
         .update_workspace(&w.id, w.generation, |w| {
             for (id, target) in &creates {
                 let id = CommentId((*id).into());
-                w.batch.write.events.push(Event::CreateComment {
-                    comment: DraftComment {
-                        content: CommentContent {
-                            id: id.clone(),
-                            body: id.0.clone(),
+                w.batch
+                    .write
+                    .events
+                    .push(RecordedEvent::new(Event::CreateComment {
+                        comment: DraftComment {
+                            content: CommentContent {
+                                id: id.clone(),
+                                body: id.0.clone(),
+                            },
+                            author: user(),
+                            target: target.clone(),
                         },
-                        author: user(),
-                        target: target.clone(),
-                    },
-                });
+                    }));
                 w.destinations.insert(id, Destination::Standalone);
             }
             Ok(())
@@ -371,7 +363,7 @@ fn same_location_threads_keep_chronology_through_receipts_refresh_and_restart() 
 }
 
 #[test]
-fn refresh_keeps_earlier_review_draft_before_later_delivered_unfetched_standalone() {
+fn refresh_preserves_history_but_drops_confirmed_comment_missing_from_complete_snapshot() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let backend = ReviewBackend {
@@ -395,16 +387,19 @@ fn refresh_keeps_earlier_review_draft_before_later_delivered_unfetched_standalon
                 (expected[1], Destination::Standalone),
             ] {
                 let id = CommentId(id.into());
-                w.batch.write.events.push(Event::CreateComment {
-                    comment: DraftComment {
-                        content: CommentContent {
-                            id: id.clone(),
-                            body: id.0.clone(),
+                w.batch
+                    .write
+                    .events
+                    .push(RecordedEvent::new(Event::CreateComment {
+                        comment: DraftComment {
+                            content: CommentContent {
+                                id: id.clone(),
+                                body: id.0.clone(),
+                            },
+                            author: user(),
+                            target: CommentTarget::Diff(location()),
                         },
-                        author: user(),
-                        target: CommentTarget::Diff(location()),
-                    },
-                });
+                    }));
                 w.destinations.insert(id, destination);
             }
             Ok(())
@@ -439,7 +434,7 @@ fn refresh_keeps_earlier_review_draft_before_later_delivered_unfetched_standalon
             .write
             .events
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|event| match &event.event {
                 Event::CreateComment { comment } => Some(comment.content.id.0.clone()),
                 _ => None,
             })
@@ -453,7 +448,7 @@ fn refresh_keeps_earlier_review_draft_before_later_delivered_unfetched_standalon
             .iter()
             .map(|c| c.comment.content().id.0.as_str())
             .collect::<Vec<_>>(),
-        ["remote", expected[0], expected[1]]
+        ["remote", expected[0]]
     );
     assert!(
         matches!(w.pending().unwrap().operations.as_slice(), [op] if matches!(&op.change, Event::CreateComment {comment} if comment.content.id.0==expected[0]))
@@ -546,7 +541,7 @@ fn blank_new_comment_is_noop_and_blank_saved_draft_cancels_without_relocation() 
             .any(|row| row.comment.content().id == comment)
     );
     assert!(
-        matches!(&w.batch.write.events[..],[Event::CreateComment{comment:draft},Event::DeleteComment{comment:deleted}] if draft.content.id==comment && draft.target==CommentTarget::Diff(location()) && *deleted==comment)
+        matches!(&w.batch.write.events.iter().map(|record| record.event.clone()).collect::<Vec<_>>()[..],[Event::CreateComment{comment:draft},Event::DeleteComment{comment:deleted}] if draft.content.id==comment && draft.target==CommentTarget::Diff(location()) && *deleted==comment)
     );
     let deleted = w.clone();
     assert!(
@@ -606,7 +601,6 @@ fn blank_fetched_comment_is_immutable_even_without_a_stale_generation() {
     assert_eq!(store.workspace(&w.id).unwrap().unwrap(), before);
     assert!(store.mutate_workspace(&w.id, w.generation, blank).is_err());
     assert_eq!(store.workspace(&w.id).unwrap().unwrap(), before);
-    assert!(!w.view().unwrap().comments[0].pending_delete);
 }
 
 #[test]
@@ -677,31 +671,6 @@ fn blank_save_reuses_delete_permissions_dependencies_conflicts_and_freezes() {
         })
         .unwrap();
     cases.push((frozen, draft));
-    let mut uncertain = base;
-    uncertain.batch.write.events.push(Event::DeleteComment {
-        comment: remote.clone(),
-    });
-    let operations = uncertain.publication_plan().unwrap().operations;
-    let operation = operations[0].id.clone();
-    uncertain
-        .apply(Action::BeginPublication {
-            destination: Destination::Standalone,
-            operations,
-        })
-        .unwrap();
-    uncertain
-        .apply(Action::SetAttemptProvider {
-            provider: serde_json::json!({"inflight":format!("operation {operation}")}),
-        })
-        .unwrap();
-    uncertain
-        .apply(Action::FinishPublication {
-            success: false,
-            uncertain: true,
-            error: Some("lost response".into()),
-        })
-        .unwrap();
-    cases.push((uncertain, remote));
     for (before, comment) in cases {
         let mut blank = before.clone();
         let mut explicit = before.clone();
@@ -781,7 +750,6 @@ fn nonblank_save_restores_only_unsent_local_deletion_atomically() {
         .iter()
         .find(|row| row.comment.content().id == comment)
         .unwrap();
-    assert!(!row.pending_delete);
     assert_eq!(row.comment.content().body, "restored text");
     assert_eq!(row.destination, Some(Destination::Review));
     assert!(
@@ -840,201 +808,6 @@ fn restore_canceled_local_draft_preserves_original_body_and_destination() {
     assert_eq!(row.comment.content().body, "draft");
     assert_eq!(row.destination, Some(Destination::Review));
     assert_eq!(w.pending().unwrap().operations.len(), 1);
-}
-
-#[test]
-fn restoration_save_cannot_bypass_sent_uncertain_conflicted_or_foreign_deletion() {
-    let mut base = Workspace::new(Review {
-        id: ReviewId("snapshot".into()),
-        reviewer: user(),
-        read: baseline(),
-    });
-    let comment = CommentId("remote".into());
-    base.batch.write.events.push(Event::DeleteComment {
-        comment: comment.clone(),
-    });
-    let mut cases = vec![];
-    for author in [
-        None,
-        Some(User {
-            id: UserId("other".into()),
-            name: "Other".into(),
-        }),
-    ] {
-        let mut foreign = base.clone();
-        foreign.review.read.comments[0].author = author;
-        cases.push(foreign);
-    }
-    let mut conflict = base.clone();
-    let previous = conflict.review.read.comments[0].clone();
-    conflict.conflicts.insert(
-        comment.clone(),
-        Conflict {
-            comment: comment.clone(),
-            previous: previous.clone(),
-            remote: Some(previous),
-            kind: ConflictKind::Changed,
-        },
-    );
-    cases.push(conflict);
-    let operations = base.publication_plan().unwrap().operations;
-    let mut active = base.clone();
-    active
-        .apply(Action::BeginPublication {
-            destination: Destination::Standalone,
-            operations: operations.clone(),
-        })
-        .unwrap();
-    cases.push(active.clone());
-    let mut uncertain = active.clone();
-    uncertain
-        .apply(Action::SetAttemptProvider {
-            provider: serde_json::json!({"inflight":format!("operation {}",operations[0].id)}),
-        })
-        .unwrap();
-    uncertain
-        .apply(Action::FinishPublication {
-            success: false,
-            uncertain: true,
-            error: Some("lost response".into()),
-        })
-        .unwrap();
-    cases.push(uncertain);
-    active
-        .apply(Action::RecordResult {
-            result: OperationResult {
-                operation: operations[0].clone(),
-                mappings: vec![],
-                response: serde_json::Value::Null,
-            },
-        })
-        .unwrap();
-    active
-        .apply(Action::FinishPublication {
-            success: true,
-            uncertain: false,
-            error: None,
-        })
-        .unwrap();
-    cases.push(active.clone());
-    active.completed.clear();
-    cases.push(active);
-    for before in cases {
-        let mut candidate = before.clone();
-        assert!(
-            candidate
-                .apply(Action::Save {
-                    comment: Some(comment.clone()),
-                    target: None,
-                    body: "must not resurrect".into(),
-                    destination: None
-                })
-                .is_err()
-        );
-        assert_eq!(candidate, before);
-    }
-}
-
-#[test]
-fn legacy_restoration_save_cannot_mutate_frozen_review_or_resurrect_fetched_remote_deletion() {
-    let project = tempdir().unwrap();
-    let mut store = Store::open(project.path()).unwrap();
-    let snapshot = create(&mut store, "snapshot", baseline());
-    let mut w = store.open_workspace(&snapshot).unwrap();
-    apply(
-        &mut store,
-        &mut w,
-        save(CommentTarget::Diff(location()), Some(Destination::Review)),
-    );
-    let draft = w.saved_comment.clone().unwrap();
-    legacy_event(
-        &mut store,
-        &mut w,
-        Event::DeleteComment {
-            comment: draft.clone(),
-        },
-    );
-    apply(
-        &mut store,
-        &mut w,
-        Action::Summary {
-            conclusion: ReviewConclusion {
-                outcome: ReviewOutcome::Approve,
-                body: None,
-            },
-        },
-    );
-    let operations = w.publication_plan().unwrap().operations;
-    apply(
-        &mut store,
-        &mut w,
-        Action::BeginPublication {
-            destination: Destination::Review,
-            operations,
-        },
-    );
-    let before = w.clone();
-    assert!(
-        store
-            .mutate_workspace(
-                &w.id,
-                w.generation,
-                Action::Save {
-                    comment: Some(draft),
-                    target: None,
-                    body: "frozen".into(),
-                    destination: None
-                }
-            )
-            .is_err()
-    );
-    assert_eq!(store.workspace(&w.id).unwrap().unwrap(), before);
-    apply(
-        &mut store,
-        &mut w,
-        Action::FinishPublication {
-            success: false,
-            uncertain: false,
-            error: Some("cancelled before writes".into()),
-        },
-    );
-    let comment = CommentId("remote".into());
-    legacy_event(
-        &mut store,
-        &mut w,
-        Event::DeleteComment {
-            comment: comment.clone(),
-        },
-    );
-    let mut absent = baseline();
-    absent.comments.clear();
-    let incoming = create(&mut store, "absent", absent);
-    w = store
-        .refresh_workspace(&w.id, w.generation, &incoming)
-        .unwrap();
-    let before = w.clone();
-    assert!(
-        store
-            .mutate_workspace(
-                &w.id,
-                w.generation,
-                Action::Save {
-                    comment: Some(comment),
-                    target: None,
-                    body: "must stay deleted".into(),
-                    destination: None
-                }
-            )
-            .is_err()
-    );
-    assert_eq!(store.workspace(&w.id).unwrap().unwrap(), before);
-    assert!(
-        w.pending()
-            .unwrap()
-            .operations
-            .iter()
-            .all(|operation| !matches!(operation.change, Event::CreateComment { .. }))
-    );
 }
 
 #[test]
@@ -1160,24 +933,6 @@ fn contextual_undo_resolves_current_state_and_never_revives_canceled_drafts() {
         read: baseline(),
     });
     let remote = CommentId("remote".into());
-    workspace.batch.write.events.push(Event::DeleteComment {
-        comment: remote.clone(),
-    });
-    let deleted = workspace.clone();
-    assert!(
-        workspace
-            .apply(Action::Delete {
-                comment: remote.clone()
-            })
-            .is_err()
-    );
-    assert_eq!(workspace, deleted);
-    workspace
-        .apply(Action::Undo {
-            comments: vec![remote.clone(), remote.clone()],
-        })
-        .unwrap();
-    assert!(workspace.pending().unwrap().operations.is_empty());
     workspace
         .apply(Action::Reaction {
             comment: remote.clone(),
@@ -1258,50 +1013,13 @@ fn contextual_undo_deletes_selected_drafts_child_first_and_preflights_dependenci
         .write
         .events
         .iter()
-        .filter_map(|event| match event {
+        .filter_map(|event| match &event.event {
             Event::DeleteComment { comment } => Some(comment),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(deleted.len(), 2);
     assert_eq!(*deleted[0], before.saved_comment.unwrap());
-}
-
-#[test]
-fn contextual_undo_selection_rolls_back_when_one_restore_is_foreign() {
-    let mut workspace = Workspace::new(Review {
-        id: ReviewId("snapshot".into()),
-        reviewer: user(),
-        read: baseline(),
-    });
-    workspace.batch.write.events.push(Event::DeleteComment {
-        comment: CommentId("remote".into()),
-    });
-    workspace.review.read.comments[0].author = Some(User {
-        id: UserId("other".into()),
-        name: "Other".into(),
-    });
-    workspace
-        .apply(save(CommentTarget::Diff(location()), None))
-        .unwrap();
-    let draft = workspace.saved_comment.clone().unwrap();
-    let before = workspace.clone();
-    assert!(
-        workspace
-            .apply(Action::Undo {
-                comments: vec![draft, CommentId("remote".into())]
-            })
-            .is_err()
-    );
-    assert_eq!(workspace, before);
-    assert!(
-        workspace
-            .apply(Action::Delete {
-                comment: CommentId("remote".into())
-            })
-            .is_err()
-    );
-    assert_eq!(workspace, before);
 }
 
 #[test]
@@ -1375,13 +1093,6 @@ fn grouped_deletions_resolve_prior_queued_undo_and_preflight_the_whole_selection
     assert_eq!(canceled.failure.as_ref().map(|(index, _)| *index), Some(2));
     let rows = canceled.workspace.view().unwrap().comments;
     assert_eq!(rows.len(), 2);
-    assert!(
-        rows.iter()
-            .find(|row| row.comment.content().id.0 == "remote")
-            .unwrap()
-            .pending_delete
-            == false
-    );
     assert_eq!(
         store.workspace_log(&workspace.id).unwrap().last().unwrap()["action"],
         serde_json::json!({"action":"delete_comments","comments":[root]})
@@ -1453,7 +1164,6 @@ fn contextual_undo_preserves_all_members_of_a_frozen_review() {
     assert_eq!(result.workspace, workspace);
     let persisted = store.workspace(&workspace.id).unwrap().unwrap();
     assert_eq!(persisted, result.workspace);
-    assert!(persisted.completed.is_empty());
     assert!(persisted.results.is_empty());
     let canceled = store
         .mutate_workspace_actions(
@@ -1468,44 +1178,6 @@ fn contextual_undo_preserves_all_members_of_a_frozen_review() {
     assert_eq!(canceled.workspace.generation, persisted.generation);
     assert!(canceled.failure.is_some());
     assert_eq!(canceled.workspace, persisted);
-}
-
-#[test]
-fn legacy_delete_restore_supersedes_log_without_erasing_history() {
-    let project = tempdir().unwrap();
-    let mut store = Store::open(project.path()).unwrap();
-    let id = create(&mut store, "snapshot", baseline());
-    let mut w = store.open_workspace(&id).unwrap();
-    legacy_event(
-        &mut store,
-        &mut w,
-        Event::DeleteComment {
-            comment: CommentId("remote".into()),
-        },
-    );
-    let old = w.batch.clone();
-    assert!(w.view().unwrap().comments[0].pending_delete);
-    apply(
-        &mut store,
-        &mut w,
-        Action::Restore {
-            comment: CommentId("remote".into()),
-        },
-    );
-    assert!(w.pending().unwrap().operations.is_empty());
-    assert_eq!(old.id, w.batch.id);
-    assert_ne!(old.revision, w.batch.revision);
-    assert_eq!(
-        store
-            .batch_revision(&old.id, old.revision.number)
-            .unwrap()
-            .unwrap()
-            .write
-            .events
-            .len(),
-        1
-    );
-    assert_eq!(store.workspace_log(&w.id).unwrap().len(), 3);
 }
 
 #[test]
@@ -1585,126 +1257,6 @@ fn file_stats_follow_the_pinned_comparison_across_refresh_and_reopen() {
     assert_eq!(workspace.view().unwrap().files[0].stats, Some(pinned_stats));
     apply(&mut store, &mut workspace, Action::CompareLatest);
     assert_eq!(workspace.view().unwrap().files[0].stats, Some(latest_stats));
-}
-
-#[test]
-fn legacy_refresh_changed_edit_conflicts_and_remote_resolution_preserve_snapshot_history() {
-    let project = tempdir().unwrap();
-    let mut store = Store::open(project.path()).unwrap();
-    let id = create(&mut store, "old", baseline());
-    let mut w = store.open_workspace(&id).unwrap();
-    legacy_event(
-        &mut store,
-        &mut w,
-        Event::EditComment {
-            comment: CommentId("remote".into()),
-            body: "local".into(),
-        },
-    );
-    let mut fresh = baseline();
-    fresh.comments[0].content.body = "remote edit".into();
-    fresh.pull_request.revision.head = "next".into();
-    fresh.files.push(ChangedFile {
-        path: "new.rs".into(),
-        previous_path: None,
-        change: FileChange::Added,
-        stats: None,
-        viewed: false,
-    });
-    let new = create(&mut store, "new", fresh);
-    w = store.refresh_workspace(&w.id, w.generation, &new).unwrap();
-    let view = w.view().unwrap();
-    assert_eq!(view.conflicts.len(), 1);
-    assert!(view.new_commits);
-    assert_eq!(view.files.len(), 1);
-    assert_eq!(view.comparison.head, "head");
-    assert!(w.publication_plan().is_err());
-    apply(
-        &mut store,
-        &mut w,
-        Action::Resolve {
-            comment: CommentId("remote".into()),
-            resolution: Resolution::Remote,
-            body: None,
-        },
-    );
-    assert!(w.pending().unwrap().operations.is_empty());
-    assert_eq!(
-        store.get_review(&id).unwrap().unwrap().read.comments[0]
-            .content
-            .body,
-        "original"
-    );
-    apply(&mut store, &mut w, Action::CompareLatest);
-    assert_eq!(w.view().unwrap().files.len(), 2);
-}
-
-#[test]
-fn legacy_changed_body_deletion_conflicts_and_missing_edit_cannot_recreate_resource() {
-    let project = tempdir().unwrap();
-    let mut store = Store::open(project.path()).unwrap();
-    let id = create(&mut store, "old", baseline());
-    let mut w = store.open_workspace(&id).unwrap();
-    legacy_event(
-        &mut store,
-        &mut w,
-        Event::DeleteComment {
-            comment: CommentId("remote".into()),
-        },
-    );
-    let mut fresh = baseline();
-    fresh.comments[0].content.body = "new work".into();
-    let next = create(&mut store, "next", fresh);
-    w = store.refresh_workspace(&w.id, w.generation, &next).unwrap();
-    assert_eq!(w.conflicts.len(), 1);
-    apply(
-        &mut store,
-        &mut w,
-        Action::Resolve {
-            comment: CommentId("remote".into()),
-            resolution: Resolution::Remote,
-            body: None,
-        },
-    );
-    legacy_event(
-        &mut store,
-        &mut w,
-        Event::EditComment {
-            comment: CommentId("remote".into()),
-            body: "local".into(),
-        },
-    );
-    let mut missing = baseline();
-    missing.comments.clear();
-    let next = create(&mut store, "missing", missing);
-    w = store.refresh_workspace(&w.id, w.generation, &next).unwrap();
-    assert_eq!(
-        w.conflicts[&CommentId("remote".into())].kind,
-        ConflictKind::Deleted
-    );
-    assert!(
-        store
-            .mutate_workspace(
-                &w.id,
-                w.generation,
-                Action::Resolve {
-                    comment: CommentId("remote".into()),
-                    resolution: Resolution::Local,
-                    body: None
-                }
-            )
-            .is_err()
-    );
-    apply(
-        &mut store,
-        &mut w,
-        Action::Resolve {
-            comment: CommentId("remote".into()),
-            resolution: Resolution::Remote,
-            body: None,
-        },
-    );
-    assert!(w.view().unwrap().comments.is_empty());
 }
 
 #[test]
@@ -2037,7 +1589,7 @@ fn confirmed_failure_imports_pending_comments_and_preserves_preparation_receipts
             .operations
             .contains(&prepared_operation)
     );
-    // The resumed runner promotes legacy prepared evidence after the same comment was fetched.
+    // Reconciliation records prepared evidence after the same comment was fetched.
     apply(
         &mut store,
         &mut w,
@@ -2046,7 +1598,6 @@ fn confirmed_failure_imports_pending_comments_and_preserves_preparation_receipts
         },
     );
     assert!(w.has_result(&prepared_operation.id));
-    assert!(!w.completed.contains(&prepared_operation));
     assert!(w.pending().is_ok());
     let before = w.clone();
     assert!(
@@ -2094,7 +1645,7 @@ fn confirmed_failure_imports_pending_comments_and_preserves_preparation_receipts
 }
 
 #[test]
-fn unfetched_confirmed_creation_remains_local_until_remote_contains_it() {
+fn complete_fetch_absorbs_receipt_and_drops_confirmed_comment_missing_remotely() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
     let id = create(&mut store, "old", baseline());
@@ -2137,11 +1688,11 @@ fn unfetched_confirmed_creation_remains_local_until_remote_contains_it() {
     let next = create(&mut store, "fresh", baseline());
     w = store.refresh_workspace(&w.id, w.generation, &next).unwrap();
     assert!(
-        w.view()
+        !w.view()
             .unwrap()
             .comments
             .iter()
-            .any(|c| !c.fetched && c.comment.content().id == local)
+            .any(|c| c.comment.content().id == local)
     );
     assert_eq!(w.view().unwrap().todo.len(), 1);
     assert!(w.pending().unwrap().operations.is_empty());
@@ -2269,29 +1820,6 @@ fn rejected_anchor_blocks_its_review_and_dependents_until_explicit_relocation() 
         },
     );
     assert!(w.publication_plan().is_ok());
-}
-
-#[test]
-fn legacy_pending_delete_retains_its_existing_done_state_until_refresh() {
-    let project = tempdir().unwrap();
-    let mut store = Store::open(project.path()).unwrap();
-    let mut read = baseline();
-    read.reactions.push(CommentReaction {
-        comment: CommentId("remote".into()),
-        author: Some(user().id),
-        reaction: "👍".into(),
-    });
-    let id = create(&mut store, "old", read);
-    let mut w = store.open_workspace(&id).unwrap();
-    legacy_event(
-        &mut store,
-        &mut w,
-        Event::DeleteComment {
-            comment: CommentId("remote".into()),
-        },
-    );
-    assert_eq!(w.view().unwrap().done.len(), 1);
-    assert!(w.view().unwrap().comments[0].pending_delete);
 }
 
 #[test]
@@ -2502,49 +2030,6 @@ fn process_publication_lock_releases_with_its_file_handle() {
 }
 
 #[test]
-fn legacy_remote_body_resolution_preserves_independent_staged_reaction() {
-    let project = tempdir().unwrap();
-    let mut store = Store::open(project.path()).unwrap();
-    let id = create(&mut store, "old", baseline());
-    let mut w = store.open_workspace(&id).unwrap();
-    legacy_event(
-        &mut store,
-        &mut w,
-        Event::EditComment {
-            comment: CommentId("remote".into()),
-            body: "local".into(),
-        },
-    );
-    apply(
-        &mut store,
-        &mut w,
-        Action::Reaction {
-            comment: CommentId("remote".into()),
-            present: true,
-        },
-    );
-    let mut fresh = baseline();
-    fresh.comments[0].content.body = "remote edit".into();
-    let next = create(&mut store, "fresh", fresh);
-    w = store.refresh_workspace(&w.id, w.generation, &next).unwrap();
-    apply(
-        &mut store,
-        &mut w,
-        Action::Resolve {
-            comment: CommentId("remote".into()),
-            resolution: Resolution::Remote,
-            body: None,
-        },
-    );
-    assert_eq!(w.view().unwrap().done.len(), 1);
-    assert_eq!(w.pending().unwrap().operations.len(), 1);
-    assert!(matches!(
-        w.pending().unwrap().operations[0].change,
-        Event::SetCommentReaction { .. }
-    ));
-}
-
-#[test]
 fn uncertain_comment_retains_the_whole_ordered_attempt_and_blocks_later_progress() {
     let project = tempdir().unwrap();
     let mut store = Store::open(project.path()).unwrap();
@@ -2736,54 +2221,6 @@ fn reconciling_old_submitted_progress_preserves_new_wip_summary() {
     );
     assert_eq!(w.wip.as_ref().unwrap().id, fresh_id);
     assert!(w.publication_plan().unwrap().operations.iter().any(|op|matches!(&op.change,Event::SetReviewConclusion{conclusion} if conclusion.body.as_deref()==Some("new summary"))));
-}
-
-#[test]
-fn legacy_deleting_owned_fetched_root_preserves_foreign_fetched_reply_without_reply_capability() {
-    let project = tempdir().unwrap();
-    let mut store = Store::open(project.path()).unwrap();
-    let mut read = baseline();
-    read.comments.push(ReadComment {
-        draft: false,
-        content: CommentContent {
-            id: CommentId("foreign-reply".into()),
-            body: "reply".into(),
-        },
-        author: Some(User {
-            id: UserId("foreign".into()),
-            name: "Other".into(),
-        }),
-        target: CommentTarget::Reply(CommentId("remote".into())),
-    });
-    let id = create(&mut store, "old", read);
-    let mut w = store.open_workspace(&id).unwrap();
-    legacy_event(
-        &mut store,
-        &mut w,
-        Event::DeleteComment {
-            comment: CommentId("remote".into()),
-        },
-    );
-    let view = w.view().unwrap();
-    assert_eq!(view.comments.len(), 2);
-    assert!(
-        view.comments
-            .iter()
-            .any(|c| c.comment.content().id.0 == "foreign-reply" && c.fetched && !c.pending_delete)
-    );
-    assert!(
-        store
-            .mutate_workspace(
-                &w.id,
-                w.generation,
-                save(
-                    CommentTarget::Reply(CommentId("foreign-reply".into())),
-                    None
-                )
-            )
-            .is_err()
-    );
-    assert_eq!(w.publication_plan().unwrap().operations.len(), 1);
 }
 
 #[test]
@@ -3061,7 +2498,6 @@ fn suspended_refresh_keeps_durable_receipts_without_replaying_fetched_creations(
     let next = create(&mut store, "fresh", fresh);
     w = store.refresh_workspace(&w.id, w.generation, &next).unwrap();
     assert!(w.has_result(&created.id));
-    assert!(!w.completed.iter().any(|op| op.id == created.id));
     assert_eq!(w.view().unwrap().todo.len(), 2);
     apply(
         &mut store,
@@ -3171,86 +2607,6 @@ fn publication_receipt_merges_after_unrelated_save_without_overwriting_new_work(
             .last_error
             .is_none()
     );
-}
-
-#[test]
-fn legacy_suspended_deletion_refresh_retains_missing_provider_identity_for_reconciliation() {
-    let project = tempdir().unwrap();
-    let mut store = Store::open(project.path()).unwrap();
-    let backend = ReviewBackend {
-        source: ReviewSource {
-            backend: "github".into(),
-            locator: "https://github.com/a/b/pull/1".into(),
-        },
-        mappings: vec![IdMapping {
-            resource: "review_comment".into(),
-            core_id: "remote".into(),
-            remote_id: "99".into(),
-        }],
-    };
-    let id = ReviewId("old".into());
-    store
-        .import_review(&id, &user(), &baseline(), &backend)
-        .unwrap();
-    let mut w = store.open_workspace(&id).unwrap();
-    legacy_event(
-        &mut store,
-        &mut w,
-        Event::DeleteComment {
-            comment: CommentId("remote".into()),
-        },
-    );
-    let plan = w.publication_plan().unwrap();
-    let deleted = plan.operations[0].clone();
-    apply(
-        &mut store,
-        &mut w,
-        Action::BeginPublication {
-            destination: Destination::Standalone,
-            operations: plan.operations,
-        },
-    );
-    apply(
-        &mut store,
-        &mut w,
-        Action::SetAttemptProvider {
-            provider: serde_json::json!({"inflight":format!("operation {}",deleted.id)}),
-        },
-    );
-    apply(
-        &mut store,
-        &mut w,
-        Action::FinishPublication {
-            success: false,
-            uncertain: true,
-            error: Some("delete response lost".into()),
-        },
-    );
-    let mut missing = baseline();
-    missing.comments.clear();
-    let next = ReviewId("fresh".into());
-    let fresh_backend = ReviewBackend {
-        mappings: vec![],
-        ..backend
-    };
-    store
-        .import_review(&next, &user(), &missing, &fresh_backend)
-        .unwrap();
-    w = store.refresh_workspace(&w.id, w.generation, &next).unwrap();
-    assert!(w.view().unwrap().comments.is_empty());
-    assert_eq!(w.suspended_attempts.len(), 1);
-    assert!(
-        store
-            .review_backend(&w.review.id)
-            .unwrap()
-            .unwrap()
-            .mappings
-            .iter()
-            .any(|mapping| mapping.resource == "review_comment"
-                && mapping.core_id == "remote"
-                && mapping.remote_id == "99")
-    );
-    assert_eq!(store.get_review(&w.review.id).unwrap().unwrap(), w.review);
 }
 
 #[test]
@@ -3502,124 +2858,6 @@ fn uncertain_submitted_review_can_record_conclusion_receipt_after_fetch_without_
     );
     assert_eq!(w.results[0].mappings, vec![receipt_mapping]);
     assert_eq!(store.get_review(&incoming).unwrap().unwrap().read, fetched);
-}
-
-#[test]
-fn legacy_confirmed_deletion_removes_pending_row_and_checklist_before_refetch_and_after_restart() {
-    for origin in ["fetched_todo", "fetched_done", "unfetched_receipt"] {
-        let project = tempdir().unwrap();
-        let mut store = Store::open(project.path()).unwrap();
-        let mut read = baseline();
-        if origin == "fetched_done" {
-            read.reactions.push(CommentReaction {
-                comment: CommentId("remote".into()),
-                author: Some(user().id),
-                reaction: "👍".into(),
-            });
-        }
-        let snapshot = create(&mut store, "snapshot", read);
-        let mut w = store.open_workspace(&snapshot).unwrap();
-        let comment = if origin == "unfetched_receipt" {
-            apply(
-                &mut store,
-                &mut w,
-                save(
-                    CommentTarget::Diff(location()),
-                    Some(Destination::Standalone),
-                ),
-            );
-            let comment = w.saved_comment.clone().unwrap();
-            let operation = w.publication_plan().unwrap().operations.remove(0);
-            store
-                .record_operation_result(
-                    &w.batch.id,
-                    &operation,
-                    &[],
-                    &serde_json::json!({"id":100}),
-                )
-                .unwrap();
-            w = store.workspace(&w.id).unwrap().unwrap();
-            comment
-        } else {
-            CommentId("remote".into())
-        };
-        legacy_event(
-            &mut store,
-            &mut w,
-            Event::DeleteComment {
-                comment: comment.clone(),
-            },
-        );
-        let staged = w.view().unwrap();
-        assert!(
-            staged
-                .comments
-                .iter()
-                .any(|row| row.comment.content().id == comment && row.pending_delete)
-        );
-        assert_eq!(staged.pending.len(), 1);
-        if origin == "fetched_todo" {
-            assert!(staged.todo.contains(&comment));
-        }
-        if origin == "fetched_done" {
-            assert!(staged.done.contains(&comment));
-        }
-        let operation = w.publication_plan().unwrap().operations.remove(0);
-        apply(
-            &mut store,
-            &mut w,
-            Action::BeginPublication {
-                destination: Destination::Standalone,
-                operations: vec![operation.clone()],
-            },
-        );
-        apply(
-            &mut store,
-            &mut w,
-            Action::RecordResult {
-                result: OperationResult {
-                    operation,
-                    mappings: vec![],
-                    response: serde_json::Value::Null,
-                },
-            },
-        );
-        // The confirmed receipt settles the row even before the attempt finishes.
-        let confirmed = w.view().unwrap();
-        assert!(confirmed.pending.is_empty());
-        assert!(
-            !confirmed
-                .comments
-                .iter()
-                .any(|row| row.comment.content().id == comment),
-            "origin={origin}"
-        );
-        assert!(!confirmed.todo.contains(&comment));
-        assert!(!confirmed.done.contains(&comment));
-        apply(
-            &mut store,
-            &mut w,
-            Action::FinishPublication {
-                success: true,
-                uncertain: false,
-                error: None,
-            },
-        );
-        let id = w.id.clone();
-        drop(store);
-        let reopened = Store::open(project.path()).unwrap();
-        let view = reopened.workspace_view(&id).unwrap();
-        assert!(view.pending.is_empty());
-        assert!(
-            !view
-                .comments
-                .iter()
-                .any(|row| row.comment.content().id == comment)
-        );
-        assert!(!view.todo.contains(&comment));
-        assert!(!view.done.contains(&comment));
-        assert_eq!(view.stats.published.deletions, 1);
-    }
 }
 
 #[test]
@@ -4120,7 +3358,11 @@ fn finished_conclusion_preserves_history_and_identical_next_review_gets_a_new_op
     })
     .unwrap();
     assert_eq!(w.batch.write.events, original_events);
-    assert!(w.completed.contains(&sent_conclusion));
+    assert!(
+        w.results
+            .iter()
+            .any(|result| result.operation == sent_conclusion)
+    );
     assert!(w.publication_plan().unwrap().operations.is_empty());
     assert!(w.wip.is_none());
     w.apply(Action::Reaction {
@@ -4231,77 +3473,6 @@ fn refresh_preserves_interleaving_of_surviving_local_operations() {
 }
 
 #[test]
-fn retrying_legacy_attempts_cannot_skip_or_rotate_the_earliest_failure() {
-    let mut w = Workspace::new(Review {
-        id: ReviewId("snapshot".into()),
-        reviewer: user(),
-        read: baseline(),
-    });
-    w.apply(save(CommentTarget::Diff(location()), None))
-        .unwrap();
-    let operations = w.publication_plan().unwrap().operations;
-    w.apply(Action::BeginPublication {
-        destination: Destination::Review,
-        operations,
-    })
-    .unwrap();
-    let earliest = w.attempt.as_ref().unwrap().id.clone();
-    w.apply(Action::FinishPublication {
-        success: false,
-        uncertain: false,
-        error: Some("first error".into()),
-    })
-    .unwrap();
-    w.apply(Action::Viewed {
-        path: "file.rs".into(),
-        viewed: true,
-    })
-    .unwrap();
-    let progress = w
-        .pending()
-        .unwrap()
-        .operations
-        .into_iter()
-        .find(|op| matches!(op.change, Event::SetFileViewed { .. }))
-        .unwrap();
-    // Earlier versions allowed a second independent publication after the first failed.
-    w.suspended_attempts.push(PublicationAttempt {
-        id: "later-legacy-attempt".into(),
-        wip: None,
-        destination: Destination::Standalone,
-        operations: vec![progress],
-        uncertain: false,
-        provider: serde_json::Value::Null,
-    });
-    let before = w.clone();
-    assert!(
-        w.apply(Action::ResumePublication {
-            attempt_id: "later-legacy-attempt".into()
-        })
-        .is_err()
-    );
-    assert_eq!(w, before);
-    w.apply(Action::ResumePublication {
-        attempt_id: earliest.clone(),
-    })
-    .unwrap();
-    assert_eq!(w.attempt.as_ref().unwrap().id, earliest);
-    w.apply(Action::FinishPublication {
-        success: false,
-        uncertain: false,
-        error: Some("still failing".into()),
-    })
-    .unwrap();
-    assert_eq!(
-        w.suspended_attempts
-            .iter()
-            .map(|attempt| attempt.id.as_str())
-            .collect::<Vec<_>>(),
-        [earliest.as_str(), "later-legacy-attempt"]
-    );
-}
-
-#[test]
 fn publish_review_can_edit_or_cancel_unsent_conclusion_without_erasing_history() {
     let mut w = Workspace::new(Review {
         id: ReviewId("snapshot".into()),
@@ -4386,4 +3557,146 @@ fn publish_review_can_edit_or_cancel_unsent_conclusion_without_erasing_history()
     let uncertain = w.clone();
     assert!(w.apply(cancel).is_err());
     assert_eq!(w, uncertain);
+}
+
+#[test]
+fn cancelled_viewed_and_reaction_intent_stays_cancelled_after_remote_changes() {
+    let mut workspace = Workspace::new(Review {
+        id: ReviewId("initial".into()),
+        reviewer: user(),
+        read: baseline(),
+    });
+    for viewed in [true, false] {
+        workspace
+            .apply(Action::Viewed {
+                path: "file.rs".into(),
+                viewed,
+            })
+            .unwrap();
+    }
+    for present in [true, false] {
+        workspace
+            .apply(Action::Reaction {
+                comment: CommentId("remote".into()),
+                present,
+            })
+            .unwrap();
+    }
+    assert!(workspace.pending().unwrap().operations.is_empty());
+    assert!(workspace.batch.write.events[1].cancelled);
+    assert!(workspace.batch.write.events[3].cancelled);
+    let records = workspace.batch.write.events.clone();
+    let mut fresh = baseline();
+    fresh.files[0].viewed = true;
+    fresh.reactions.push(CommentReaction {
+        comment: CommentId("remote".into()),
+        author: Some(user().id),
+        reaction: "👍".into(),
+    });
+    workspace
+        .refresh(Review {
+            id: ReviewId("fresh".into()),
+            reviewer: user(),
+            read: fresh,
+        })
+        .unwrap();
+    assert_eq!(workspace.batch.write.events, records);
+    assert!(workspace.pending().unwrap().operations.is_empty());
+    let projected = workspace.projected().unwrap();
+    assert!(projected.files[0].viewed);
+    assert!(
+        projected
+            .reactions
+            .iter()
+            .any(|item| item.comment.0 == "remote")
+    );
+    workspace
+        .apply(Action::Viewed {
+            path: "file.rs".into(),
+            viewed: false,
+        })
+        .unwrap();
+    assert!(!workspace.batch.write.events.last().unwrap().cancelled);
+    assert_eq!(workspace.pending().unwrap().operations.len(), 1);
+}
+
+#[test]
+fn refresh_does_not_treat_edits_folded_into_a_sent_creation_as_pending_conflicts() {
+    let mut workspace = Workspace::new(Review {
+        id: ReviewId("initial".into()),
+        reviewer: user(),
+        read: baseline(),
+    });
+    workspace
+        .apply(save(CommentTarget::PullRequest, None))
+        .unwrap();
+    let local = workspace.saved_comment.clone().unwrap();
+    workspace
+        .apply(Action::Save {
+            comment: Some(local.clone()),
+            target: None,
+            destination: None,
+            body: "edited before publication".into(),
+        })
+        .unwrap();
+    let operations = workspace.publication_plan().unwrap().operations;
+    assert_eq!(operations.len(), 1);
+    workspace
+        .apply(Action::BeginPublication {
+            destination: Destination::Standalone,
+            operations: operations.clone(),
+        })
+        .unwrap();
+    workspace
+        .apply(Action::RecordResult {
+            result: OperationResult {
+                operation: operations[0].clone(),
+                mappings: vec![],
+                response: serde_json::Value::Null,
+            },
+        })
+        .unwrap();
+    workspace
+        .apply(Action::FinishPublication {
+            success: true,
+            uncertain: false,
+            error: None,
+        })
+        .unwrap();
+    let records = workspace.batch.write.events.clone();
+    let receipts = workspace.results.clone();
+    for (generation, body) in ["edited before publication", "changed remotely"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut read = baseline();
+        read.comments.push(ReadComment {
+            content: CommentContent {
+                id: local.clone(),
+                body: body.into(),
+            },
+            author: Some(user()),
+            target: CommentTarget::PullRequest,
+            draft: false,
+        });
+        workspace
+            .refresh(Review {
+                id: ReviewId(format!("fresh-{generation}")),
+                reviewer: user(),
+                read,
+            })
+            .unwrap();
+        assert!(workspace.conflicts.is_empty());
+        assert!(workspace.pending().unwrap().operations.is_empty());
+        assert_eq!(workspace.batch.write.events, records);
+        assert_eq!(workspace.results, receipts);
+        assert!(
+            workspace
+                .projected()
+                .unwrap()
+                .comments
+                .iter()
+                .any(|comment| comment.content().id == local && comment.content().body == body)
+        );
+    }
 }

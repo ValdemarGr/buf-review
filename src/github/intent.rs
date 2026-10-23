@@ -246,6 +246,8 @@ struct RemoteBranch {
 #[derive(Deserialize)]
 struct IntentPull {
     id: u64,
+    #[serde(default)]
+    node_id: Option<String>,
     number: u64,
     html_url: String,
     state: String,
@@ -357,7 +359,7 @@ fn bind(
         )
         .into());
     }
-    let backend = ReviewBackend {
+    let mut backend = ReviewBackend {
         source: ReviewSource {
             backend: "github".into(),
             locator: pull.html_url,
@@ -375,6 +377,13 @@ fn bind(
             },
         ],
     };
+    if let Some(node) = pull.node_id.filter(|node| !node.is_empty()) {
+        backend.mappings.push(IdMapping {
+            resource: "pull_request_node".into(),
+            core_id: object.id.0.clone(),
+            remote_id: node,
+        });
+    }
     store.bind_pull_request(
         &object.id,
         object.revision,

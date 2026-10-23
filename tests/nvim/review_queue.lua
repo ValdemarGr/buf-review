@@ -39,7 +39,7 @@ local function comment(id, local_draft)
     author = { id = 'me', name = 'me' }, target = { kind = 'diff', target = { path = 'src/file.rs', revision = revision,
       range = { start = { side = 'head', line = 2 }, ['end'] = { side = 'head', line = 2 } } } } } },
     fetched = not local_draft, draft = local_draft, destination = local_draft and 'standalone' or nil,
-    done = false, pending_delete = false, conflict = false, summary = false }
+    done = false, conflict = false, summary = false }
 end
 local pending = comment('pending-imported'); pending.draft = true
 local reply = comment('legacy-reply', true); reply.comment.comment.target = { kind = 'reply', target = 'legacy-root' }
@@ -76,7 +76,7 @@ for _, id in ipairs({ 'published', 'pending-imported' }) do
   wait(function() return #records('action_results.jsonl') == before + 1 end, 'Published operator validation did not complete')
   assert(records('action_results.jsonl')[before + 1].error:find('immutable', 1, true), 'Published delete operator escaped core validation')
   for _, item in ipairs(state().comments) do
-    if item.comment.comment.id == id then assert(not item.pending_delete and item.comment.comment.body == 'Feedback ' .. id, 'Published comment mutated') end
+    if item.comment.comment.id == id then assert(item.comment.comment.body == 'Feedback ' .. id, 'Published comment mutated') end
   end
 end
 

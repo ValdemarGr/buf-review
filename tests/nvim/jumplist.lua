@@ -54,7 +54,7 @@ local function comment(id, path, pair)
   return { comment = { origin = 'read', comment = { id = id, body = 'Feedback ' .. id,
     author = { id = 'alice', name = 'alice' }, target = { kind = 'diff', target = { path = path, revision = pair or revision,
       range = { start = { side = 'head', line = 2 }, ['end'] = { side = 'head', line = 2 } } } } } },
-    fetched = true, done = false, pending_delete = false, conflict = false, summary = false }
+    fetched = true, done = false, conflict = false, summary = false }
 end
 local view = {
   id = 'jumplist', generation = 0, locator = 'https://github.com/acme/repo/pull/1', comparison = revision,

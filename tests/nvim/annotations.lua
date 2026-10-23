@@ -39,7 +39,7 @@ local function comment(id, side, first, last, done)
     comment = { origin = 'read', comment = { id = id, author = { id = 'alice', name = 'alice' }, body = 'Feedback ' .. id,
       target = { kind = 'diff', target = { path = 'src/file.rs', revision = revision,
         range = { start = { side = side, line = first }, ['end'] = { side = side, line = last or first } } } } } },
-    fetched = true, done = done or false, pending_delete = false, conflict = false, summary = false,
+    fetched = true, done = done or false, conflict = false, summary = false,
   }
 end
 local root = comment('root', 'head', 1, 2)

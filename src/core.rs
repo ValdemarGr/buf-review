@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::model::*;
 
@@ -97,12 +96,17 @@ pub enum CoreError {
     Invalid(String),
 }
 
+type ReactionKey = (CommentId, Option<UserId>, String);
+
 struct Projection {
     state: ProjectedState,
     comments: BTreeMap<CommentId, ProjectedComment>,
     // Snapshot order followed by creation events in persisted log sequence.
     comment_order: Vec<CommentId>,
     identities: BTreeSet<CommentId>,
+    file_positions: BTreeMap<String, usize>,
+    reactions: BTreeMap<ReactionKey, Vec<(usize, CommentReaction)>>,
+    next_reaction: usize,
 }
 
 impl Projection {
@@ -128,11 +132,33 @@ impl Projection {
                 .map(|comment| comment.content.id.clone())
                 .collect(),
             comments,
+            file_positions: review
+                .read
+                .files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| (file.path.clone(), index))
+                .collect(),
+            reactions: review.read.reactions.iter().enumerate().fold(
+                BTreeMap::new(),
+                |mut reactions, (index, reaction)| {
+                    reactions
+                        .entry((
+                            reaction.comment.clone(),
+                            reaction.author.clone(),
+                            reaction.reaction.clone(),
+                        ))
+                        .or_insert_with(Vec::new)
+                        .push((index, reaction.clone()));
+                    reactions
+                },
+            ),
+            next_reaction: review.read.reactions.len(),
             state: ProjectedState {
                 pull_request: review.read.pull_request.clone(),
                 files: review.read.files.clone(),
                 comments: Vec::new(),
-                reactions: review.read.reactions.clone(),
+                reactions: Vec::new(),
                 reviews: review.read.reviews.clone(),
                 conclusion: None,
             },
@@ -174,17 +200,14 @@ impl Projection {
                 self.comments
                     .remove(comment)
                     .ok_or_else(|| CoreError::MissingComment(comment.clone()))?;
-                self.state
-                    .reactions
-                    .retain(|reaction| &reaction.comment != comment);
+                self.reactions.retain(|(target, _, _), _| target != comment);
             }
             Change::SetFileViewed { path, viewed, .. } => {
-                self.state
-                    .files
-                    .iter_mut()
-                    .find(|file| &file.path == path)
-                    .ok_or_else(|| CoreError::MissingFile(path.clone()))?
-                    .viewed = *viewed;
+                let index = self
+                    .file_positions
+                    .get(path)
+                    .ok_or_else(|| CoreError::MissingFile(path.clone()))?;
+                self.state.files[*index].viewed = *viewed;
             }
             Change::SetReviewConclusion { conclusion } => {
                 self.state.conclusion = Some(conclusion.clone());
@@ -216,19 +239,41 @@ impl Projection {
                 if reaction.is_empty() {
                     return Err(CoreError::Invalid("empty reaction".into()));
                 }
-                self.state.reactions.retain(|item| {
-                    !(item.comment == *comment
-                        && item.author.as_ref() == Some(reviewer)
-                        && item.reaction == *reaction)
-                });
+                let key = (comment.clone(), Some(reviewer.clone()), reaction.clone());
+                self.reactions.remove(&key);
                 if *present {
-                    self.state.reactions.push(CommentReaction {
-                        comment: comment.clone(),
-                        author: Some(reviewer.clone()),
-                        reaction: reaction.clone(),
-                    });
+                    self.reactions.insert(
+                        key,
+                        vec![(
+                            self.next_reaction,
+                            CommentReaction {
+                                comment: comment.clone(),
+                                author: Some(reviewer.clone()),
+                                reaction: reaction.clone(),
+                            },
+                        )],
+                    );
+                    self.next_reaction += 1;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn apply_confirmed(
+        &mut self,
+        reviewer: &UserId,
+        operations: &[Operation],
+    ) -> Result<(), CoreError> {
+        for operation in operations {
+            // A fetch can already contain a write whose receipt arrived while
+            // the snapshot was being read.
+            if let Event::CreateComment { comment } = &operation.change
+                && self.comments.contains_key(&comment.content.id)
+            {
+                continue;
+            }
+            self.apply(reviewer, &operation.change)?;
         }
         Ok(())
     }
@@ -251,24 +296,6 @@ impl Projection {
         }
     }
 
-    fn depth(&self, comment: &CommentId) -> usize {
-        let mut current = comment;
-        let mut seen = BTreeSet::new();
-        let mut depth = 0;
-        while seen.insert(current) {
-            let Some(parent) = self
-                .comments
-                .get(current)
-                .and_then(ProjectedComment::parent)
-            else {
-                break;
-            };
-            current = parent;
-            depth += 1;
-        }
-        depth
-    }
-
     fn validate(&self) -> Result<(), CoreError> {
         for comment in self.comments.values() {
             if comment.parent().is_some() && matches!(comment, ProjectedComment::Draft(_)) {
@@ -284,6 +311,12 @@ impl Projection {
     }
 
     fn finish(mut self) -> ProjectedState {
+        let mut reactions = self.reactions.into_values().flatten().collect::<Vec<_>>();
+        reactions.sort_by_key(|(index, _)| *index);
+        self.state.reactions = reactions
+            .into_iter()
+            .map(|(_, reaction)| reaction)
+            .collect();
         self.state.comments = self
             .comment_order
             .into_iter()
@@ -312,299 +345,222 @@ fn validate_location(location: &DiffLocation) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn replay(review: &Review, batch: &Batch) -> Result<Projection, CoreError> {
+/// Check ordered events without requiring the final thread structure yet.
+/// Deleting a parent before its replies is a valid staging sequence.
+pub(crate) fn validate_events(
+    review: &Review,
+    batch: &Batch,
+    overlay: &[Operation],
+) -> Result<(), CoreError> {
     if batch.review != review.id {
         return Err(CoreError::ReviewMismatch(batch.id.clone()));
     }
     let mut projection = Projection::new(review)?;
-    for event in &batch.write.events {
-        projection.apply(&review.reviewer.id, event)?;
+    projection.apply_confirmed(&review.reviewer.id, overlay)?;
+    for record in &batch.write.events {
+        if !record.cancelled {
+            projection.apply(&review.reviewer.id, &record.event)?;
+        }
     }
-    Ok(projection)
-}
-
-/// Check ordered events without requiring the final thread structure yet.
-/// Deleting a parent before its replies is a valid staging sequence.
-pub(crate) fn validate_events(review: &Review, batch: &Batch) -> Result<(), CoreError> {
-    replay(review, batch).map(|_| ())
-}
-
-fn desired(review: &Review, batch: &Batch) -> Result<Projection, CoreError> {
-    let projection = replay(review, batch)?;
-    projection.validate()?;
-    Ok(projection)
+    Ok(())
 }
 
 pub fn project(review: &Review, batch: &Batch) -> Result<ProjectedState, CoreError> {
-    desired(review, batch).map(Projection::finish)
-}
-
-/// Compare intended state with successfully delivered writes. A failed or
-/// cancelled operation is absent from `completed`; event history stays intact.
-pub fn prepare(
-    review: &Review,
-    batch: &Batch,
-    completed: &[Operation],
-) -> Result<CommitState, CoreError> {
-    let desired = desired(review, batch)?;
-    let mut delivered = Projection::new(review)?;
-    for operation in completed {
-        delivered.apply(&review.reviewer.id, &operation.change)?;
-    }
-    delivered.validate()?;
-    let mut operations = Vec::new();
-    for (id, comment) in &desired.comments {
-        match delivered.comments.get(id) {
-            None => {
-                let ProjectedComment::Draft(_) = comment else {
-                    return Err(CoreError::Invalid(
-                        "a deleted fetched comment cannot be recreated".into(),
-                    ));
-                };
-            }
-            Some(previous) if previous.content().body != comment.content().body => {
-                operations.push(operation(
-                    batch,
-                    Change::EditComment {
-                        comment: id.clone(),
-                        body: comment.content().body.clone(),
-                    },
-                )?);
-            }
-            _ => {}
-        }
-    }
-    // Valid replay already requires a reply's parent to exist. Keeping creation
-    // event order therefore preserves both chronology and parent-first writes.
-    let mut creates = desired
-        .comment_order
-        .iter()
-        .filter(|id| !delivered.comments.contains_key(*id))
-        .filter_map(|id| match desired.comments.get(id) {
-            Some(ProjectedComment::Draft(comment)) => Some(comment.clone()),
-            _ => None,
-        })
-        .map(|comment| operation(batch, Change::CreateComment { comment }))
-        .collect::<Result<Vec<_>, _>>()?;
-    creates.append(&mut operations);
-    operations = creates;
-    let mut deletes = delivered
-        .comments
-        .keys()
-        .filter(|id| !desired.comments.contains_key(*id))
-        .map(|id| (delivered.depth(id), id.clone()))
-        .collect::<Vec<_>>();
-    deletes.sort_by(|(left_depth, left), (right_depth, right)| {
-        right_depth.cmp(left_depth).then_with(|| left.cmp(right))
-    });
-    for (_, comment) in deletes {
-        operations.push(operation(batch, Change::DeleteComment { comment })?);
-    }
-    for file in &desired.state.files {
-        if delivered
-            .state
-            .files
-            .iter()
-            .find(|previous| previous.path == file.path)
-            .is_some_and(|previous| previous.viewed != file.viewed)
-        {
-            operations.push(operation(
-                batch,
-                Change::SetFileViewed {
-                    path: file.path.clone(),
-                    viewed: file.viewed,
-                    commit: batch
-                        .write
-                        .events
-                        .iter()
-                        .rev()
-                        .find_map(|event| match event {
-                            Event::SetFileViewed { path, commit, .. } if path == &file.path => {
-                                Some(commit.clone())
-                            }
-                            _ => None,
-                        })
-                        .flatten(),
-                },
-            )?);
-        }
-    }
-    let reactions = |projection: &Projection| {
-        projection
-            .state
-            .reactions
-            .iter()
-            .filter(|reaction| {
-                reaction.author.as_ref() == Some(&review.reviewer.id)
-                    && desired.comments.contains_key(&reaction.comment)
-            })
-            .map(|reaction| (reaction.comment.clone(), reaction.reaction.clone()))
-            .collect::<BTreeSet<_>>()
-    };
-    let wanted = reactions(&desired);
-    let sent = reactions(&delivered);
-    for (comment, reaction) in wanted.symmetric_difference(&sent) {
-        operations.push(operation(
-            batch,
-            Change::SetCommentReaction {
-                comment: comment.clone(),
-                reaction: reaction.clone(),
-                present: wanted.contains(&(comment.clone(), reaction.clone())),
-            },
-        )?);
-    }
-    for resource in &desired.state.reviews {
-        if matches!(
-            resource.state,
-            ReadReviewState::Inactive {
-                state: InactiveReviewState::Dismissed,
-                ..
-            }
-        ) && let Some(id) = &resource.id
-        {
-            let previous = delivered
-                .state
-                .reviews
-                .iter()
-                .find(|previous| previous.id.as_ref() == Some(id));
-            if previous.is_some_and(|previous| previous.state != resource.state) {
-                let message = batch
-                    .write
-                    .events
-                    .iter()
-                    .rev()
-                    .find_map(|event| match event {
-                        Event::DismissReview { review, message } if review == id => {
-                            Some(message.clone())
-                        }
-                        _ => None,
-                    })
-                    .flatten();
-                operations.push(operation(
-                    batch,
-                    Change::DismissReview {
-                        review: id.clone(),
-                        message,
-                    },
-                )?);
-            }
-        }
-    }
-    if let Some(conclusion) = desired.state.conclusion {
-        let conclusion = operation(batch, Change::SetReviewConclusion { conclusion })?;
-        if !completed.iter().any(|previous| previous == &conclusion) {
-            operations.push(conclusion);
-        }
-    }
-    Ok(CommitState { operations })
-}
-
-/// Preserve the order of surviving local intent, with review submission last.
-pub fn prepare_ordered(
-    review: &Review,
-    batch: &Batch,
-    completed: &[Operation],
-) -> Result<CommitState, CoreError> {
-    let mut ordered = prepare(review, batch, completed)?
-        .operations
-        .into_iter()
-        .map(|operation| Ok((operation_source(batch, &operation.change)?, operation)))
-        .collect::<Result<Vec<_>, CoreError>>()?;
-    ordered.sort_by_key(|(source, operation)| {
-        (
-            matches!(operation.change, Change::SetReviewConclusion { .. }),
-            *source,
-        )
-    });
-    Ok(CommitState {
-        operations: ordered
-            .into_iter()
-            .map(|(_, operation)| operation)
-            .collect(),
-    })
-}
-
-pub(crate) fn operation_source(batch: &Batch, change: &Change) -> Result<usize, CoreError> {
-    batch
+    let eligible = batch
         .write
         .events
         .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, event)| match (change, event) {
-            (Change::CreateComment { comment }, Event::CreateComment { comment: candidate }) => {
-                comment.content.id == candidate.content.id
-            }
-            (
-                Change::EditComment { comment, .. },
-                Event::EditComment {
-                    comment: candidate, ..
-                },
-            )
-            | (Change::DeleteComment { comment }, Event::DeleteComment { comment: candidate }) => {
-                comment == candidate
-            }
-            (
-                Change::SetFileViewed {
-                    path,
-                    viewed,
-                    commit,
-                },
-                Event::SetFileViewed {
-                    path: candidate,
-                    viewed: candidate_viewed,
-                    commit: candidate_commit,
-                },
-            ) => path == candidate && viewed == candidate_viewed && commit == candidate_commit,
-            (Change::SetReviewConclusion { .. }, Event::SetReviewConclusion { .. }) => true,
-            (
-                Change::DismissReview { review, .. },
-                Event::DismissReview {
-                    review: candidate, ..
-                },
-            ) => review == candidate,
-            (
-                Change::SetCommentReaction {
-                    comment, reaction, ..
-                },
-                Event::SetCommentReaction {
-                    comment: candidate,
-                    reaction: candidate_reaction,
-                    ..
-                },
-            ) => comment == candidate && reaction == candidate_reaction,
-            _ => false,
-        })
-        .map(|(index, _)| index + 1)
-        .ok_or_else(|| CoreError::Invalid("processed write has no source event".into()))
+        .map(|record| record.id.clone())
+        .collect();
+    derive(review, batch, &BTreeSet::new(), &eligible, &[]).map(|(projected, _)| projected)
 }
 
-pub(crate) fn operation(batch: &Batch, change: Change) -> Result<Operation, CoreError> {
-    Ok(operation_at(
-        batch,
-        operation_source(batch, &change)?,
-        change,
-    ))
+/// Derive remaining writes against confirmed effects with the shared planner.
+pub fn prepare(
+    review: &Review,
+    batch: &Batch,
+    receipts: &[Operation],
+) -> Result<CommitState, CoreError> {
+    let acknowledged = receipts
+        .iter()
+        .map(|operation| operation.id.clone())
+        .collect();
+    let eligible = batch
+        .write
+        .events
+        .iter()
+        .map(|record| record.id.clone())
+        .collect();
+    derive(review, batch, &acknowledged, &eligible, receipts).map(|(_, pending)| pending)
 }
 
-pub(crate) fn operation_at(batch: &Batch, source: usize, change: Change) -> Operation {
-    let kind = match &change {
-        Change::CreateComment { .. } => "create_comment",
-        Change::EditComment { .. } => "edit_comment",
-        Change::DeleteComment { .. } => "delete_comment",
-        Change::SetFileViewed { .. } => "set_file_viewed",
-        Change::SetReviewConclusion { .. } => "set_review_conclusion",
-        Change::DismissReview { .. } => "dismiss_review",
-        Change::SetCommentReaction { .. } => "set_comment_reaction",
-    };
-    let name = serde_json::to_vec(&(
-        batch.revision.namespace.as_deref().unwrap_or(&batch.id.0),
-        source,
-        kind,
-    ))
-    .expect("strings and event sequence serialize");
-    Operation {
-        id: Uuid::new_v5(&Uuid::NAMESPACE_URL, &name).to_string(),
-        change,
+/// Derive the effective local intent and its projected state in one pass.
+/// Receipt identities consume the coalesced operation, never its predecessors.
+pub(crate) fn derive(
+    review: &Review,
+    batch: &Batch,
+    acknowledged: &BTreeSet<String>,
+    viewed_eligible: &BTreeSet<String>,
+    overlay: &[Operation],
+) -> Result<(ProjectedState, CommitState), CoreError> {
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum Key {
+        Comment(CommentId),
+        Viewed(String),
+        Reaction(CommentId, String),
+        Conclusion,
+        Dismiss(ReviewResourceId),
     }
+    if batch.review != review.id {
+        return Err(CoreError::ReviewMismatch(batch.id.clone()));
+    }
+    let mut intent = BTreeMap::<Key, (usize, Option<Operation>)>::new();
+    let mut created = BTreeSet::new();
+    let mut event_ids = BTreeSet::new();
+    for (index, record) in batch.write.events.iter().enumerate() {
+        if record.id.is_empty() || !event_ids.insert(&record.id) {
+            return Err(CoreError::Invalid(
+                "missing or duplicate event identity".into(),
+            ));
+        }
+        let source = index + 1;
+        let operation = Operation {
+            id: record.id.clone(),
+            change: record.event.clone(),
+        };
+        let key = match &record.event {
+            Event::CreateComment { comment } => {
+                if !created.insert(comment.content.id.clone()) {
+                    return Err(CoreError::DuplicateComment(comment.content.id.clone()));
+                }
+                Key::Comment(comment.content.id.clone())
+            }
+            Event::EditComment { comment, .. } | Event::DeleteComment { comment } => {
+                Key::Comment(comment.clone())
+            }
+            Event::SetFileViewed { path, .. } => {
+                if !acknowledged.contains(&operation.id) && !viewed_eligible.contains(&record.id) {
+                    continue;
+                }
+                Key::Viewed(path.clone())
+            }
+            Event::SetCommentReaction {
+                comment, reaction, ..
+            } => Key::Reaction(comment.clone(), reaction.clone()),
+            Event::SetReviewConclusion { .. } => Key::Conclusion,
+            Event::DismissReview { review, .. } => Key::Dismiss(review.clone()),
+        };
+        if record.cancelled {
+            if matches!(key, Key::Viewed(_) | Key::Reaction(..) | Key::Conclusion) {
+                intent.insert(key, (source, None));
+            }
+            continue;
+        }
+        match &record.event {
+            Event::EditComment { body, .. } => {
+                if let Some((_, Some(previous))) = intent.get_mut(&key)
+                    && let Event::CreateComment { comment } = &mut previous.change
+                {
+                    comment.content.body = body.clone();
+                    continue;
+                }
+                return Err(CoreError::Invalid(
+                    "only unpublished drafts can be edited".into(),
+                ));
+            }
+            Event::DeleteComment { .. } => {
+                if intent.get(&key).is_some_and(|(_, previous)| {
+                    previous.as_ref().is_some_and(|operation| {
+                        matches!(operation.change, Event::CreateComment { .. })
+                    })
+                }) {
+                    intent.insert(key, (source, None));
+                    continue;
+                }
+                return Err(CoreError::Invalid(
+                    "only unpublished drafts can be deleted".into(),
+                ));
+            }
+            _ => {}
+        }
+        intent.insert(key, (source, Some(operation)));
+    }
+    let deleted = intent
+        .iter()
+        .filter_map(|(key, (_, operation))| match key {
+            Key::Comment(comment) if operation.is_none() => Some(comment.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut operations = intent
+        .into_values()
+        .filter_map(|(source, operation)| operation.map(|operation| (source, operation)))
+        .collect::<Vec<_>>();
+    operations.sort_by_key(|(source, operation)| {
+        (
+            matches!(operation.change, Event::SetReviewConclusion { .. }),
+            *source,
+        )
+    });
+    let mut projection = Projection::new(review)?;
+    projection.apply_confirmed(&review.reviewer.id, overlay)?;
+    let mut pending = Vec::new();
+    for (_, operation) in operations {
+        if acknowledged.contains(&operation.id) {
+            continue;
+        }
+        if let Event::SetCommentReaction { comment, .. } = &operation.change
+            && (deleted.contains(comment) || !projection.comments.contains_key(comment))
+        {
+            continue;
+        }
+        let differs = match &operation.change {
+            Event::CreateComment { comment } => {
+                !projection.comments.contains_key(&comment.content.id)
+            }
+            Event::EditComment { .. } | Event::DeleteComment { .. } => {
+                return Err(CoreError::Invalid("uncoalesced comment operation".into()));
+            }
+            Event::SetFileViewed { path, viewed, .. } => {
+                let index = projection
+                    .file_positions
+                    .get(path)
+                    .ok_or_else(|| CoreError::MissingFile(path.clone()))?;
+                projection.state.files[*index].viewed != *viewed
+            }
+            Event::SetCommentReaction {
+                comment,
+                reaction,
+                present,
+            } => {
+                projection.reactions.contains_key(&(
+                    comment.clone(),
+                    Some(review.reviewer.id.clone()),
+                    reaction.clone(),
+                )) != *present
+            }
+            Event::SetReviewConclusion { .. } => true,
+            Event::DismissReview { review, .. } => projection.state.reviews.iter().any(|item| {
+                item.id.as_ref() == Some(review)
+                    && !matches!(
+                        item.state,
+                        ReadReviewState::Inactive {
+                            state: InactiveReviewState::Dismissed,
+                            ..
+                        }
+                    )
+            }),
+        };
+        if differs {
+            projection.apply(&review.reviewer.id, &operation.change)?;
+            pending.push(operation);
+        }
+    }
+    projection.validate()?;
+    Ok((
+        projection.finish(),
+        CommitState {
+            operations: pending,
+        },
+    ))
 }

@@ -22,7 +22,7 @@ end
 local base_text, head_text = table.concat(base, '\n') .. '\n', table.concat(head, '\n') .. '\n'
 local function head_line(line) return line + (line < 20 and 0 or (line < 110 and 13 or 4)) end
 local function comment(id, side, line, comparison)
-  return { comment = { origin = 'read', comment = { id = id, body = 'Feedback ' .. id, author = { id = 'alice', name = 'alice' }, target = { kind = 'diff', target = { path = 'src/long.rs', revision = comparison or revision, range = { start = { side = side, line = line }, ['end'] = { side = side, line = line } } } } } }, fetched = true, done = false, pending_delete = false, conflict = false, summary = false }
+  return { comment = { origin = 'read', comment = { id = id, body = 'Feedback ' .. id, author = { id = 'alice', name = 'alice' }, target = { kind = 'diff', target = { path = 'src/long.rs', revision = comparison or revision, range = { start = { side = side, line = line }, ['end'] = { side = side, line = line } } } } } }, fetched = true, done = false, conflict = false, summary = false }
 end
 local view = {
   id = 'diff-scroll', generation = 0, locator = 'https://github.com/acme/repo/pull/1', comparison = revision,

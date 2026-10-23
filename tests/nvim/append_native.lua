@@ -26,7 +26,7 @@ local remote = {
       range = { start = { side = 'head', line = 2 }, ['end'] = { side = 'head', line = 2 } },
     } },
   } },
-  fetched = true, done = false, pending_delete = false, conflict = false, summary = false,
+  fetched = true, done = false, conflict = false, summary = false,
 }
 local remote_child = vim.deepcopy(remote)
 remote_child.comment.comment.id, remote_child.comment.comment.body = 'remote-child', 'Remote child'
@@ -162,14 +162,14 @@ api.nvim_win_set_cursor(diff_win, { 2, 0 })
 normal('<CR>'); row('Remote root'); normal('<CR>'); row('Remote root')
 local before_published = #state().comments
 normal('dd:Review edit<CR>')
-assert(kind() == 'thread' and not require('buf_review.editor').get() and not state().comments[1].pending_delete,
+assert(kind() == 'thread' and not require('buf_review.editor').get(),
   'published deletion/edit opened composer or staged deletion')
 assert(#state().comments == before_published and notices[#notices]:find('immutable', 1, true), 'published mutation changed saved state or hid validation')
 row('Remote child'); normal(':Review reply<CR>')
 assert(kind() == 'composer' and require('buf_review.editor').get().target.target == 'remote-root', 'published child selection lost root reply capability')
 normal(':q!<CR>')
 row('Remote root'); normal('aReply without changing published root<Esc>:wq<CR>')
-assert(kind() == 'thread' and not state().comments[1].pending_delete and state().comments[1].comment.comment.body == 'Remote root',
+assert(kind() == 'thread' and state().comments[1].comment.comment.body == 'Remote root',
   'published-root append mutated its parent')
 assert(#matches('Reply without changing published root') == 1, 'immutable parent prevented new reply')
 

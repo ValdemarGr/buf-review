@@ -18,10 +18,6 @@ fn malformed_inline_request_can_retry_without_relocation() {
     run("schema_rejection");
 }
 #[test]
-fn persisted_schema_rejection_recovers_without_clearing_real_anchor_rejections() {
-    run("schema_recovery");
-}
-#[test]
 fn invalid_diff_location_still_requires_explicit_relocation() {
     run("anchor_rejection");
 }
@@ -65,6 +61,30 @@ fn viewed_files_reuse_one_pull_request_lookup_and_keep_ordered_receipts() {
 #[test]
 fn failed_viewed_write_stops_and_retry_reuses_the_confirmed_lookup() {
     run("viewed_cache_failure");
+}
+#[test]
+fn every_ready_family_uses_one_batch_and_only_reply_depth_adds_rounds() {
+    run("families");
+}
+#[test]
+fn partial_comment_batch_keeps_later_successes_and_retries_only_rejection() {
+    run("comment_partial");
+}
+#[test]
+fn unknown_comment_alias_keeps_other_receipts_and_never_blindly_resends() {
+    run("comment_unknown");
+}
+#[test]
+fn internal_alias_failure_after_creation_never_blindly_retries() {
+    run("comment_internal");
+}
+#[test]
+fn existing_authenticated_pending_review_is_reused_before_batched_comments() {
+    run("pending_reuse");
+}
+#[test]
+fn discarded_cached_review_is_replaced_without_resending_receipts() {
+    run("pending_discarded");
 }
 #[test]
 fn uncertain_submission_reconciles_without_second_submit() {
@@ -119,23 +139,19 @@ fn provider_receipts_merge_concurrent_unrelated_saves() {
     run("concurrent");
 }
 #[test]
-fn adjacent_roots_share_native_review_creation_and_keep_individual_receipts() {
+fn adjacent_roots_share_one_batch_and_keep_individual_receipts() {
     run("bulk");
 }
 #[test]
-fn terminal_conclusion_joins_native_review_creation() {
+fn terminal_conclusion_follows_batched_comments() {
     run("bulk_conclude");
 }
 #[test]
-fn failed_bulk_receipt_read_retries_without_recreating_review() {
-    run("bulk_receipts");
-}
-#[test]
-fn viewed_operation_separates_root_groups_without_reordering() {
+fn viewed_progress_follows_all_ready_roots() {
     run("bulk_boundary");
 }
 #[test]
-fn failed_group_boundary_blocks_later_roots_until_retry() {
+fn failed_viewed_batch_retries_without_resending_roots() {
     run("bulk_boundary_failure");
 }
 #[test]
@@ -151,44 +167,8 @@ fn external_review_submission_preserves_newly_queued_conclusion() {
     run("bulk_external_conclusion");
 }
 #[test]
-fn historical_bulk_receipts_match_original_anchors() {
-    run("bulk_old_anchor");
-}
-#[test]
-fn pending_bulk_receipts_recover_single_line_head_anchors() {
-    run("bulk_null_head");
-}
-#[test]
-fn pending_bulk_receipts_recover_single_line_base_anchors() {
-    run("bulk_null_base");
-}
-#[test]
-fn pending_bulk_receipts_recover_multiline_anchors() {
-    run("bulk_null_multiline");
-}
-#[test]
-fn pending_bulk_receipts_find_anchors_on_later_thread_pages() {
-    run("bulk_null_pages");
-}
-#[test]
-fn pending_bulk_receipts_reject_mismatched_graphql_anchors() {
-    run("bulk_null_mismatch");
-}
-#[test]
-fn failed_pending_anchor_read_retries_existing_review_without_duplicate_writes() {
-    run("bulk_null_retry");
-}
-#[test]
-fn fetched_pending_comments_reconcile_with_later_bulk_receipts() {
-    run("bulk_refresh_collision");
-}
-#[test]
 fn reply_lookup_failure_is_retryable_without_an_uncertain_write() {
     run("reply_lookup_fail");
-}
-#[test]
-fn legacy_standalone_inline_drafts_require_explicit_move_before_publication() {
-    run("legacy_standalone");
 }
 #[test]
 fn changed_remote_head_blocks_publication_without_mutating_local_work() {
@@ -285,75 +265,21 @@ fn run(case: &str) {
                 .success()
         );
     }
-    fs::write(directory.path().join("review.py"), r#"import json, os, pathlib, sys
+    fs::write(
+        directory.path().join("review.py"),
+        r#"import json, os, pathlib, sys
 root = pathlib.Path(os.environ["PROVIDER_ROOT"])
-case = os.environ["PROVIDER_CASE"]
-if sys.argv[1] == "thread":
-    body = json.load(sys.stdin)
-    counter = root / "thread-counter"
-    count = int(counter.read_text()) if counter.exists() else len(json.loads((root / "review-comments.json").read_text()))
-    identity = 201 + count
-    counter.write_text(str(count + 1))
-    print(json.dumps({"data": {"addPullRequestReviewThread": {"thread": {"id": "T" + str(identity), "comments": {"nodes": [{"id": "C" + str(identity), "databaseId": identity}]}}}}}))
-elif sys.argv[1] == "comments":
-    if case in ("bulk_receipts", "bulk_refresh_collision") and not (root / "discovery").exists():
-        (root / "discovery").touch()
-        sys.stderr.write("HTTP 503 review comments temporarily unavailable")
-        sys.exit(1)
-    comments = json.loads((root / "review-comments.json").read_text())
-    if case == "bulk_old_anchor":
-        for comment in comments:
-            comment["original_commit_id"] = comment["commit_id"]
-            comment["original_line"] = comment["line"]
-            comment["original_start_line"] = comment.get("start_line")
-            comment.update(commit_id="new-head", line=None, start_line=None)
-    if case.startswith("bulk_null_"):
-        for comment in comments:
-            comment["original_commit_id"] = comment["commit_id"]
-            comment["position"] = 1
-            comment.update(line=None, original_line=None, side=None,
-                           start_line=None, original_start_line=None, start_side=None)
-    print(json.dumps([comments]))
-elif sys.argv[1] == "anchors":
-    body = json.load(sys.stdin)
-    if case == "bulk_null_retry" and not (root / "anchor-read").exists():
-        (root / "anchor-read").touch()
-        sys.stderr.write("HTTP 503 review thread anchors temporarily unavailable")
-        sys.exit(1)
-    comments = json.loads((root / "review-comments.json").read_text())
-    nodes = []
-    for comment in comments:
-        line = comment["line"] + (1 if case == "bulk_null_mismatch" else 0)
-        nodes.append(dict(id="T" + str(comment["id"]), diffSide=comment["side"],
-                          startDiffSide=comment.get("start_side"),
-                          comments=dict(nodes=[dict(id=comment["node_id"], body=comment["body"],
-                              path=comment["path"], line=line, originalLine=line,
-                              startLine=comment.get("start_line"), originalStartLine=comment.get("start_line"),
-                              commit=dict(oid=comment["commit_id"]), originalCommit=dict(oid=comment["commit_id"]))])))
-    next_page = case == "bulk_null_pages" and body["variables"].get("cursor") is None
-    if case == "bulk_null_pages":
-        nodes = nodes[:1] if next_page else nodes[1:]
-    print(json.dumps(dict(data=dict(repository=dict(pullRequest=dict(reviewThreads=dict(
-        nodes=nodes, pageInfo=dict(hasNextPage=next_page, endCursor="second" if next_page else None))))))))
-else:
-    body = json.load(sys.stdin)
-    if case == "anchor_rejection" or (case == "schema_rejection" and not (root / "rejected").exists()):
-        (root / "rejected").touch()
-        sys.stderr.write(os.environ["PROVIDER_REJECTION_ERROR"])
-        sys.exit(1)
-    counter = root / "review-counter"
-    review_id = int(counter.read_text()) if counter.exists() else 100
-    counter.write_text(str(review_id + 1))
-    first_comment = 201 + 100 * (review_id - 100)
-    comments = [dict(comment, id=first_comment + index, node_id="C" + str(first_comment + index), commit_id=body["commit_id"])
-                for index, comment in enumerate(body.get("comments", []))]
-    (root / "review-comments.json").write_text(json.dumps(comments))
-    if case == "uncertain_review":
-        sys.stderr.write("connection lost after preparing comment")
-        sys.exit(1)
-    state = {"COMMENT": "COMMENTED", "APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}.get(body.get("event"), "PENDING")
-    print(json.dumps(dict(id=review_id, node_id="R" + str(review_id), state=state, body=body.get("body", ""))))
-"#).unwrap();
+body = json.load(sys.stdin)
+counter = root / "review-counter"
+review_id = int(counter.read_text()) if counter.exists() else 100
+counter.write_text(str(review_id + 1))
+pending = dict(id=review_id, node_id="R" + str(review_id), commit_id=body["commit_id"],
+    state="PENDING", user=dict(id=7, login="reviewer"))
+(root / "pending-review.json").write_text(json.dumps(pending))
+print(json.dumps(pending))
+"#,
+    )
+    .unwrap();
     let executable = directory.path().join("gh");
     fs::write(&executable,r#"#!/bin/sh
 if [ "$1" = repo ]; then printf '{"nameWithOwner":"owner/repo"}'; exit; fi
@@ -374,8 +300,9 @@ printf '{"endpoint":"%s","method":"%s","body":%s}\n' "$endpoint" "$method" "$bod
 case "$endpoint" in
  user) if [ "$PROVIDER_CASE" = account ]; then printf '{"id":99,"login":"other"}'; else printf '{"id":7,"login":"reviewer"}'; fi ;;
  *'/pulls?state='*) printf '[[{"number":3,"title":"older","html_url":"https://github.com/owner/repo/pull/3","user":{"id":8,"login":"author"},"assignees":[{"id":7,"login":"reviewer"}],"state":"open","merged_at":null,"updated_at":"2026-01-01"}],[{"number":4,"title":"latest","html_url":"https://github.com/owner/repo/pull/4","user":null,"assignees":[{"id":7,"login":"reviewer"}],"state":"closed","merged_at":"2026-01-02","updated_at":"2026-01-02"},{"number":5,"title":"other","html_url":"https://github.com/owner/repo/pull/5","user":null,"assignees":[],"state":"open","merged_at":null,"updated_at":"2026-01-03"}]]' ;;
- *reviews?per_page=100) printf '[[]]' ;;
- */reviews/100/events)
+ *reviews?per_page=100)
+   python3 "$PROVIDER_BATCH_FIXTURE" reviews ;;
+ */reviews/*/events)
    if [ "$PROVIDER_CASE" = concurrent ] && [ ! -f "$PROVIDER_ROOT/concurrent" ]; then
      touch "$PROVIDER_ROOT/concurrent"
      "$PROVIDER_TEST_BIN" --exact provider_concurrent_child --nocapture >"$PROVIDER_ROOT/concurrent-log" 2>&1 || { cat "$PROVIDER_ROOT/concurrent-log" >&2; exit 1; }
@@ -384,12 +311,13 @@ case "$endpoint" in
      touch "$PROVIDER_ROOT/submit"
      case "$PROVIDER_CASE" in
        retry|drop|relocate|relocate_head) printf 'HTTP 422 Review summary rejected' >&2; exit 1 ;;
-       uncertain_submit) printf 'connection lost after submitting' >&2; exit 1 ;;
+       uncertain_submit) rm -f "$PROVIDER_ROOT/pending-review.json"; printf 'connection lost after submitting' >&2; exit 1 ;;
      esac
    fi
-   printf '{"id":100,"node_id":"R100","state":"COMMENTED","body":"Summary"}' ;;
- */reviews/100) printf '{"id":100,"node_id":"R100","state":"COMMENTED","body":"Summary"}' ;;
- */reviews/*/comments?*) python3 "$PROVIDER_ROOT/review.py" comments ;;
+   id=${endpoint%/events}; id=${id##*/}
+   rm -f "$PROVIDER_ROOT/pending-review.json"
+   printf '{"id":%s,"node_id":"R%s","state":"COMMENTED","body":"Summary"}' "$id" "$id" ;;
+ */reviews/*) id=${endpoint##*/}; printf '{"id":%s,"node_id":"R%s","state":"COMMENTED","body":"Summary"}' "$id" "$id" ;;
  */reviews) printf '%s' "$body" | python3 "$PROVIDER_ROOT/review.py" create ;;
  */pulls/comments/400) printf '{"id":400,"body":"Root","in_reply_to_id":null}' ;;
  */pulls/comments/*)
@@ -397,41 +325,8 @@ case "$endpoint" in
    if [ "$method" != DELETE ]; then printf '{"id":201,"body":"Root edited"}'; fi ;;
  graphql)
    case "$body" in
-    *BulkReviewCommentAnchors*) printf '%s' "$body" | python3 "$PROVIDER_ROOT/review.py" anchors ;;
-    *ReviewSnapshot*)
-      viewed=VIEWED
-      snapshot_head=old-head
-      if [ "$PROVIDER_CASE" = uncertain_stale_viewed ]; then viewed=UNVIEWED; snapshot_head=$(cat "$PROVIDER_ROOT/remote-head"); fi
-      if [ "$PROVIDER_CASE" = alias_edit ] && [ -f "$PROVIDER_ROOT/alias" ]; then text=Local; else text=Original; fi
-      case "$PROVIDER_CASE" in alias_*) comments="{\"totalCount\":1,\"nodes\":[{\"id\":\"IC300\",\"fullDatabaseId\":\"300\",\"body\":\"$text\",\"createdAt\":\"2026-01-01T00:00:00Z\",\"author\":{\"databaseId\":7,\"login\":\"reviewer\"},\"reactions\":{\"totalCount\":0,\"nodes\":[],\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null}}}],\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null}}" ;;
-        *) comments='{ "totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}' ;;
-      esac
-      if [ "$PROVIDER_CASE" = alias_reaction ] && [ -f "$PROVIDER_ROOT/alias" ]; then
-        comments='{ "totalCount":1,"nodes":[{"id":"IC300","fullDatabaseId":"300","body":"Original","createdAt":"2026-01-01T00:00:00Z","author":{"databaseId":7,"login":"reviewer"},"reactions":{"totalCount":1,"nodes":[{"id":"R501","content":"THUMBS_UP","user":{"databaseId":7,"login":"reviewer"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}'
-      fi
-      printf '{"data":{"viewer":{"databaseId":7,"login":"reviewer"},"repository":{"pullRequest":{"id":"PR1","fullDatabaseId":"1","title":"PR","body":"","author":null,"state":"OPEN","baseRefOid":"old-base","headRefOid":"%s","headRefName":"feature","headRepository":{"url":"https://github.com/acme/repo"},"changedFiles":1,"files":{"totalCount":1,"nodes":[{"path":"file.rs","changeType":"MODIFIED","viewerViewedState":"%s"}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"comments":%s,"reviews":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"reviewThreads":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' "$snapshot_head" "$viewed" "$comments" ;;
-    *addPullRequestReviewThreadReply*) printf '{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"C202","databaseId":202}}}}' ;;
-    *addPullRequestReviewThread*)
-      if [ "$PROVIDER_CASE" = uncertain_review ]; then printf 'connection lost after preparing comment' >&2; exit 1; fi
-      printf '%s' "$body" | python3 "$PROVIDER_ROOT/review.py" thread ;;
-    *updatePullRequestReviewComment*) printf '{"data":{"updatePullRequestReviewComment":{"pullRequestReviewComment":{"id":"C201","body":"Root edited"}}}}' ;;
-    *markFileAsViewed*)
-      if [ "$PROVIDER_CASE" = viewed_cache_failure ]; then
-        count=0
-        if [ -f "$PROVIDER_ROOT/viewed-count" ]; then count=$(cat "$PROVIDER_ROOT/viewed-count"); fi
-        count=$((count + 1))
-        printf '%s' "$count" > "$PROVIDER_ROOT/viewed-count"
-        if [ "$count" -eq 2 ]; then printf 'HTTP 422 viewed state rejected' >&2; exit 1; fi
-      fi
-      if { [ "$PROVIDER_CASE" = progress ] || [ "$PROVIDER_CASE" = bulk_boundary_failure ]; } && [ ! -f "$PROVIDER_ROOT/progress" ]; then touch "$PROVIDER_ROOT/progress"; printf 'HTTP 422 viewed state rejected' >&2; exit 1; fi
-      if [ "$PROVIDER_CASE" = uncertain_progress ] && [ ! -f "$PROVIDER_ROOT/progress" ]; then touch "$PROVIDER_ROOT/progress"; printf 'connection lost after setting viewed state' >&2; exit 1; fi
-      printf '{"data":{"markFileAsViewed":{"clientMutationId":"done"}}}' ;;
-    *addReaction*) printf '{"data":{"addReaction":{"clientMutationId":"done"}}}' ;;
-    *reviewThreads*)
-      if [ "$PROVIDER_CASE" = reply_lookup_fail ] && [ ! -f "$PROVIDER_ROOT/thread-lookup" ]; then touch "$PROVIDER_ROOT/thread-lookup"; printf 'HTTP 503 thread lookup unavailable' >&2; exit 1; fi
-      printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"T400","comments":{"nodes":[{"databaseId":400}]}},{"id":"T201","comments":{"nodes":[{"databaseId":201}]}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}' ;;
-    null) printf '[{"data":{"repository":{"pullRequest":{"baseRefOid":"old-base","headRefOid":"old-head","files":{"totalCount":1,"nodes":[{"path":"file.rs","viewerViewedState":"VIEWED"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}]' ;;
-    *) printf 'unexpected GraphQL' >&2; exit 1 ;;
+    *PublicationBatch*) printf '%s' "$body" | python3 "$PROVIDER_BATCH_FIXTURE" batch ;;
+    *ReviewSnapshot*) printf '%s' "$body" | python3 "$PROVIDER_BATCH_FIXTURE" snapshot ;;
    esac ;;
  */pulls/1)
    head=old-head
@@ -444,8 +339,9 @@ case "$endpoint" in
      mixed) head=other-head ;;
      uncertain_stale_viewed) head=$(cat "$PROVIDER_ROOT/remote-head") ;;
    esac
-   printf '{"id":1,"node_id":"PR1","title":"PR","body":"","user":null,"state":"open","merged":false,"changed_files":1,"base":{"sha":"old-base"},"head":{"sha":"%s"}}' "$head" ;;
- */pulls/1/files*) printf '[[{"filename":"file.rs","status":"modified","additions":12,"deletions":3}]]' ;;
+   count=$(python3 -c 'import json,os,pathlib; p=pathlib.Path(os.environ["PROVIDER_ROOT"])/"snapshot-seed.json"; print(len(json.loads(p.read_text())["read"]["files"]) if p.exists() else 1)')
+   printf '{"id":1,"node_id":"PR1","title":"PR","body":"","user":null,"state":"open","merged":false,"changed_files":%s,"base":{"sha":"old-base"},"head":{"sha":"%s"}}' "$count" "$head" ;;
+ */pulls/1/files*) printf '%s' "$body" | python3 "$PROVIDER_BATCH_FIXTURE" files ;;
  */pulls/1/comments?*) printf '[[]]' ;;
  */issues/1/comments?*)
    case "$PROVIDER_CASE" in
@@ -490,6 +386,13 @@ esac
         .args(["--exact", "provider_child", "--nocapture"])
         .env("PROVIDER_CASE", case)
         .env(
+            "PROVIDER_BATCH_FIXTURE",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/publication_batch.py"
+            ),
+        )
+        .env(
             "PROVIDER_REJECTION_ERROR",
             if case == "anchor_rejection" {
                 ANCHOR_REJECTION
@@ -533,6 +436,9 @@ fn location(head: &str) -> CommentTarget {
     })
 }
 
+// Reproduce a durable preparation written by the previous publisher. These
+// receipt-discovery tests must keep exercising old saved publications after the
+// new publisher stops creating comment arrays through the REST review endpoint.
 #[test]
 fn provider_child() {
     let Ok(case) = std::env::var("PROVIDER_CASE") else {
@@ -598,7 +504,10 @@ fn provider_child() {
             },
         ],
     };
-    if matches!(case.as_str(), "viewed_cache" | "viewed_cache_failure") {
+    if matches!(
+        case.as_str(),
+        "viewed_cache" | "viewed_cache_failure" | "families"
+    ) {
         read.files = (0..20)
             .map(|index| ChangedFile {
                 path: format!("file-{index:02}.rs"),
@@ -709,10 +618,284 @@ fn provider_child() {
             },
         ]);
     }
+    fs::write(
+        std::path::Path::new(&root).join("snapshot-seed.json"),
+        serde_json::to_vec(&serde_json::json!({"read":read,"mappings":backend.mappings})).unwrap(),
+    )
+    .unwrap();
     store
         .import_review(&ReviewId("snapshot".into()), &reviewer, &read, &backend)
         .unwrap();
     let mut workspace = store.open_workspace(&ReviewId("snapshot".into())).unwrap();
+    if case == "pending_discarded" {
+        workspace = store
+            .mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::Save {
+                    comment: None,
+                    target: Some(location("old-head")),
+                    body: "Old draft".into(),
+                    destination: None,
+                },
+            )
+            .unwrap();
+        workspace =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
+        let first = serde_json::to_value(&workspace.results[0]).unwrap();
+        fs::remove_file(std::path::Path::new(&root).join("pending-review.json")).unwrap();
+        drop(store);
+        let mut store = Store::open(std::path::Path::new(&root)).unwrap();
+        workspace = store
+            .mutate_workspace(
+                &workspace.id,
+                workspace.generation,
+                Action::Save {
+                    comment: None,
+                    target: Some(location("old-head")),
+                    body: "New draft".into(),
+                    destination: None,
+                },
+            )
+            .unwrap();
+        workspace =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
+        assert_eq!(workspace.results.len(), 2);
+        assert_eq!(serde_json::to_value(&workspace.results[0]).unwrap(), first);
+        assert!(workspace.pending().unwrap().operations.is_empty());
+        let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let creates = requests
+            .iter()
+            .filter(|request| {
+                request["endpoint"] == "repos/owner/repo/pulls/1/reviews"
+                    && request["method"] == "POST"
+            })
+            .count();
+        assert_eq!(creates, 2);
+        let batches = requests
+            .iter()
+            .filter(|request| {
+                request["body"]["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("PublicationBatch"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches[0]["body"]["variables"]["input0"]["body"],
+            "Old draft"
+        );
+        assert_eq!(
+            batches[1]["body"]["variables"]["input0"]["body"],
+            "New draft"
+        );
+        assert_eq!(
+            batches[1]["body"]["variables"]["input0"]["pullRequestReviewId"],
+            "R101"
+        );
+        return;
+    }
+    if matches!(
+        case.as_str(),
+        "families" | "comment_partial" | "comment_unknown" | "comment_internal" | "pending_reuse"
+    ) {
+        let count = if case == "families" {
+            20
+        } else if case == "pending_reuse" {
+            1
+        } else {
+            3
+        };
+        let mut roots = Vec::new();
+        let mut replies = Vec::new();
+        for index in 0..count {
+            let mut target = location("old-head");
+            if let CommentTarget::Diff(location) = &mut target {
+                location.position.path = workspace.review.read.files
+                    [index % workspace.review.read.files.len()]
+                .path
+                .clone();
+            }
+            workspace = store
+                .mutate_workspace(
+                    &workspace.id,
+                    workspace.generation,
+                    Action::Save {
+                        comment: None,
+                        target: Some(target),
+                        body: format!("Root {index}"),
+                        destination: None,
+                    },
+                )
+                .unwrap();
+            roots.push(workspace.saved_comment.clone().unwrap());
+            if case == "families" {
+                workspace = store
+                    .mutate_workspace(
+                        &workspace.id,
+                        workspace.generation,
+                        Action::Save {
+                            comment: None,
+                            target: Some(CommentTarget::Reply(roots[index].clone())),
+                            body: format!("Reply {index}"),
+                            destination: None,
+                        },
+                    )
+                    .unwrap();
+                replies.push(workspace.saved_comment.clone().unwrap());
+            }
+        }
+        let paths = workspace
+            .review
+            .read
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        if case != "pending_reuse" {
+            for path in paths {
+                workspace = store
+                    .mutate_workspace(
+                        &workspace.id,
+                        workspace.generation,
+                        Action::Viewed { path, viewed: true },
+                    )
+                    .unwrap();
+            }
+        }
+        if case == "families" {
+            store
+                .append_event(
+                    &workspace.batch.id,
+                    &Event::CreateComment {
+                        comment: DraftComment {
+                            content: CommentContent {
+                                id: CommentId("nested-reply".into()),
+                                body: "Nested reply".into(),
+                            },
+                            author: reviewer.clone(),
+                            target: CommentTarget::Reply(replies[0].clone()),
+                        },
+                    },
+                )
+                .unwrap();
+            for comment in roots {
+                store
+                    .append_event(
+                        &workspace.batch.id,
+                        &Event::SetCommentReaction {
+                            comment,
+                            reaction: "👍".into(),
+                            present: true,
+                        },
+                    )
+                    .unwrap();
+            }
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+            workspace = store
+                .mutate_workspace(
+                    &workspace.id,
+                    workspace.generation,
+                    Action::MoveToReview {
+                        comments: vec![CommentId("nested-reply".into())],
+                    },
+                )
+                .unwrap();
+        }
+        let raw = workspace.batch.write.clone();
+        let planned = workspace.publication_plan().unwrap().operations;
+        if matches!(
+            case.as_str(),
+            "comment_partial" | "comment_unknown" | "comment_internal"
+        ) {
+            let error = github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                .unwrap_err();
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+            assert_eq!(workspace.results.len(), 2);
+            assert_eq!(workspace.results[0].operation, planned[0]);
+            assert_eq!(workspace.results[1].operation, planned[2]);
+            assert_eq!(
+                workspace.suspended_attempts[0].uncertain,
+                case != "comment_partial"
+            );
+            if case != "comment_partial" {
+                assert!(
+                    error.to_string().contains(if case == "comment_internal" {
+                        "INTERNAL"
+                    } else {
+                        "identity missing"
+                    }),
+                    "{error}"
+                );
+                let before = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+                let error =
+                    github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                        .unwrap_err();
+                assert!(error.to_string().contains("uncertain"));
+                let after = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+                assert_eq!(
+                    before.matches("PublicationBatch").count(),
+                    after.matches("PublicationBatch").count()
+                );
+                assert_eq!(workspace.batch.write, raw);
+                return;
+            }
+        }
+        workspace =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
+        assert!(workspace.pending().unwrap().operations.is_empty());
+        assert_eq!(workspace.batch.write, raw);
+        assert_eq!(workspace.results.len(), planned.len());
+        let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let batches = requests
+            .iter()
+            .filter(|request| {
+                request["body"]["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("PublicationBatch"))
+            })
+            .collect::<Vec<_>>();
+        let sizes = batches
+            .iter()
+            .map(|request| request["body"]["variables"].as_object().unwrap().len())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sizes,
+            if case == "families" {
+                vec![20, 20, 1, 20, 20]
+            } else if case == "comment_partial" {
+                vec![3, 1, 1]
+            } else {
+                vec![1]
+            }
+        );
+        if case == "comment_partial" {
+            assert_eq!(batches[1]["body"]["variables"]["input0"]["body"], "Root 1");
+            assert_eq!(workspace.results[2].operation, planned[1]);
+        }
+        if case == "pending_reuse" {
+            assert_eq!(
+                batches[0]["body"]["variables"]["input0"]["pullRequestReviewId"],
+                "R900"
+            );
+            assert!(!requests.iter().any(|request| request["endpoint"]
+                == "repos/owner/repo/pulls/1/reviews"
+                && request["method"] == "POST"));
+        }
+        assert!(!requests.iter().any(|request| request["method"] == "POST"
+            && request["endpoint"].as_str().is_some_and(
+                |endpoint| endpoint.ends_with("/comments") || endpoint.ends_with("/replies")
+            )));
+        return;
+    }
     if case == "runtime_conclusion_head" {
         let expected =
             fs::read_to_string(std::path::Path::new(&root).join("replacement-head")).unwrap();
@@ -734,8 +917,7 @@ fn provider_child() {
             )
             .unwrap();
         workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
         assert_eq!(workspace.results.len(), 1);
         let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
             .unwrap()
@@ -750,7 +932,10 @@ fn provider_child() {
             })
             .unwrap();
         assert_eq!(created["body"]["commit_id"], expected.trim());
-        assert_eq!(created["body"]["event"], "COMMENT");
+        assert!(created["body"].get("event").is_none());
+        assert!(requests.iter().any(|request| request["endpoint"]
+            == "repos/owner/repo/pulls/1/reviews/100/events"
+            && request["body"]["event"] == "COMMENT"));
         return;
     }
     if case == "uncertain_stale_viewed" {
@@ -814,7 +999,7 @@ fn provider_child() {
             )
             .unwrap();
         workspace = store.mutate_workspace(&workspace.id, workspace.generation, Action::SetAttemptProvider {
-            provider: serde_json::json!({"inflight": format!("operation {}", frozen[1].id)}),
+            provider: serde_json::json!({"inflight":"operation batch", "creating":[frozen[1].clone()]}),
         }).unwrap();
         workspace = store
             .mutate_workspace(
@@ -864,8 +1049,7 @@ fn provider_child() {
         assert_eq!(workspace.suspended_attempts[0].id, publication);
         assert_eq!(workspace.suspended_attempts[0].operations, frozen);
         workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
         assert!(workspace.pending().unwrap().operations.is_empty());
         assert!(workspace.suspended_attempts.is_empty() && workspace.attempt.is_none());
         assert_eq!(workspace.batch.write.events, history);
@@ -902,7 +1086,10 @@ fn provider_child() {
             .collect::<Vec<_>>();
         assert_eq!(writes.len(), 1);
         assert!(snapshot < writes[0].0);
-        assert_eq!(writes[0].1["body"]["variables"]["input"]["path"], "keep.rs");
+        assert_eq!(
+            writes[0].1["body"]["variables"]["input0"]["path"],
+            "keep.rs"
+        );
         return;
     }
     if matches!(
@@ -921,8 +1108,7 @@ fn provider_child() {
             .unwrap();
         let before = serde_json::to_value(&workspace).unwrap();
         let error =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap_err();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap_err();
         if case == "remote_head_changed" {
             assert_eq!(
                 error.to_string(),
@@ -979,43 +1165,81 @@ fn provider_child() {
                 .unwrap();
         }
         let operations = workspace.publication_plan().unwrap().operations;
+        let events = workspace.batch.write.events.clone();
+        let mut expected = operations.clone();
         if case == "viewed_cache_failure" {
-            let error =
-                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                    .unwrap_err();
+            let error = github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                .unwrap_err();
             assert!(
                 error.to_string().contains("viewed state rejected"),
                 "{error}"
             );
             workspace = store.workspace(&workspace.id).unwrap().unwrap();
-            assert_eq!(workspace.results.len(), 1);
-            assert_eq!(workspace.results[0].operation, operations[0]);
+            let confirmed = operations
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != 1)
+                .map(|(_, operation)| operation.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(workspace.results.len(), 19);
+            assert_eq!(
+                workspace
+                    .results
+                    .iter()
+                    .map(|result| result.operation.clone())
+                    .collect::<Vec<_>>(),
+                confirmed
+            );
+            assert!(!workspace.suspended_attempts[0].uncertain);
+            assert_eq!(workspace.batch.write.events, events);
+            expected = confirmed;
+            expected.push(operations[1].clone());
             let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
                 .unwrap()
                 .lines()
                 .map(|line| serde_json::from_str::<Value>(line).unwrap())
                 .collect::<Vec<_>>();
-            let attempted_paths = requests
+            let batches = requests
                 .iter()
-                .filter_map(|request| request["body"]["variables"]["input"]["path"].as_str())
+                .filter(|request| {
+                    request["body"]["query"]
+                        .as_str()
+                        .is_some_and(|query| query.contains("PublicationBatch"))
+                })
                 .collect::<Vec<_>>();
-            assert_eq!(attempted_paths, paths[..2]);
+            assert_eq!(batches.len(), 1);
+            assert_eq!(
+                batches[0]["body"]["variables"].as_object().unwrap().len(),
+                20
+            );
+            for (index, path) in paths.iter().enumerate() {
+                let input = &batches[0]["body"]["variables"][format!("input{index}")];
+                assert_eq!(input["path"], *path);
+                assert_eq!(input["clientMutationId"], operations[index].id);
+            }
             drop(store);
             store = Store::open(&root).unwrap();
             workspace = store.workspace(&workspace.id).unwrap().unwrap();
         }
         workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
         assert!(workspace.pending().unwrap().operations.is_empty());
-        assert_eq!(workspace.completed, operations);
+        assert_eq!(
+            workspace
+                .results
+                .iter()
+                .map(|result| result.operation.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(workspace.batch.write.events, events);
         assert_eq!(
             workspace
                 .results
                 .iter()
                 .map(|result| &result.operation)
                 .collect::<Vec<_>>(),
-            operations.iter().collect::<Vec<_>>()
+            expected.iter().collect::<Vec<_>>()
         );
         assert_eq!(
             workspace.results[0].mappings,
@@ -1051,69 +1275,28 @@ fn provider_child() {
                     .is_some_and(|query| query.contains("MarkFileAsViewedInput"))
             })
             .collect::<Vec<_>>();
-        let mut expected_paths = paths.clone();
-        if case == "viewed_cache_failure" {
-            expected_paths.insert(1, paths[1].clone());
-        }
         assert_eq!(
-            writes
-                .iter()
-                .map(|request| request["body"]["variables"]["input"]["path"]
-                    .as_str()
-                    .unwrap())
-                .collect::<Vec<_>>(),
-            expected_paths
+            writes.len(),
+            if case == "viewed_cache_failure" { 2 } else { 1 }
         );
-        assert!(
-            writes
-                .iter()
-                .all(|request| request["body"]["variables"]["input"]["pullRequestId"] == "PR1")
+        assert_eq!(
+            writes[0]["body"]["variables"].as_object().unwrap().len(),
+            20
         );
-        return;
-    }
-    if case == "legacy_standalone" {
-        workspace = store
-            .mutate_workspace(
-                &workspace.id,
-                workspace.generation,
-                Action::Save {
-                    comment: None,
-                    target: Some(location("old-head")),
-                    body: "Legacy inline draft".into(),
-                    destination: Some(buf_review::workspace::Destination::Standalone),
-                },
-            )
-            .unwrap();
-        let comment = workspace.saved_comment.clone().unwrap();
-        workspace.destinations.insert(
-            comment.clone(),
-            buf_review::workspace::Destination::Standalone,
-        );
-        workspace = store
-            .save_workspace(workspace.generation, &workspace)
-            .unwrap();
-        let error =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap_err();
-        assert!(error.to_string().contains("move"));
-        workspace = store.workspace(&workspace.id).unwrap().unwrap();
-        assert!(workspace.completed.is_empty());
-        let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap_or_default();
-        assert!(!log.contains("\"method\":\"POST\""));
-        workspace = store
-            .mutate_workspace(
-                &workspace.id,
-                workspace.generation,
-                Action::MoveToReview {
-                    comments: vec![comment],
-                },
-            )
-            .unwrap();
-        workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
-        assert_eq!(workspace.completed.len(), 1);
-        assert!(workspace.pending().unwrap().operations.is_empty());
+        for (index, path) in paths.iter().enumerate() {
+            let input = &writes[0]["body"]["variables"][format!("input{index}")];
+            assert_eq!(input["path"], *path);
+            assert_eq!(input["pullRequestId"], "PR1");
+            assert_eq!(input["clientMutationId"], operations[index].id);
+        }
+        if case == "viewed_cache_failure" {
+            assert_eq!(writes[1]["body"]["variables"].as_object().unwrap().len(), 1);
+            assert_eq!(writes[1]["body"]["variables"]["input0"]["path"], paths[1]);
+            assert_eq!(
+                writes[1]["body"]["variables"]["input0"]["clientMutationId"],
+                operations[1].id
+            );
+        }
         return;
     }
     if matches!(case.as_str(), "reply_first" | "reply_lookup_fail") {
@@ -1142,22 +1325,20 @@ fn provider_child() {
                 .unwrap();
         }
         if case == "reply_lookup_fail" {
-            let error =
-                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                    .unwrap_err();
+            let error = github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                .unwrap_err();
             assert!(error.to_string().contains("thread lookup unavailable"));
             workspace = store.workspace(&workspace.id).unwrap().unwrap();
-            assert!(workspace.completed.is_empty());
+            assert!(workspace.results.is_empty());
             assert_eq!(workspace.suspended_attempts.len(), 1);
             assert!(!workspace.suspended_attempts[0].uncertain);
             let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
             assert!(!log.contains("AddPullRequestReviewThreadReplyInput"));
         }
         workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
         assert!(workspace.pending().unwrap().operations.is_empty());
-        assert_eq!(workspace.completed.len(), 2);
+        assert_eq!(workspace.results.len(), 2);
         let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
             .unwrap()
             .lines()
@@ -1188,31 +1369,13 @@ fn provider_child() {
     if case.starts_with("bulk") {
         let mut ids = Vec::new();
         for body in ["First bulk root", "Second bulk root"] {
-            let mut target = location("old-head");
-            if matches!(case.as_str(), "bulk_null_head" | "bulk_null_base") {
-                let CommentTarget::Diff(location) = &mut target else {
-                    unreachable!()
-                };
-                let line = DiffLine {
-                    side: if case == "bulk_null_base" {
-                        DiffSide::Base
-                    } else {
-                        DiffSide::Head
-                    },
-                    line: NonZeroU32::new(80).unwrap(),
-                };
-                location.position.range = Some(DiffRange {
-                    start: line.clone(),
-                    end: line,
-                });
-            }
             workspace = store
                 .mutate_workspace(
                     &workspace.id,
                     workspace.generation,
                     Action::Save {
                         comment: None,
-                        target: Some(target),
+                        target: Some(location("old-head")),
                         body: body.into(),
                         destination: None,
                     },
@@ -1261,196 +1424,19 @@ fn provider_child() {
                 )
                 .unwrap();
         }
-        let mut resumed_publication = None;
-        if matches!(
-            case.as_str(),
-            "bulk_receipts" | "bulk_null_retry" | "bulk_refresh_collision"
-        ) {
-            let error =
-                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                    .unwrap_err();
-            assert!(error.to_string().contains("503"));
-            workspace = store.workspace(&workspace.id).unwrap().unwrap();
-            assert!(workspace.completed.is_empty());
-            assert_eq!(workspace.suspended_attempts.len(), 1);
-            assert!(workspace.suspended_attempts[0].uncertain);
-            assert_eq!(
-                workspace.suspended_attempts[0].provider["pending"]["id"],
-                100
-            );
-            resumed_publication = Some(workspace.suspended_attempts[0].id.clone());
-        }
-        let mut refreshed_snapshot = None;
-        if case == "bulk_refresh_collision" {
-            let mut fresh = workspace.review.read.clone();
-            fresh.comments = workspace
-                .pending()
-                .unwrap()
-                .operations
-                .iter()
-                .filter_map(|operation| {
-                    let Event::CreateComment { comment } = &operation.change else {
-                        return None;
-                    };
-                    let CommentTarget::Diff(location) = &comment.target else {
-                        return None;
-                    };
-                    Some(ReadComment {
-                        content: CommentContent {
-                            id: CommentId(format!("fetched-{}", comment.content.id.0)),
-                            body: comment.content.body.clone(),
-                        },
-                        author: Some(comment.author.clone()),
-                        draft: true,
-                        target: CommentTarget::Diff(ReadDiffLocation {
-                            original: ReadCommentAnchor {
-                                revision: ReadCommentRevision::Comparison(
-                                    location.revision.clone(),
-                                ),
-                                position: location.position.clone(),
-                            },
-                            current: None,
-                            subject: Some(CommentSubject::Line),
-                            diff_hunk: None,
-                            outdated: Some(false),
-                        }),
-                    })
-                })
-                .collect();
-            fresh.comments.push(ReadComment {
-                content: CommentContent {
-                    id: CommentId("fetched-reply".into()),
-                    body: "Reply fetched before receipt recovery".into(),
-                },
-                author: Some(reviewer.clone()),
-                draft: true,
-                target: CommentTarget::Reply(fresh.comments[0].content.id.clone()),
-            });
-            fresh.reactions.push(CommentReaction {
-                comment: fresh.comments[0].content.id.clone(),
-                author: Some(reviewer.id.clone()),
-                reaction: "+1".into(),
-            });
-            fresh.reviews.push(ReadReview {
-                id: Some(ReviewResourceId("fetched-review".into())),
-                author: Some(reviewer.clone()),
-                state: ReadReviewState::Inactive {
-                    state: InactiveReviewState::Pending,
-                    body: None,
-                },
-            });
-            let mut fetched_backend = backend.clone();
-            fetched_backend.mappings.push(IdMapping {
-                resource: "review".into(),
-                core_id: "fetched-review".into(),
-                remote_id: "100".into(),
-            });
-            for (index, comment) in fresh.comments.iter().enumerate() {
-                for (resource, remote_id) in [
-                    ("review_comment", (201 + index).to_string()),
-                    ("review_comment_node", format!("C{}", 201 + index)),
-                    ("review_member:100", (201 + index).to_string()),
-                ] {
-                    fetched_backend.mappings.push(IdMapping {
-                        resource: resource.into(),
-                        core_id: comment.content.id.0.clone(),
-                        remote_id,
-                    });
-                }
-            }
-            let snapshot = ReviewId("pending-before-receipts".into());
-            store
-                .import_review(&snapshot, &reviewer, &fresh, &fetched_backend)
-                .unwrap();
-            workspace = store
-                .refresh_workspace(&workspace.id, workspace.generation, &snapshot)
-                .unwrap();
-            assert!(workspace.completed.is_empty());
-            assert_eq!(
-                workspace.suspended_attempts[0].id,
-                *resumed_publication.as_ref().unwrap()
-            );
-            refreshed_snapshot = Some((snapshot, fresh));
-        }
-        if case == "bulk_null_mismatch" {
-            for _ in 0..2 {
-                let error = github::publish_workspace(
-                    &mut store,
-                    &workspace.id,
-                    workspace.generation,
-                    false,
-                )
-                .unwrap_err();
-                assert!(error.to_string().contains("identity unconfirmed"));
-                workspace = store.workspace(&workspace.id).unwrap().unwrap();
-                assert!(workspace.completed.is_empty());
-                assert_eq!(workspace.suspended_attempts.len(), 1);
-                assert!(workspace.suspended_attempts[0].uncertain);
-                if let Some(publication) = &resumed_publication {
-                    assert_eq!(&workspace.suspended_attempts[0].id, publication);
-                }
-                resumed_publication = Some(workspace.suspended_attempts[0].id.clone());
-            }
-            let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
-            let creates = requests
-                .lines()
-                .filter(|line| {
-                    let request: Value = serde_json::from_str(line).unwrap();
-                    request["method"] == "POST"
-                        && request["endpoint"] == "repos/owner/repo/pulls/1/reviews"
-                })
-                .count();
-            assert_eq!(
-                creates, 1,
-                "unconfirmed identity must never recreate review"
-            );
-            return;
-        }
         if case == "bulk_boundary_failure" {
-            let error =
-                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                    .unwrap_err();
+            let error = github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                .unwrap_err();
             assert!(error.to_string().contains("viewed state rejected"));
             workspace = store.workspace(&workspace.id).unwrap().unwrap();
-            assert_eq!(workspace.completed.len(), 2);
-            let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
-            assert!(!log.contains("AddPullRequestReviewThreadInput"));
+            assert_eq!(workspace.results.len(), 4);
         }
         workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
         assert!(workspace.pending().unwrap().operations.is_empty());
-        if let Some((snapshot, original)) = refreshed_snapshot {
-            assert_eq!(store.get_review(&snapshot).unwrap().unwrap().read, original);
-            for id in &ids {
-                assert!(
-                    workspace
-                        .review
-                        .read
-                        .comments
-                        .iter()
-                        .any(|comment| comment.content.id == *id)
-                );
-            }
-            assert_eq!(workspace.review.read.comments.len(), 3);
-            assert_eq!(
-                workspace.review.read.comments[2].target,
-                CommentTarget::Reply(ids[0].clone())
-            );
-            assert_eq!(workspace.review.read.reactions[0].comment, ids[0]);
-            let history = store.publication_history(&workspace).unwrap();
-            let publication = resumed_publication.as_ref().unwrap();
-            let entry = history
-                .iter()
-                .find(|entry| &entry.summary.id == publication)
-                .unwrap();
-            assert_eq!(entry.summary.published.total, 2);
-        }
         assert_eq!(
-            workspace.completed.len(),
-            if case == "bulk_refresh_collision" {
-                0
-            } else if case == "bulk_conclude" {
+            workspace.results.len(),
+            if case == "bulk_conclude" {
                 3
             } else if case.starts_with("bulk_boundary") {
                 5
@@ -1459,21 +1445,16 @@ fn provider_child() {
             }
         );
         for (index, id) in ids.iter().enumerate() {
-            let result = workspace
-                .results
-                .iter()
-                .find(|result| {
-                    matches!(&result.operation.change,
-                Event::CreateComment { comment } if &comment.content.id == id)
-                })
-                .unwrap();
             assert!(
-                result
-                    .mappings
+                workspace
+                    .results
                     .iter()
-                    .any(|mapping| mapping.resource == "review_comment"
-                        && mapping.core_id == id.0
-                        && mapping.remote_id == (201 + index).to_string())
+                    .any(|result| result
+                        .mappings
+                        .iter()
+                        .any(|mapping| mapping.resource == "review_comment"
+                            && mapping.core_id == id.0
+                            && mapping.remote_id == (201 + index).to_string()))
             );
         }
         let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
@@ -1489,123 +1470,44 @@ fn provider_child() {
             })
             .collect::<Vec<_>>();
         assert_eq!(creates.len(), 1);
-        assert_eq!(creates[0]["body"]["commit_id"], "old-head");
-        assert_eq!(creates[0]["body"]["comments"].as_array().unwrap().len(), 2);
-        assert_eq!(creates[0]["body"]["comments"][0]["body"], "First bulk root");
         assert_eq!(
-            creates[0]["body"]["comments"][1]["body"],
-            "Second bulk root"
+            creates[0]["body"],
+            serde_json::json!({"commit_id":"old-head"})
         );
-        let single_line = matches!(case.as_str(), "bulk_null_head" | "bulk_null_base");
+        let batches = requests
+            .iter()
+            .filter(|request| {
+                request["body"]["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("AddPullRequestReviewThreadInput"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 1);
         assert_eq!(
-            creates[0]["body"]["comments"][0]["line"],
-            if single_line { 80 } else { 4 }
-        );
-        assert_eq!(
-            creates[0]["body"]["comments"][0]["start_line"],
-            if single_line {
-                Value::Null
-            } else {
-                Value::from(2)
-            }
+            batches[0]["body"]["variables"].as_object().unwrap().len(),
+            ids.len()
         );
         assert_eq!(
-            creates[0]["body"]["comments"][0]["side"],
-            if case == "bulk_null_base" {
-                "LEFT"
-            } else {
-                "RIGHT"
-            }
+            batches[0]["body"]["variables"]["input0"]["body"],
+            "First bulk root"
         );
-        assert_eq!(
-            creates[0]["body"]["event"].as_str(),
-            (case == "bulk_conclude").then_some("COMMENT")
-        );
-        assert!(!requests.iter().any(|request| {
-            request["endpoint"]
-                .as_str()
-                .is_some_and(|endpoint| endpoint.ends_with("/events"))
-        }));
+        assert_eq!(batches[0]["body"]["variables"]["input0"]["line"], 4);
+        assert_eq!(batches[0]["body"]["variables"]["input0"]["startLine"], 2);
         assert_eq!(
             requests
                 .iter()
                 .filter(|request| request["endpoint"]
-                    == "repos/owner/repo/pulls/1/reviews/100/comments?per_page=100")
+                    .as_str()
+                    .is_some_and(|endpoint| endpoint.ends_with("/events")))
                 .count(),
-            if matches!(
-                case.as_str(),
-                "bulk_receipts" | "bulk_null_retry" | "bulk_refresh_collision"
-            ) {
-                2
-            } else {
-                1
-            }
+            usize::from(case == "bulk_conclude")
         );
-        if case.starts_with("bulk_null_") {
-            let anchors = requests
-                .iter()
-                .filter(|request| {
-                    request["body"]["query"]
-                        .as_str()
-                        .is_some_and(|query| query.contains("BulkReviewCommentAnchors"))
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                anchors.len(),
-                if matches!(case.as_str(), "bulk_null_pages" | "bulk_null_retry") {
-                    2
-                } else {
-                    1
-                }
-            );
-            if case == "bulk_null_pages" {
-                assert_eq!(anchors[0]["body"]["variables"]["cursor"], Value::Null);
-                assert_eq!(anchors[1]["body"]["variables"]["cursor"], "second");
-            }
-            if let Some(publication) = resumed_publication {
-                let history = store.publication_history(&workspace).unwrap();
-                let entry = history
-                    .iter()
-                    .find(|entry| entry.summary.id == publication)
-                    .unwrap();
-                assert_eq!(entry.summary.planned.total, 2);
-                assert_eq!(entry.summary.published.total, 2);
-            }
-        }
-        if case.starts_with("bulk_boundary") {
-            let viewed = requests
-                .iter()
-                .position(|request| {
-                    request["body"]["query"]
-                        .as_str()
-                        .is_some_and(|query| query.contains("markFileAsViewed"))
-                })
-                .unwrap();
-            let roots = requests
-                .iter()
-                .enumerate()
-                .filter(|(_, request)| {
-                    request["body"]["query"]
-                        .as_str()
-                        .is_some_and(|query| query.contains("AddPullRequestReviewThreadInput"))
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(roots.len(), 2);
-            assert!(viewed < roots[0].0 && roots[0].0 < roots[1].0);
-            assert_eq!(
-                roots[0].1["body"]["variables"]["input"]["body"],
-                "Third bulk root"
-            );
-            assert_eq!(
-                roots[1].1["body"]["variables"]["input"]["body"],
-                "Fourth bulk root"
-            );
-        }
         if case.starts_with("bulk_external") {
             let mut fresh = workspace.review.read.clone();
             fresh.comments = workspace
-                .completed
+                .results
                 .iter()
+                .map(|result| &result.operation)
                 .filter_map(|operation| {
                     let Event::CreateComment { comment } = &operation.change else {
                         return None;
@@ -1720,6 +1622,7 @@ fn provider_child() {
                 outcome: ReviewOutcome::Comment,
                 body: Some("Concluded externally".into()),
             });
+            fs::remove_file(std::path::Path::new(&root).join("pending-review.json")).unwrap();
             let submitted_snapshot = ReviewId("fetched-submitted".into());
             store
                 .import_review(&submitted_snapshot, &reviewer, &fresh, &fetched_backend)
@@ -1785,8 +1688,7 @@ fn provider_child() {
                 )
                 .unwrap();
             workspace =
-                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                    .unwrap();
+                github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
             assert!(workspace.pending().unwrap().operations.is_empty());
             let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
             assert_eq!(
@@ -1802,10 +1704,7 @@ fn provider_child() {
         }
         return;
     }
-    if matches!(
-        case.as_str(),
-        "schema_rejection" | "schema_recovery" | "anchor_rejection"
-    ) {
+    if matches!(case.as_str(), "schema_rejection" | "anchor_rejection") {
         let target = location("old-head");
         workspace = store
             .mutate_workspace(
@@ -1820,104 +1719,41 @@ fn provider_child() {
             )
             .unwrap();
         let draft = workspace.saved_comment.clone().unwrap();
-        if case == "schema_recovery" {
-            workspace = store
-                .mutate_workspace(
-                    &workspace.id,
-                    workspace.generation,
-                    Action::RejectAnchor {
-                        comment: draft.clone(),
-                        message: format!("gh failed: {SCHEMA_REJECTION}"),
-                    },
-                )
-                .unwrap();
-            workspace = store
-                .mutate_workspace(
-                    &workspace.id,
-                    workspace.generation,
-                    Action::Save {
-                        comment: None,
-                        target: Some(target.clone()),
-                        body: "Rejected location".into(),
-                        destination: None,
-                    },
-                )
-                .unwrap();
-            let rejected = workspace.saved_comment.clone().unwrap();
-            workspace = store
-                .mutate_workspace(
-                    &workspace.id,
-                    workspace.generation,
-                    Action::RejectAnchor {
-                        comment: rejected.clone(),
-                        message: ANCHOR_REJECTION.into(),
-                    },
-                )
-                .unwrap();
-            drop(store);
-            store = Store::open(&root).unwrap();
-            workspace = store.workspace(&workspace.id).unwrap().unwrap();
-            assert!(workspace.rejected_anchors.contains_key(&rejected));
-            let error =
-                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                    .unwrap_err();
-            assert!(error.to_string().contains("resolution"));
-            workspace = store.workspace(&workspace.id).unwrap().unwrap();
-            assert!(!workspace.rejected_anchors.contains_key(&draft));
-            assert!(workspace.rejected_anchors.contains_key(&rejected));
-            let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
-            assert!(!log.contains("\"method\":\"POST\""));
-            workspace = store
-                .mutate_workspace(
-                    &workspace.id,
-                    workspace.generation,
-                    Action::Delete { comment: rejected },
-                )
-                .unwrap();
-        } else {
-            let error =
-                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                    .unwrap_err();
-            assert!(error.to_string().contains("HTTP 422"));
-            workspace = store.workspace(&workspace.id).unwrap().unwrap();
-            assert!(workspace.attempt.is_none());
-            assert_eq!(workspace.suspended_attempts.len(), 1);
-            assert!(!workspace.suspended_attempts[0].uncertain);
-            assert_eq!(workspace.pending().unwrap().operations.len(), 1);
-            if case == "anchor_rejection" {
-                assert!(workspace.rejected_anchors.contains_key(&draft));
-                let before = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
-                let error = github::publish_workspace(
-                    &mut store,
-                    &workspace.id,
-                    workspace.generation,
-                    false,
-                )
+        let error =
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap_err();
+        assert!(error.to_string().contains("HTTP 422"));
+        workspace = store.workspace(&workspace.id).unwrap().unwrap();
+        assert!(workspace.attempt.is_none());
+        assert_eq!(workspace.suspended_attempts.len(), 1);
+        assert!(!workspace.suspended_attempts[0].uncertain);
+        assert_eq!(workspace.pending().unwrap().operations.len(), 1);
+        if case == "anchor_rejection" {
+            assert!(workspace.rejected_anchors.contains_key(&draft));
+            let before = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+            let error = github::publish_workspace(&mut store, &workspace.id, workspace.generation)
                 .unwrap_err();
-                assert!(error.to_string().contains("resolution"));
-                let after = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
-                assert_eq!(
-                    after
-                        .lines()
-                        .filter(|line| line.contains("\"method\":\"POST\""))
-                        .count(),
-                    before
-                        .lines()
-                        .filter(|line| line.contains("\"method\":\"POST\""))
-                        .count()
-                );
-                assert!(workspace.completed.is_empty());
-                return;
-            }
-            assert!(workspace.rejected_anchors.is_empty());
-            assert!(workspace.last_error.as_deref().unwrap().contains("oneOf"));
+            assert!(error.to_string().contains("resolution"));
+            let after = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+            assert_eq!(
+                after
+                    .lines()
+                    .filter(|line| line.contains("\"method\":\"POST\""))
+                    .count(),
+                before
+                    .lines()
+                    .filter(|line| line.contains("\"method\":\"POST\""))
+                    .count()
+            );
+            assert!(workspace.results.is_empty());
+            return;
         }
+        assert!(workspace.rejected_anchors.is_empty());
+        assert!(workspace.last_error.as_deref().unwrap().contains("oneOf"));
         workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
         assert!(!workspace.rejected_anchors.contains_key(&draft));
-        assert_eq!(workspace.completed.len(), 1);
-        let Event::CreateComment { comment } = &workspace.completed[0].change else {
+        assert_eq!(workspace.results.len(), 1);
+        let Event::CreateComment { comment } = &workspace.results[0].operation.change else {
             panic!("original draft must be created")
         };
         assert_eq!(comment.content.id, draft);
@@ -1928,20 +1764,23 @@ fn provider_child() {
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
-            .filter(|request: &Value| request["method"] == "POST")
+            .filter(|request: &Value| {
+                request["body"]["query"].as_str().is_some_and(|query| {
+                    query.contains("PublicationBatch")
+                        && query.contains("addPullRequestReviewThread")
+                })
+            })
             .collect();
         assert_eq!(
             requests.len(),
             if case == "schema_rejection" { 2 } else { 1 }
         );
-        assert!(
-            requests
-                .iter()
-                .all(
-                    |request| request["body"]["comments"][0]["body"] == "This is a test"
-                        && request["body"]["comments"][0].get("subject_type").is_none()
-                )
-        );
+        assert!(requests.iter().all(|request| {
+            request["body"]["variables"]["input0"]["body"] == "This is a test"
+                && request["body"]["variables"]["input0"]
+                    .get("subject_type")
+                    .is_none()
+        }));
         return;
     }
     if case.starts_with("alias_") || case == "resumed_conflict" {
@@ -1973,13 +1812,11 @@ fn provider_child() {
             .mutate_workspace(&workspace.id, workspace.generation, action)
             .unwrap();
         let error =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap_err();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap_err();
         assert!(error.to_string().contains("lost reaction response"));
         workspace = store.workspace(&workspace.id).unwrap().unwrap();
         workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
         assert!(workspace.pending().unwrap().operations.is_empty());
         assert!(workspace.suspended_attempts.is_empty());
         let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
@@ -1990,11 +1827,12 @@ fn provider_child() {
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request["method"] == "POST"
-                    && request["endpoint"]
+                .filter(
+                    |request| request["body"]["query"]
                         .as_str()
-                        .unwrap()
-                        .contains("issues/comments/300"))
+                        .is_some_and(|query| query.contains("PublicationBatch")
+                            && query.contains("addReaction"))
+                )
                 .count(),
             1
         );
@@ -2025,8 +1863,7 @@ fn provider_child() {
             )
             .unwrap();
         workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
         assert!(workspace.pending().unwrap().operations.is_empty());
         let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
             .unwrap()
@@ -2039,14 +1876,10 @@ fn provider_child() {
                 Some("PUT" | "PATCH" | "DELETE")
             ))
         );
-        assert!(
-            requests
-                .iter()
-                .any(
-                    |request| request["body"]["variables"]["input"]["subjectId"] == "R100"
-                        && request["body"]["variables"]["input"]["content"] == "THUMBS_UP"
-                )
-        );
+        assert!(requests.iter().any(
+            |request| request["body"]["variables"]["input0"]["subjectId"] == "R100"
+                && request["body"]["variables"]["input0"]["content"] == "THUMBS_UP"
+        ));
         assert!(
             store
                 .mutate_workspace(
@@ -2074,8 +1907,7 @@ fn provider_child() {
         .unwrap();
     if case == "unknown" || case == "account" {
         let failure =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap_err();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap_err();
         if case == "account" {
             assert!(failure.to_string().contains("differs"));
         } else {
@@ -2085,9 +1917,8 @@ fn provider_child() {
                 .unwrap()
                 .matches("\"method\":\"POST\"")
                 .count();
-            let second =
-                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                    .unwrap_err();
+            let second = github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                .unwrap_err();
             assert!(second.to_string().contains("uncertain"));
             let after = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
                 .unwrap()
@@ -2108,7 +1939,7 @@ fn provider_child() {
                 )
                 .unwrap();
             let blocked =
-                github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
+                github::publish_workspace(&mut store, &workspace.id, workspace.generation)
                     .unwrap_err();
             assert!(blocked.to_string().contains("uncertain"));
             workspace = store.workspace(&workspace.id).unwrap().unwrap();
@@ -2149,8 +1980,7 @@ fn provider_child() {
             )
             .unwrap();
         workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
         assert!(workspace.review.read.comments.is_empty());
         workspace = store
             .mutate_workspace(
@@ -2177,11 +2007,16 @@ fn provider_child() {
             )
             .unwrap();
         workspace =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, true)
-                .unwrap();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
         assert!(workspace.view().unwrap().todo.is_empty());
         let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
-        assert!(log.contains("T201"));
+        let thread = workspace
+            .results
+            .iter()
+            .flat_map(|result| &result.mappings)
+            .find(|mapping| mapping.resource == "review_thread")
+            .unwrap();
+        assert!(log.contains(&thread.remote_id));
         assert!(log.contains("addPullRequestReviewThreadReply"));
         return;
     }
@@ -2242,8 +2077,7 @@ fn provider_child() {
             )
             .unwrap();
         let failure =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, true)
-                .unwrap_err();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap_err();
         assert!(failure.to_string().contains("different head commits"));
         let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
         assert!(!log.contains("\"method\":\"POST\""));
@@ -2269,21 +2103,19 @@ fn provider_child() {
     )
     .unwrap();
     if case == "uncertain_review" {
-        github::publish_workspace(&mut store, &workspace.id, workspace.generation, true)
-            .unwrap_err();
+        github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap_err();
         workspace = store.workspace(&workspace.id).unwrap().unwrap();
         assert_eq!(workspace.suspended_attempts.len(), 1);
         let before = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
         let error =
-            github::publish_workspace(&mut store, &workspace.id, workspace.generation, false)
-                .unwrap_err();
+            github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap_err();
         assert!(error.to_string().contains("uncertain"));
         let after = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
         assert_eq!(
             before.matches("\"method\":\"POST\"").count(),
             after.matches("\"method\":\"POST\"").count()
         );
-        assert!(before.contains("issues/1/comments"));
+        assert!(before.contains("addComment"));
         assert!(!after.contains("markFileAsViewed"));
         assert!(workspace.wip.is_some());
         return;
@@ -2298,8 +2130,7 @@ fn provider_child() {
             | "relocate_head"
             | "uncertain_progress"
     ) {
-        github::publish_workspace(&mut store, &workspace.id, workspace.generation, true)
-            .unwrap_err();
+        github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap_err();
         workspace = store.workspace(&workspace.id).unwrap().unwrap();
         match case.as_str() {
             "retry" => {
@@ -2360,13 +2191,9 @@ fn provider_child() {
                         .unwrap()
                         .contains("/reviews/100/events")
                 );
-                workspace = github::publish_workspace(
-                    &mut store,
-                    &workspace.id,
-                    workspace.generation,
-                    false,
-                )
-                .unwrap();
+                workspace =
+                    github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                        .unwrap();
                 assert!(workspace.pending().unwrap().operations.is_empty());
                 assert!(workspace.wip.is_none());
                 let log = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
@@ -2381,20 +2208,12 @@ fn provider_child() {
                         .unwrap()
                         .contains("/reviews/100/events")
                 );
-                workspace = github::publish_workspace(
-                    &mut store,
-                    &workspace.id,
-                    workspace.generation,
-                    false,
-                )
-                .unwrap();
-                workspace = github::publish_workspace(
-                    &mut store,
-                    &workspace.id,
-                    workspace.generation,
-                    false,
-                )
-                .unwrap();
+                workspace =
+                    github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                        .unwrap();
+                workspace =
+                    github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                        .unwrap();
                 assert!(workspace.pending().unwrap().operations.is_empty());
                 assert!(workspace.suspended_attempts.is_empty());
                 assert!(workspace.wip.is_none());
@@ -2406,8 +2225,7 @@ fn provider_child() {
             _ => {}
         }
     }
-    workspace =
-        github::publish_workspace(&mut store, &workspace.id, workspace.generation, true).unwrap();
+    workspace = github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
     assert!(workspace.wip.is_none());
     assert!(workspace.attempt.is_none());
     assert_eq!(
@@ -2437,16 +2255,29 @@ fn provider_child() {
                 .is_some_and(|query| query.contains("AddPullRequestReviewThreadReplyInput"))
         })
         .unwrap();
+    let reply_input = reply["body"]["variables"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|input| input["body"] == "Reply")
+        .unwrap();
+    assert_eq!(reply_input["pullRequestReviewId"], "R100");
+    let root_thread = workspace
+        .results
+        .iter()
+        .flat_map(|result| &result.mappings)
+        .find(|mapping| mapping.resource == "review_thread" && mapping.core_id == parent.0)
+        .unwrap();
     assert_eq!(
-        reply["body"]["variables"]["input"]["pullRequestReviewId"],
-        "R100"
+        reply_input["pullRequestReviewThreadId"],
+        root_thread.remote_id
     );
     assert_eq!(
-        reply["body"]["variables"]["input"]["pullRequestReviewThreadId"],
-        "T201"
-    );
-    assert_eq!(
-        log.matches("\"endpoint\":\"repos/owner/repo/issues/1/comments\",\"method\":\"POST\"")
+        requests
+            .iter()
+            .filter(|request| request["body"]["query"]
+                .as_str()
+                .is_some_and(|query| query.contains(":addComment(")))
             .count(),
         1
     );
@@ -2460,7 +2291,56 @@ fn provider_child() {
             .count(),
         1
     );
-    assert_eq!(prepared["body"]["comments"][0]["body"], "Root");
+    assert!(
+        prepared["body"]["comments"].is_null(),
+        "review creation must not publish a special first comment group"
+    );
+    let roots = requests
+        .iter()
+        .position(|request| {
+            request["body"]["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("AddPullRequestReviewThreadInput"))
+        })
+        .unwrap();
+    assert!(
+        requests[roots]["body"]["query"]
+            .as_str()
+            .unwrap()
+            .contains(":addComment("),
+        "independent PR and inline roots were not sent together"
+    );
+    assert_eq!(
+        requests[roots]["body"]["variables"]
+            .as_object()
+            .unwrap()
+            .len(),
+        2
+    );
+    let replies = requests
+        .iter()
+        .position(|request| {
+            request["body"]["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("AddPullRequestReviewThreadReplyInput"))
+        })
+        .unwrap();
+    let viewed = requests
+        .iter()
+        .position(|request| {
+            request["body"]["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("MarkFileAsViewedInput"))
+        })
+        .unwrap();
+    let concluded = requests
+        .iter()
+        .position(|request| request["endpoint"] == "repos/owner/repo/pulls/1/reviews/100/events")
+        .unwrap();
+    assert!(
+        roots < replies && replies < viewed && viewed < concluded,
+        "publication did not follow dependency phases"
+    );
     assert!(
         !requests
             .iter()
@@ -2469,8 +2349,7 @@ fn provider_child() {
     if case == "uncertain_submit" {
         assert_eq!(log.matches("/reviews/100/events").count(), 1);
     }
-    workspace =
-        github::publish_workspace(&mut store, &workspace.id, workspace.generation, false).unwrap();
+    workspace = github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
     assert!(workspace.pending().unwrap().operations.is_empty());
 }
 

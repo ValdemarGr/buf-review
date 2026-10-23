@@ -38,7 +38,7 @@ local function comment(id)
   return { comment = { origin = 'read', comment = { id = id, author = { id = 'alice', name = 'alice' }, body = 'Feedback ' .. id,
     target = { kind = 'diff', target = { path = 'src/' .. id .. '.rs', revision = revision,
       range = { start = { side = 'head', line = 1 }, ['end'] = { side = 'head', line = 1 } } } } } },
-    fetched = true, done = false, pending_delete = false, conflict = false, summary = false }
+    fetched = true, done = false, conflict = false, summary = false }
 end
 local wide = comment('wide')
 wide.comment.comment.target = { kind = 'pull_request' }

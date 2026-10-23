@@ -51,7 +51,7 @@ local revision = { base = string.rep('a', 40), head = string.rep('b', 40) }
 local function comment(id, line, done)
   return {
     comment = { origin = 'read', comment = { id = id, body = 'Feedback ' .. id, author = { id = 'alice', name = 'alice' }, target = { kind = 'diff', target = { path = 'src/c.rs', revision = revision, range = { start = { side = 'head', line = line }, ['end'] = { side = 'head', line = line } } } } } },
-    fetched = true, done = done or false, pending_delete = false, conflict = false, summary = false,
+    fetched = true, done = done or false, conflict = false, summary = false,
   }
 end
 local initial = {

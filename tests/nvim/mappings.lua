@@ -59,7 +59,7 @@ local function comment(id, path, done)
   return { comment = { origin = 'read', comment = { id = id, body = 'Feedback ' .. id,
     author = { id = 'alice', name = 'alice' }, target = { kind = 'diff', target = { path = path, revision = revision,
       range = { start = { side = 'head', line = 2 }, ['end'] = { side = 'head', line = 2 } } } } } },
-    fetched = true, done = done or false, pending_delete = false, conflict = false, summary = false }
+    fetched = true, done = done or false, conflict = false, summary = false }
 end
 local initial = {
   id = 'mappings', generation = 0, locator = 'https://github.com/acme/repo/pull/1', comparison = revision,

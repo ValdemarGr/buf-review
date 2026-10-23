@@ -195,19 +195,6 @@ row('Remote reply arrived while composing')
 append('Reply from another comment row', conversation, window)
 assert(draft('Reply from another comment row').comment.comment.target.target == first.comment.comment.id, 'append replied to selected child instead of conversation root')
 
--- Pending deletion keeps conversation append read-only.
-changed = state()
-changed.generation = changed.generation + 1
-changed.comments[1].pending_delete = true
-refreshed(changed)
-before = #requests('save')
-input('a')
-assert(kind() == 'thread' and #requests('save') == before and notices[#notices]:find('pending deletion', 1, true), 'append allowed reply to deleted parent')
-changed = state()
-changed.generation = changed.generation + 1
-changed.comments[1].pending_delete = false
-refreshed(changed)
-
 -- A fetched other-author root uses the same append reply workflow.
 changed = state()
 changed.generation = changed.generation + 1

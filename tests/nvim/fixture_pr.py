@@ -119,18 +119,14 @@ def mutate(request):
             row = row_for(identity)
             if row not in view["comments"]:
                 continue
-            if op == "delete_comments" or row.get("pending_delete") or row.get("destination"):
+            if op == "delete_comments" or row.get("destination"):
                 if comment(row)["author"]["id"] != view["review"]["reviewer"]["id"]:
                     return {"workspace": view, "error": "editing and deletion require verified ownership"}
                 if row.get("summary"):
                     return {"workspace": view, "error": "Review summaries cannot be deleted"}
             if op == "delete_comments" and not (row["comment"]["origin"] == "draft" and row.get("destination")):
                 return {"workspace": view, "error": "published comments are immutable"}
-            if op == "delete_comments" and row.get("pending_delete"):
-                continue
-            if op == "undo" and row.get("pending_delete"):
-                operations[identity] = {"op": "restore", "comment": identity}
-            elif op == "delete_comments" or row.get("destination"):
+            if op == "delete_comments" or row.get("destination"):
                 children = [comment(child)["id"] for child in view["comments"] if child.get("destination") and comment(child)["target"] == {"kind": "reply", "target": identity}]
                 if any(child not in selected for child in children):
                     return {"workspace": view, "error": "Remove unpublished replies before deleting their parent"}
@@ -193,13 +189,11 @@ def mutate(request):
     elif op == "save":
         if request.get("comment"):
             row = row_for(request["comment"])
-            if not request["body"].strip():
+            if row["fetched"] or not row.get("destination"):
+                response["error"] = "published comments are immutable"
+            elif not request["body"].strip():
                 if any(comment(child)["target"] == {"kind": "reply", "target": request["comment"]} and not child["fetched"] for child in view["comments"]):
                     response["error"] = "Remove local replies before deleting their parent"
-                elif row["fetched"] or not row.get("destination"):
-                    row["pending_delete"] = True
-                    if not any(item["change"] == {"kind": "delete_comment", "comment": request["comment"]} for item in view["pending"]):
-                        view["pending"].append({"id": "delete-" + request["comment"], "change": {"kind": "delete_comment", "comment": request["comment"]}})
                 else:
                     view["comments"].remove(row)
                     view.setdefault("deleted_comments", []).append(row)
@@ -207,13 +201,10 @@ def mutate(request):
                 if row not in view["comments"]:
                     view["deleted_comments"].remove(row)
                     view["comments"].append(row)
-                row["pending_delete"] = False
                 view["pending"] = [item for item in view["pending"] if item["change"] != {"kind": "delete_comment", "comment": request["comment"]}]
                 comment(row)["body"] = request["body"]
                 if request.get("target"):
                     comment(row)["target"] = request["target"]
-                if row["comment"]["origin"] == "draft" and not row.get("destination"):
-                    view["pending"].append({"id": "receipt-edit", "change": {"kind": "edit_comment", "comment": request["comment"], "body": request["body"]}})
             response["comment"] = request["comment"] if response.get("error") or request["body"].strip() else None
         elif request["body"].strip():
             identity = "draft-" + str(view["generation"])
@@ -223,15 +214,13 @@ def mutate(request):
                 destination = row_for(target["target"]).get("destination", "review")
             if destination == "review" and not view.get("wip"):
                 view["wip"] = {"id": "wip-1", "active": False, "conclusion": None}
-            row = {"comment": {"origin": "draft", "comment": {"id": identity, "body": request["body"], "author": view["review"]["reviewer"], "target": target}}, "fetched": False, "draft": True, "done": False, "destination": destination, "pending_delete": False, "conflict": False, "summary": False}
+            row = {"comment": {"origin": "draft", "comment": {"id": identity, "body": request["body"], "author": view["review"]["reviewer"], "target": target}}, "fetched": False, "draft": True, "done": False, "destination": destination, "conflict": False, "summary": False}
             view["comments"].append(row)
             response["comment"] = identity
     elif op == "reaction":
         row = row_for(request["comment"])
         if not row["fetched"] or row.get("draft"):
             response["error"] = "progress is available only for fetched comments"
-        elif row.get("pending_delete"):
-            response["error"] = "comment does not exist in the current projection"
         elif (directory / "fail_reaction").exists() or ((directory / "fail_reaction_id").exists() and (directory / "fail_reaction_id").read_text().strip() == request["comment"]):
             response["error"] = "Fixture reaction conflict"
         else:
@@ -287,12 +276,17 @@ def mutate(request):
         elif any(comment(child)["target"] == {"kind": "reply", "target": request["comment"]} and child.get("destination") for child in view["comments"]):
             response["error"] = "Remove local replies before deleting their parent"
         elif row["fetched"] or not row.get("destination"):
-            row["pending_delete"] = True
+            response["error"] = "published comments are immutable"
         else:
             view["comments"].remove(row)
             view.setdefault("deleted_comments", []).append(row)
     elif op == "restore":
-        row_for(request["comment"])["pending_delete"] = False
+        row = row_for(request["comment"])
+        if not row.get("destination"):
+            response["error"] = "published comments are immutable"
+        elif row not in view["comments"]:
+            view["deleted_comments"].remove(row)
+            view["comments"].append(row)
     elif op == "resolve":
         row = row_for(request["comment"])
         conflict = next(item for item in view["conflicts"] if item["comment"] == request["comment"])
