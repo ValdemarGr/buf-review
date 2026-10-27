@@ -55,7 +55,7 @@ end
 
 local function show_buffer(win, buf)
   api.nvim_win_call(win, function()
-    api.nvim_cmd({ cmd = 'buffer', args = { tostring(buf) }, mods = { keepjumps = true } }, {})
+    api.nvim_cmd({ cmd = 'buffer', args = { tostring(buf) }, mods = { keepjumps = true, hide = true } }, {})
   end)
 end
 
@@ -322,65 +322,48 @@ end })
 local function tab(state)
   local repository = state.repository
   local previous = repository.current
-  local marked
-  for _, page in ipairs(api.nvim_list_tabpages()) do
-    local marker = vim.t[page].buf_review
-    if type(marker) == 'table' and marker.repository == state.root then marked = page; break end
+  local page = api.nvim_get_current_tabpage()
+  if previous.tab ~= page then
+    guard(previous)
+    if previous.tab and api.nvim_tabpage_is_valid(previous.tab) then
+      local marker = vim.t[previous.tab].buf_review
+      if marker and marker.repository == state.root then vim.t[previous.tab].buf_review = nil end
+    end
   end
   local function recover(current)
-    current.tab = marked
-    local windows = api.nvim_tabpage_list_wins(marked)
+    current.tab = page
     for _, key in ipairs({ 'top', 'left', 'right', 'original', 'discussion' }) do
       local win = current[key]
-      if win and (not valid(win) or api.nvim_win_get_tabpage(win) ~= marked) then current[key], current.diff_windows = nil, nil end
-      if key ~= 'top' and valid(current[key]) then
-        local buf = api.nvim_win_get_buf(current[key])
+      if valid(win) then
+        local buf = api.nvim_win_get_buf(win)
         local meta = buffers[buf]
         local local_pane = key == 'right' and current.diff_panes and current.diff_panes.right
         local native = local_pane and local_pane.kind == 'local' and api.nvim_buf_get_name(buf) == local_pane.path
-        if not (meta and meta.state == current) and not native then current[key], current.diff_windows = nil, nil end
+        local owned = meta and meta.state == current or native
+        if api.nvim_win_get_tabpage(win) ~= page then
+          if owned then leave_diff(win) end
+          current[key], current.diff_windows = nil, nil
+        elseif key ~= 'top' and not owned then current[key], current.diff_windows = nil, nil end
+      elseif win then
+        current[key], current.diff_windows = nil, nil
       end
     end
-    if #windows == 1 then
-      current.top = windows[1]
-      if current.left ~= windows[1] then
-        current.left, current.right, current.original, current.discussion, current.diff_windows = nil, nil, nil, nil, nil
-      end
-    else
-      if not valid(current.left) and not valid(current.top) then
-        for _, key in ipairs({ 'original', 'right', 'discussion' }) do
-          if valid(current[key]) then
-            current.left, current.top, current[key], current.diff_windows = current[key], current[key], nil, nil
-            break
-          end
-        end
-      end
-      if not valid(current.top) then current.top = api.nvim_tabpage_get_win(marked) end
-    end
+    if not valid(current.top) then current.top = api.nvim_get_current_win() end
   end
-  if marked then recover(previous) end
+  recover(previous)
   if previous ~= state then
     settle(previous)
     guard(previous)
-    if marked and previous.tab and api.nvim_tabpage_is_valid(previous.tab) then
-      close_original(previous)
-      if valid(previous.discussion) then leave_diff(previous.discussion); api.nvim_win_close(previous.discussion, false) end
-      if valid(previous.right) then leave_diff(previous.right); api.nvim_win_close(previous.right, true) end
-      state.tab, state.top = previous.tab, valid(previous.left) and previous.left or previous.top
-      previous.tab, previous.top, previous.left, previous.right, previous.discussion = nil, nil, nil, nil, nil
-      previous.diff_windows = nil
+    local target = valid(previous.left) and previous.left or previous.top
+    for _, key in ipairs({ 'original', 'discussion', 'right' }) do
+      local win = previous[key]
+      if valid(win) and win ~= target then leave_diff(win); api.nvim_win_hide(win) end
     end
+    state.tab, state.top = previous.tab, target
+    previous.tab, previous.top, previous.left, previous.right, previous.discussion, previous.original = nil, nil, nil, nil, nil, nil
+    previous.diff_windows = nil
     repository.current = state
-  end
-  if marked then
     recover(state)
-    api.nvim_set_current_tabpage(marked)
-  else
-    vim.cmd('keepjumps tabnew')
-    state.tab = api.nvim_get_current_tabpage()
-    state.top = api.nvim_get_current_win()
-    state.left, state.right, state.discussion, state.original = nil, nil, nil, nil
-    state.diff_windows = nil
   end
   vim.t[state.tab].buf_review = { repository = state.root }
 end
@@ -1188,20 +1171,22 @@ local function display_home(state)
   if not state.loading then restore_home_folds(state, state.top) end
 end
 
-home = function(state)
+home = function(state, target)
   guard(state)
   state.repository.opening = {}
   settle(state)
   tab(state)
-  close_original(state)
-  if valid(state.discussion) then leave_diff(state.discussion); api.nvim_win_close(state.discussion, false) end
-  state.discussion = nil
-  if valid(state.right) then leave_diff(state.right); api.nvim_win_close(state.right, true) end
-  state.right = nil
-  if valid(state.left) then state.top = state.left end
-  state.left = nil
-  state.diff_windows = nil
-  if not valid(state.top) then state.top = api.nvim_get_current_win() end
+  target = target or (valid(state.left) and state.left or state.top)
+  for _, key in ipairs({ 'original', 'discussion', 'right', 'left', 'top' }) do
+    local win = state[key]
+    local meta = valid(win) and buffers[api.nvim_win_get_buf(win)]
+    if valid(win) and win ~= target and (key ~= 'top' or meta and meta.state == state) then
+      leave_diff(win)
+      api.nvim_win_hide(win)
+    end
+    state[key] = nil
+  end
+  state.top, state.diff_windows = target, nil
   display_home(state)
   api.nvim_set_current_win(state.top)
 end
@@ -1374,6 +1359,7 @@ end
 navigate = function(state, payload)
   local repository = state.repository
   if repository.navigating then return end
+  local target = api.nvim_get_current_win()
   guard(repository.current)
   guard(state)
   repository.opening = {}
@@ -1399,7 +1385,7 @@ navigate = function(state, payload)
     notify(err, vim.log.levels.ERROR)
   end
   local receive
-  receive = function(response, err)
+  local function received(response, err)
     if err then failure(err); return end
     if protected(repository.current) or protected(state) then
       failure('Unsaved composer; session selection cancelled')
@@ -1446,6 +1432,11 @@ navigate = function(state, payload)
     end)
     repository.navigating = nil
     if not ok then failure(problem) end
+  end
+  receive = function(response, err)
+    if not valid(target) then repository.navigating = nil; state.loading = nil; return end
+    if api.nvim_get_current_win() == target then received(response, err)
+    else api.nvim_win_call(target, function() received(response, err) end) end
   end
   client.request(state.root, payload, receive)
 end
@@ -1585,7 +1576,7 @@ show_diff = function(context, panes)
       api.nvim_buf_delete(buf, { force = true })
     end
   end
-  api.nvim_set_current_win(state.diff_windows.right or state.left)
+  api.nvim_set_current_win(panes.right and panes.right.kind == 'local' and state.left or state.diff_windows.right or state.left)
   activate(api.nvim_get_current_buf())
 end
 
@@ -2568,7 +2559,7 @@ dispatch = function(command, arguments, opts)
   if not command then
     guard(state)
     if state.view and ((meta and meta.kind ~= 'prs' and meta.kind ~= 'sessions') or vim.t.buf_review) then
-      home(state)
+      home(state, api.nvim_get_current_win())
       refresh(state)
     else navigate(state, { op = 'entry' }) end
     return

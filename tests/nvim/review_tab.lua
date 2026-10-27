@@ -49,40 +49,50 @@ local function assert_tab(page, count)
   assert(vim.t[page].buf_review.repository == repository, 'Review tab lost repository marker')
 end
 
-local source_tab, source = api.nvim_get_current_tabpage(), api.nvim_get_current_buf()
+local source_tab, source, source_window = api.nvim_get_current_tabpage(), api.nvim_get_current_buf(), api.nvim_get_current_win()
 api.nvim_buf_set_name(source, repository .. '/review-tab-unsaved-source.rs')
 api.nvim_buf_set_lines(source, 0, -1, false, { 'unsaved source' })
-command()
-wait(function() return kind() == 'home' end, 'initial Review missing')
-local review = api.nvim_get_current_tabpage()
-assert(review ~= source_tab, 'Review reused ordinary source tab')
-assert_tab(review, 2)
-
--- The tab marker survives replacing the only Review buffer with native editing.
 local native = api.nvim_create_buf(true, false)
 api.nvim_buf_set_name(native, fixture .. '/ordinary-outside-git.txt')
 api.nvim_buf_set_lines(native, 0, -1, false, { 'keep native unsaved text' })
+vim.cmd('vsplit')
+local extra = api.nvim_get_current_win()
+api.nvim_win_set_buf(extra, native)
+api.nvim_set_current_win(source_window)
+command()
+wait(function() return kind() == 'home' end, 'initial Review missing')
+local review = api.nvim_get_current_tabpage()
+assert(review == source_tab and api.nvim_get_current_win() == source_window, 'Review did not use invoking window/tab')
+assert_tab(review, 1)
+assert(api.nvim_win_is_valid(extra) and api.nvim_win_get_buf(extra) == native, 'Review changed an existing user split')
+assert(api.nvim_buf_is_loaded(source) and vim.bo[source].modified
+  and api.nvim_buf_get_lines(source, 0, -1, false)[1] == 'unsaved source', 'Review discarded invoking source edits')
+
+-- An invocation from a native split takes that split, preserving other user windows.
+vim.cmd('vsplit')
+local invoking_split = api.nvim_get_current_win()
+api.nvim_win_set_buf(invoking_split, native)
+command()
+wait(function() return kind() == 'home' end, 'Review did not replace invoking native split')
+assert(api.nvim_get_current_win() == invoking_split, 'Review jumped to another split')
+assert(api.nvim_win_is_valid(extra) and api.nvim_win_get_buf(extra) == native, 'split takeover changed unrelated native window')
+assert_tab(review, 1)
+
+-- The tab marker survives replacing the only Review buffer with native editing.
 api.nvim_set_current_buf(native)
 assert(vim.b.buf_review == nil, 'native replacement inherited Review metadata')
 command()
 wait(function() return kind() == 'home' end, 'Review did not recover from native replacement')
-assert_tab(review, 2)
+assert_tab(review, 1)
 assert(api.nvim_buf_is_loaded(native) and vim.bo[native].modified
   and api.nvim_buf_get_lines(native, 0, -1, false)[1] == 'keep native unsaved text', 'Review discarded native edits')
 
--- Replacing a pane does not make other user windows owned by Review.
-vim.cmd('vsplit')
-local extra = api.nvim_get_current_win()
-api.nvim_win_set_buf(extra, native)
-command()
-wait(function() return kind() == 'home' end, 'Review did not return beside native window')
-assert_tab(review, 2)
-assert(api.nvim_win_is_valid(extra) and api.nvim_win_get_buf(extra) == native, 'Review closed another native window')
+-- Native window changes leave the invoking window available for Review.
 api.nvim_set_current_win(extra)
 vim.cmd('only')
 command()
 wait(function() return kind() == 'home' end, 'Review did not recover after only')
-assert_tab(review, 2)
+assert_tab(review, 1)
 
 -- Wiping all bound readers cannot remove the tab's identity.
 api.nvim_set_current_buf(native)
@@ -92,14 +102,31 @@ end
 assert(vim.b.buf_review == nil, 'wipe left a bound Review reader')
 command()
 wait(function() return kind() == 'home' end, 'Review did not recover after readers wiped')
-assert_tab(review, 2)
+assert_tab(review, 1)
 
-api.nvim_set_current_tabpage(source_tab)
+-- Another user-created tab takes over without jumping back or changing old panes.
+row('file.rs'); require('buf_review').enter()
+wait(function() return kind() == 'diff' end, 'diff before takeover missing')
+local user_diff = api.nvim_get_current_win()
+api.nvim_win_set_buf(user_diff, native)
+vim.cmd('diffthis')
+assert(vim.wo[user_diff].diff, 'replaced Review window did not retain native diff setup')
+local old_windows = {}
+for _, win in ipairs(api.nvim_tabpage_list_wins(review)) do old_windows[win] = api.nvim_win_get_buf(win) end
+local old_review = review
+vim.cmd('tabnew')
+api.nvim_set_current_buf(source)
+review = api.nvim_get_current_tabpage()
 command()
-wait(function() return kind() == 'home' end, 'Review did not focus marked tab from ordinary tab')
+wait(function() return kind() == 'home' end, 'Review did not take over invoking tab')
 assert_tab(review, 2)
+assert(vim.t[old_review].buf_review == nil, 'previous tab retained active Review ownership')
+for win, buf in pairs(old_windows) do
+  assert(api.nvim_win_is_valid(win) and api.nvim_win_get_buf(win) == buf, 'takeover changed previous tab panes')
+end
+assert(vim.wo[user_diff].diff, 'takeover disabled unrelated native diff')
 assert(api.nvim_buf_get_lines(source, 0, -1, false)[1] == 'unsaved source' and vim.bo[source].modified,
-  'Review modified ordinary source tab')
+  'takeover discarded invoking source edits')
 
 -- PR and session navigation share the same marked tab.
 command('prs')
@@ -119,13 +146,24 @@ assert_tab(review, 2)
 row('file.rs'); require('buf_review').enter()
 wait(function() return kind() == 'diff' end, 'diff missing')
 vim.cmd('only')
-command()
-wait(function() return kind() == 'home' end, 'Review did not recover from surviving right diff pane')
+command('sessions new')
+wait(function() return kind() == 'home' and vim.b.buf_review.workspace ~= session end,
+  'session switch failed with only the right diff pane remaining')
+assert_tab(review, 2)
+
+command('log')
+wait(function() return kind() == 'log' end, 'log discussion missing')
+vim.cmd('only')
+local discussion_session = vim.b.buf_review.workspace
+command('sessions new')
+wait(function() return kind() == 'home' and vim.b.buf_review.workspace ~= discussion_session end,
+  'session switch failed with only the discussion pane remaining')
 assert_tab(review, 2)
 
 row('file.rs'); require('buf_review').enter()
 wait(function() return kind() == 'diff' end, 'diff before local editing missing')
 api.nvim_feedkeys('o', 'xt', false)
+api.nvim_feedkeys(api.nvim_replace_termcodes('<C-w>l', true, false, true), 'xt', false)
 wait(function() return api.nvim_buf_get_name(0) == edit_path end, 'o did not open local buffer')
 local edit_buffer = api.nvim_get_current_buf()
 api.nvim_buf_set_lines(edit_buffer, 0, -1, false, { 'keep local edit' })
@@ -139,6 +177,8 @@ assert(api.nvim_buf_is_loaded(edit_buffer) and vim.bo[edit_buffer].modified
   and api.nvim_buf_get_lines(edit_buffer, 0, -1, false)[1] == 'keep local edit', 'tab recovery discarded local edit')
 
 row('file.rs'); require('buf_review').enter()
+wait(function() return kind() == 'diff' end, 'local comparison did not reopen')
+api.nvim_feedkeys(api.nvim_replace_termcodes('<C-w>l', true, false, true), 'xt', false)
 wait(function() return api.nvim_get_current_buf() == edit_buffer end, 'local editing pane did not reopen')
 local editing_window = api.nvim_get_current_win()
 vim.cmd('vsplit')
@@ -155,20 +195,37 @@ assert(api.nvim_win_is_valid(ordinary_window) and api.nvim_win_get_buf(ordinary_
   'recovering a surviving pane replaced another user window')
 api.nvim_win_close(ordinary_window, true)
 
--- Closed marked tabs are recreated once; old native buffers remain intact.
+-- Closing the active tab leaves subsequent Review in the surviving tab.
 vim.cmd('tabclose')
-assert(api.nvim_get_current_tabpage() == source_tab, 'closing Review changed ordinary tab')
+assert(api.nvim_get_current_tabpage() == old_review, 'closing Review changed surviving tab')
+api.nvim_set_current_buf(source)
 command()
-wait(function() return kind() == 'home' end, 'closed Review tab was not recreated')
-local recreated = api.nvim_get_current_tabpage()
-assert(recreated ~= review, 'closed tab handle was reused')
-assert_tab(recreated, 2)
+wait(function() return kind() == 'home' end, 'Review did not use surviving tab')
+assert_tab(old_review, 1)
 command()
 wait(function() return kind() == 'home' end, 'repeated Review missing')
-assert_tab(recreated, 2)
+assert_tab(old_review, 1)
 assert(api.nvim_buf_is_loaded(native) and api.nvim_buf_get_lines(native, 0, -1, false)[1] == 'keep native unsaved text',
   'Review recreation deleted native buffer')
 
-print('Neovim marked Review tab reuse passed')
+-- A delayed browser response belongs to the invoking window, even after a tab switch.
+local browser_window = api.nvim_get_current_win()
+vim.fn.writefile({ '0.3' }, fixture .. '/delay_list')
+command('prs')
+vim.cmd('tabnew')
+api.nvim_set_current_buf(native)
+local ordinary_tab, ordinary_window = api.nvim_get_current_tabpage(), api.nvim_get_current_win()
+wait(function()
+  local marker = vim.b[api.nvim_win_get_buf(browser_window)].buf_review
+  return marker and marker.kind == 'prs'
+end, 'delayed browser did not render in the invoking window')
+assert(api.nvim_get_current_tabpage() == ordinary_tab and api.nvim_get_current_win() == ordinary_window
+  and api.nvim_get_current_buf() == native, 'delayed browser took over another tab')
+assert(vim.t[ordinary_tab].buf_review == nil and vim.t[old_review].buf_review.repository == repository,
+  'delayed browser moved Review ownership to another tab')
+assert(#api.nvim_list_tabpages() == 2, 'delayed browser created another tab')
+vim.fn.delete(fixture .. '/delay_list')
+
+print('Neovim current-tab Review takeover passed')
 vim.fn.delete(fixture, 'rf')
 vim.cmd('qa!')

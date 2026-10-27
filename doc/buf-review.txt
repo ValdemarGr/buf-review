@@ -81,12 +81,12 @@ hashes in the background.
 Missing historical commits report warnings and use recorded-hunk fallback;
 missing current comparison commits report an error. Preparation never checks out files.
 
-Each repository has one marked Review tab. :Review reuses it after ordinary
-buffer replacements or window changes, creating one only when no marked tab remains.
-The marker t:buf_review.repository identifies the repository independently of
-buffer metadata. PR/session switches and o share that tab; unrelated user
-windows and unsaved native buffers are preserved.
-The reusable review tab contains home or committed code panes, with
+:Review opens in the current window and tab. It never creates or jumps to a
+dedicated Review tab. Each repository has one active view; another tab takes
+over when :Review is invoked there. PR/session switches and o share the active
+tab; unrelated user splits and unsaved native buffers are preserved. Closing
+the tab does not create a replacement.
+The active review view contains home or committed code panes, with
 one reusable discussion split below them. A dirty right pane uses the ordinary
 editable source buffer. Press o in a review diff to open its right pane as Local,
 even when clean. This explicit editable mode lasts until the diff is reopened.

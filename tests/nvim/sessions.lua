@@ -92,6 +92,7 @@ assert(#requests('list') == 0, 'duplicate navigation started while first session
 wait(function() return kind() == 'home' end, 'selected session did not open')
 vim.fn.delete(fixture .. '/delay_refresh')
 local first_home, review_tab = api.nvim_get_current_buf(), api.nvim_get_current_tabpage()
+assert(review_tab == source_tab and #api.nvim_list_tabpages() == 1, 'Review did not use the invoking tab')
 assert(vim.b.buf_review.workspace == first.id and text():find('Session: batch-first', 1, true), 'home lost canonical batch identity')
 assert(text():find('Publication: draft', 1, true) and text():find('Pending: 2 comments, 1 edit, 1 file', 1, true), 'home omitted backend statistics')
 row('Review · submitted')
@@ -110,7 +111,8 @@ wait(function() return #requests('code') == 1 end, 'delayed code request missing
 command('sessions')
 wait(function() return kind() == 'sessions' end, 'browser missing during code read')
 ReviewTest.wait(250)
-assert(kind() == 'sessions' and #api.nvim_tabpage_list_wins(0) == 1, 'late code response replaced session browser')
+assert(kind() == 'sessions' and #api.nvim_tabpage_list_wins(0) == 1,
+  'late code response replaced session browser: ' .. vim.inspect({ kind = kind(), windows = api.nvim_tabpage_list_wins(0), notices = notices }))
 vim.fn.delete(fixture .. '/delay_code')
 local resumed = vim.json.decode(table.concat(vim.fn.readfile(fixture .. '/state.json'), '\n'))
 resumed.pr.title = 'First PR resumed after code read'
@@ -144,18 +146,21 @@ assert(text():find('batch-first', 1, true) and text():find('batch-second', 1, tr
 row('batch-second')
 enter()
 wait(function() return kind() == 'home' and vim.b.buf_review.workspace == second.id end, 'second session on same PR did not open')
-assert(api.nvim_get_current_tabpage() == review_tab and #api.nvim_list_tabpages() == 2, 'session switching created another review tab')
+assert(api.nvim_get_current_tabpage() == review_tab and #api.nvim_list_tabpages() == 1, 'session switching created another review tab')
 ReviewTest.wait(400)
 assert(kind() == 'home' and vim.b.buf_review.workspace == second.id, 'late refresh selected its old session')
 assert(api.nvim_buf_get_lines(first_home, 0, -1, false)[6] == 'Session: batch-first', 'old home was retargeted')
 
 -- A source invocation always resolves the branch again, despite selected state.
-api.nvim_set_current_tabpage(source_tab)
+vim.cmd('tabnew')
+api.nvim_set_current_buf(source)
+source_tab = api.nvim_get_current_tabpage()
 routes.entry = { route = 'batch', batch = first.id }
 write('routes.json', routes)
 command('')
 wait(function() return kind() == 'home' and vim.b.buf_review.workspace == first.id end, 'source branch route did not resume returned batch')
-assert(#requests('entry') == before_entry + 1 and api.nvim_get_current_tabpage() == review_tab, 'source entry skipped resolution or reused source tab')
+assert(#requests('entry') == before_entry + 1 and api.nvim_get_current_tabpage() == source_tab
+  and #api.nvim_list_tabpages() == 2, 'source entry skipped resolution or left the invoking tab')
 assert(vim.bo[source].modified and api.nvim_buf_get_lines(source, 0, -1, false)[1] == 'source stays exact')
 
 -- Multiple unfinished sessions use the same browser with a PR filter.
@@ -261,7 +266,8 @@ command('prs assignee=@me state=closed')
 wait(function() return kind() == 'prs' and text():find('state=closed', 1, true) end, 'filtered PR picker missing')
 routes.entry = { route = 'prs', pull_requests = pulls }
 write('routes.json', routes)
-api.nvim_set_current_tabpage(source_tab)
+vim.cmd('tabnew')
+api.nvim_set_current_buf(source)
 command('')
 wait(function() return kind() == 'prs' and text():find('state=open assignee=all', 1, true) end, 'source branch fallback inherited stale PR filters')
 

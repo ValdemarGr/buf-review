@@ -68,6 +68,7 @@ local native_window = api.nvim_get_current_win()
 vim.bo[native].filetype = 'text'
 vim.bo[native].shiftwidth = 7
 vim.bo[native].undolevels = 80
+vim.cmd('vsplit')
 local notices = {}
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end
 local function kind() return vim.b.buf_review and vim.b.buf_review.kind end
@@ -113,12 +114,19 @@ local function assert_native()
   end
   assert(api.nvim_win_is_valid(native_window) and api.nvim_win_get_buf(native_window) == native, 'other native window changed')
 end
+local function edit_local()
+  assert(kind() == 'diff' and (vim.b.buf_review.side == 'base' or vim.b.buf_review.comment_role == 'comment'),
+    'local-right layout did not focus the left Review pane')
+  input('<C-w>l')
+  assert_native()
+end
 
 open_file()
 assert(#review_panes() == 2 and api.nvim_get_current_buf() ~= native, 'clean file did not use committed Review panes')
+assert(vim.b.buf_review.side == 'head', 'committed layout did not retain right-pane focus')
 local right = api.nvim_get_current_win()
 input('o')
-assert_native()
+edit_local()
 assert(api.nvim_get_current_win() == right and #review_panes() == 1, 'o did not convert existing right pane through shared setup')
 input('A edit<Esc>')
 assert(api.nvim_get_current_line() == 'committed edit', 'native append failed')
@@ -130,7 +138,7 @@ assert(api.nvim_buf_line_count(native) == 2, 'native o was replaced by Review op
 home()
 assert(api.nvim_buf_is_loaded(native) and vim.bo[native].modified and api.nvim_buf_line_count(native) == 2, 'closing local pane discarded native edits')
 open_file()
-assert_native()
+edit_local()
 assert(#review_panes() == 1, 'unsaved local changes did not select edit pane')
 
 -- Restore file bytes explicitly as user work, then open a contracted comment.
@@ -143,7 +151,7 @@ for _, pane in ipairs(review_panes()) do if pane.marker.comment_role == 'comment
 assert(#review_panes() == 2 and source, 'comment at HEAD did not contract to two committed panes')
 api.nvim_set_current_win(source)
 input('o')
-assert_native()
+edit_local()
 assert(#review_panes() == 2, 'o did not add real right pane to contracted comment layout')
 input('A local<Esc>')
 assert(api.nvim_get_current_line() == 'committed local', 'contracted edit pane is not native')
@@ -168,7 +176,7 @@ api.nvim_buf_set_lines(native, 0, -1, false, { 'staged content' })
 api.nvim_buf_call(native, function() vim.cmd.write() end)
 git('add', 'file.txt')
 code(true)
-open_file(); assert_native()
+open_file(); edit_local()
 local captured = review_panes()[1].buffer
 git('commit', '--quiet', '-m', 'Unpushed local commit')
 local newer = git('rev-parse', 'HEAD')

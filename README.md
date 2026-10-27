@@ -36,9 +36,10 @@ or opens the session browser when several are unfinished. Use
 `:Review prs` to choose any PR, or `:Review sessions` to browse saved sessions
 grouped by PR. `:Review sessions new` creates another session for the selected
 or current PR. Each session is a batch with a stable ID; refresh and publication
-preserve it. Each repository has one marked Review tab. Inside that tab,
-`:Review` returns to its current session even after ordinary editing replaces
-the buffers or changes the window layout. A closed Review tab is recreated.
+preserve it. `:Review` opens in the current window and tab; it never creates
+or jumps to a dedicated Review tab. If that repository's review is active
+elsewhere, the current tab takes over. Other user splits and unsaved source
+buffers are preserved.
 
 Use `:Review pr master` to review the current branch against `master` before a
 GitHub PR exists. The command reuses an existing open PR for that exact source/
@@ -175,8 +176,8 @@ PR-wide comments open their discussion without changing code.
 Readers reuse stable numbered buffers during navigation. A manual split keeps
 its existing target; navigation uses another slot when needed. Composers remain
 separate, and their return readers stay reserved until the composer closes.
-Tab identity lives in `t:buf_review.repository`; it does not depend on a Review
-buffer remaining visible. PR/session navigation and `o` reuse the same tab.
+PR/session navigation and `o` use the active view's tab. Closing that tab does
+not create a replacement; the next `:Review` uses its invoking window and tab.
 
 Inline markers show fetched comments with `[ ]` none Done, `[-]` partly Done,
 or `[x]` all Done, using your thumbs-up on each comment/reply. Local comments

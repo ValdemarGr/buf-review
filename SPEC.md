@@ -75,9 +75,11 @@ in the sessions browser it rereads local state and preserves its PR filter;
 elsewhere it refreshes the bound session. Listing failure preserves the
 previous rows and shows the error.
 
-Use one reusable review tab per repository. Home, diff and discussion views
-reuse that tab; original code context uses a separate, explicitly opened tab.
-Review entry does not replace the user's existing source layout. Normal Vim
+`:Review` opens in the current window and tab, without creating or locating a
+dedicated Review tab. Each repository has one active view; invoking `:Review`
+from another tab moves that view there. Unrelated user splits and unsaved source
+buffers are preserved. Home, diff and discussion views reuse the active tab;
+original code context uses a separate, explicitly opened tab. Normal Vim
 window/tab commands remain available.
 
 Review buffers carry their own repository, PR, session and object identities.
