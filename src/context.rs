@@ -87,6 +87,7 @@ fn base_path(
 
 /// Prepare current history first; fetch exceptional comment commits together.
 pub fn prepare(store: &mut Store, project: &Path, workspace: &Workspace) -> Result<Value> {
+    crate::progress::report("prepare_git", "Preparing Git objects", None);
     let mut current = vec![
         workspace.review.read.pull_request.revision.base.clone(),
         diff::resolve(project, "HEAD")?,
@@ -109,6 +110,7 @@ pub fn prepare(store: &mut Store, project: &Path, workspace: &Workspace) -> Resu
     let local = store
         .pull_request(&workspace.review.read.pull_request.id)?
         .is_some_and(|pr| matches!(pr.source, PullRequestSource::LocalIntent { .. }));
+    crate::progress::report("prepare_current", "Preparing current commits", None);
     if local {
         let missing = diff::missing_commits(project, &current)?;
         if !missing.is_empty() {
@@ -149,6 +151,7 @@ pub fn prepare(store: &mut Store, project: &Path, workspace: &Workspace) -> Resu
         }
     }
     let commits = commits.into_iter().collect::<Vec<_>>();
+    crate::progress::report("prepare_history", "Preparing historical commits", None);
     let mut response = json!({"revision":workspace.comparison});
     if store
         .pull_request(&workspace.review.read.pull_request.id)?
@@ -169,9 +172,11 @@ pub fn prepare(store: &mut Store, project: &Path, workspace: &Workspace) -> Resu
             )]);
             response["missing_commits"] = json!(missing);
         }
+        crate::progress::report("prepare_comparison", "Preparing comparison", None);
         let current = store.prepare_worktree(&workspace.id)?;
         response["revision"] = json!(current.comparison);
         response["workspace"] = serde_json::to_value(store.view_workspace(&current)?)?;
+        crate::progress::report("prepare_git", "Git preparation complete", None);
         return Ok(response);
     }
     let backend = store
@@ -182,9 +187,11 @@ pub fn prepare(store: &mut Store, project: &Path, workspace: &Workspace) -> Resu
         response["missing_commits"] =
             json!(diff::missing_commits(project, &commits).unwrap_or(commits));
     }
+    crate::progress::report("prepare_comparison", "Preparing comparison", None);
     let current = store.prepare_worktree(&workspace.id)?;
     response["revision"] = json!(current.comparison);
     response["workspace"] = serde_json::to_value(store.view_workspace(&current)?)?;
+    crate::progress::report("prepare_git", "Git preparation complete", None);
     Ok(response)
 }
 

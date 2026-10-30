@@ -63,7 +63,7 @@ fn failed_viewed_write_stops_and_retry_reuses_the_confirmed_lookup() {
     run("viewed_cache_failure");
 }
 #[test]
-fn every_ready_family_uses_one_batch_and_only_reply_depth_adds_rounds() {
+fn ready_families_use_bounded_batches_in_dependency_order() {
     run("families");
 }
 #[test]
@@ -77,6 +77,39 @@ fn unknown_comment_alias_keeps_other_receipts_and_never_blindly_resends() {
 #[test]
 fn internal_alias_failure_after_creation_never_blindly_retries() {
     run("comment_internal");
+}
+#[test]
+fn resource_limited_comment_batch_recovers_after_refresh_and_restart() {
+    run("comment_resource");
+}
+#[test]
+fn resource_limited_saved_attempt_recovers_from_its_original_error_log() {
+    run("comment_resource_legacy");
+}
+#[test]
+fn missing_comment_identity_stays_blocked_after_resource_failure() {
+    run("comment_resource_missing");
+}
+#[test]
+fn ambiguous_remote_comments_block_resource_failure_recovery() {
+    run("comment_resource_ambiguous");
+}
+#[test]
+fn changed_pending_review_author_blocks_resource_failure_recovery() {
+    run("comment_resource_author");
+}
+#[test]
+fn mismatched_partial_comment_identity_blocks_resource_failure_recovery() {
+    run("comment_resource_node");
+    run("comment_resource_database");
+}
+#[test]
+fn review_submitted_during_recovery_is_not_recreated() {
+    run("comment_resource_submitted");
+}
+#[test]
+fn unknown_pr_wide_comment_is_not_retried_against_pending_review_members() {
+    run("comment_resource_wide");
 }
 #[test]
 fn existing_authenticated_pending_review_is_reused_before_batched_comments() {
@@ -141,6 +174,10 @@ fn provider_receipts_merge_concurrent_unrelated_saves() {
 #[test]
 fn adjacent_roots_share_one_batch_and_keep_individual_receipts() {
     run("bulk");
+}
+#[test]
+fn eighteen_roots_use_bounded_batches_before_one_conclusion() {
+    run("bulk_large");
 }
 #[test]
 fn terminal_conclusion_follows_batched_comments() {
@@ -412,6 +449,58 @@ esac
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let progress = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["event"] == "progress")
+        .collect::<Vec<_>>();
+    let counts = |stage| {
+        let mut counts = progress
+            .iter()
+            .filter(|event| event["stage"] == stage)
+            .map(|event| {
+                (
+                    event["completed"].as_u64().unwrap(),
+                    event["total"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        counts.dedup();
+        counts
+    };
+    if case == "bulk_large" {
+        assert_eq!(
+            counts("publish_comments"),
+            [(0, 18), (8, 18), (16, 18), (18, 18)]
+        );
+        assert_eq!(counts("publish_review"), [(0, 1), (1, 1)]);
+        assert_eq!(progress.last().unwrap()["stage"], "publish_complete");
+    } else if matches!(case, "comment_resource" | "comment_resource_legacy") {
+        assert_eq!(counts("publish_comments"), [(0, 8), (6, 8), (7, 8), (8, 8)]);
+        assert_eq!(counts("publish_files"), [(0, 1), (1, 1)]);
+        assert_eq!(progress.last().unwrap()["stage"], "publish_complete");
+    } else if case.starts_with("comment_resource") {
+        assert_eq!(counts("publish_comments"), [(0, 8), (6, 8)]);
+        assert!(
+            !progress
+                .iter()
+                .any(|event| event["stage"] == "publish_complete")
+        );
+        assert_eq!(progress.last().unwrap()["stage"], "publish_failed");
+    } else if matches!(case, "comment_unknown" | "comment_internal") {
+        assert_eq!(counts("publish_comments"), [(0, 3), (2, 3)]);
+        assert!(
+            !progress
+                .iter()
+                .any(|event| event["stage"] == "publish_complete")
+        );
+    } else if case == "comment_partial" {
+        assert_eq!(counts("publish_comments"), [(0, 3), (2, 3), (3, 3)]);
+    } else if case == "uncertain_stale_viewed" {
+        assert_eq!(counts("publish_files"), [(1, 2), (2, 2)]);
+    } else if case == "uncertain_submit" {
+        assert_eq!(counts("publish_review"), [(0, 1), (1, 1)]);
+    }
 }
 
 fn location(head: &str) -> CommentTarget {
@@ -701,10 +790,25 @@ fn provider_child() {
     }
     if matches!(
         case.as_str(),
-        "families" | "comment_partial" | "comment_unknown" | "comment_internal" | "pending_reuse"
+        "families"
+            | "comment_partial"
+            | "comment_unknown"
+            | "comment_internal"
+            | "pending_reuse"
+            | "comment_resource"
+            | "comment_resource_legacy"
+            | "comment_resource_missing"
+            | "comment_resource_ambiguous"
+            | "comment_resource_author"
+            | "comment_resource_node"
+            | "comment_resource_database"
+            | "comment_resource_submitted"
+            | "comment_resource_wide"
     ) {
         let count = if case == "families" {
             20
+        } else if case.starts_with("comment_resource") {
+            8
         } else if case == "pending_reuse" {
             1
         } else {
@@ -713,7 +817,11 @@ fn provider_child() {
         let mut roots = Vec::new();
         let mut replies = Vec::new();
         for index in 0..count {
-            let mut target = location("old-head");
+            let mut target = if case == "comment_resource_wide" && index == 7 {
+                CommentTarget::PullRequest
+            } else {
+                location("old-head")
+            };
             if let CommentTarget::Diff(location) = &mut target {
                 location.position.path = workspace.review.read.files
                     [index % workspace.review.read.files.len()]
@@ -808,6 +916,163 @@ fn provider_child() {
         }
         let raw = workspace.batch.write.clone();
         let planned = workspace.publication_plan().unwrap().operations;
+        if case.starts_with("comment_resource") {
+            let error = github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("RESOURCE_LIMITS_EXCEEDED"),
+                "{error}"
+            );
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+            assert_eq!(workspace.results.len(), 6);
+            assert!(workspace.suspended_attempts[0].uncertain);
+            assert_eq!(
+                workspace.suspended_attempts[0].provider["creating"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(
+                !std::path::Path::new(&root)
+                    .join("batch-viewed.json")
+                    .exists()
+            );
+            if case == "comment_resource_legacy" {
+                workspace.suspended_attempts[0]
+                    .provider
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("failures");
+                workspace = store
+                    .save_workspace(workspace.generation, &workspace)
+                    .unwrap();
+            }
+            if case == "comment_resource_missing" {
+                let path = std::path::Path::new(&root).join("batch-comments.json");
+                let mut remote: Vec<Value> =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                remote.retain(|comment| comment["body"] != "Root 6");
+                fs::write(path, serde_json::to_vec(&remote).unwrap()).unwrap();
+            }
+            if case == "comment_resource_ambiguous" {
+                let path = std::path::Path::new(&root).join("batch-comments.json");
+                let mut remote: Vec<Value> =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                let mut duplicate = remote.last().unwrap().clone();
+                duplicate["identity"] = serde_json::json!(208);
+                remote.push(duplicate);
+                fs::write(path, serde_json::to_vec(&remote).unwrap()).unwrap();
+            }
+            if case == "comment_resource_author" {
+                let path = std::path::Path::new(&root).join("pending-review.json");
+                let mut pending: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                pending["user"]["id"] = serde_json::json!(99);
+                fs::write(path, serde_json::to_vec(&pending).unwrap()).unwrap();
+            }
+            let fresh = github::fetch(&url::Url::parse(&backend.source.locator).unwrap()).unwrap();
+            let snapshot = ReviewId("fetched-partial-resource".into());
+            store
+                .import_review(&snapshot, &fresh.reviewer, &fresh.read, &fresh.backend)
+                .unwrap();
+            workspace = store
+                .refresh_workspace(&workspace.id, workspace.generation, &snapshot)
+                .unwrap();
+            drop(store);
+            store = Store::open(&root).unwrap();
+            workspace = store.workspace(&workspace.id).unwrap().unwrap();
+            let original_receipts = workspace.results.clone();
+            let before = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+            if matches!(
+                case.as_str(),
+                "comment_resource_missing"
+                    | "comment_resource_ambiguous"
+                    | "comment_resource_author"
+                    | "comment_resource_node"
+                    | "comment_resource_database"
+                    | "comment_resource_submitted"
+                    | "comment_resource_wide"
+            ) {
+                let error =
+                    github::publish_workspace(&mut store, &workspace.id, workspace.generation)
+                        .unwrap_err();
+                assert!(error.to_string().contains("uncertain"), "{error}");
+                let after = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap()).unwrap();
+                assert_eq!(
+                    before.matches("PublicationBatch").count(),
+                    after.matches("PublicationBatch").count()
+                );
+                assert_eq!(
+                    store.workspace(&workspace.id).unwrap().unwrap().results,
+                    original_receipts
+                );
+                return;
+            }
+            workspace =
+                github::publish_workspace(&mut store, &workspace.id, workspace.generation).unwrap();
+            assert!(workspace.pending().unwrap().operations.is_empty());
+            assert_eq!(&workspace.results[..6], original_receipts.as_slice());
+            assert_eq!(workspace.results.len(), planned.len());
+            assert_eq!(workspace.results[6].operation, planned[6]);
+            assert_eq!(workspace.results[7].operation, planned[7]);
+            assert_eq!(
+                workspace.results[6]
+                    .mappings
+                    .iter()
+                    .find(|mapping| mapping.resource == "review_comment")
+                    .unwrap()
+                    .remote_id,
+                "207"
+            );
+            let remote: Vec<Value> = serde_json::from_slice(
+                &fs::read(std::path::Path::new(&root).join("batch-comments.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(remote.len(), 8);
+            for index in 0..8 {
+                assert_eq!(
+                    remote
+                        .iter()
+                        .filter(|comment| comment["body"] == format!("Root {index}"))
+                        .count(),
+                    1
+                );
+            }
+            let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let creates = requests
+                .iter()
+                .filter(|request| {
+                    request["body"]["query"]
+                        .as_str()
+                        .is_some_and(|query| query.contains("AddPullRequestReviewThreadInput"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(creates.len(), 2);
+            assert_eq!(
+                creates[0]["body"]["variables"].as_object().unwrap().len(),
+                8
+            );
+            assert_eq!(
+                creates[1]["body"]["variables"].as_object().unwrap().len(),
+                1
+            );
+            assert_eq!(creates[1]["body"]["variables"]["input0"]["body"], "Root 7");
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(
+                        |request| request["endpoint"] == "repos/owner/repo/pulls/1/reviews"
+                            && request["method"] == "POST"
+                    )
+                    .count(),
+                1
+            );
+            return;
+        }
         if matches!(
             case.as_str(),
             "comment_partial" | "comment_unknown" | "comment_internal"
@@ -870,7 +1135,7 @@ fn provider_child() {
         assert_eq!(
             sizes,
             if case == "families" {
-                vec![20, 20, 1, 20, 20]
+                vec![8, 8, 4, 8, 8, 4, 1, 8, 8, 4, 8, 8, 4]
             } else if case == "comment_partial" {
                 vec![3, 1, 1]
             } else {
@@ -1177,11 +1442,12 @@ fn provider_child() {
             workspace = store.workspace(&workspace.id).unwrap().unwrap();
             let confirmed = operations
                 .iter()
+                .take(8)
                 .enumerate()
                 .filter(|(index, _)| *index != 1)
                 .map(|(_, operation)| operation.clone())
                 .collect::<Vec<_>>();
-            assert_eq!(workspace.results.len(), 19);
+            assert_eq!(workspace.results.len(), 7);
             assert_eq!(
                 workspace
                     .results
@@ -1194,6 +1460,7 @@ fn provider_child() {
             assert_eq!(workspace.batch.write.events, events);
             expected = confirmed;
             expected.push(operations[1].clone());
+            expected.extend_from_slice(&operations[8..]);
             let requests = fs::read_to_string(std::env::var("PROVIDER_LOG").unwrap())
                 .unwrap()
                 .lines()
@@ -1210,9 +1477,9 @@ fn provider_child() {
             assert_eq!(batches.len(), 1);
             assert_eq!(
                 batches[0]["body"]["variables"].as_object().unwrap().len(),
-                20
+                8
             );
-            for (index, path) in paths.iter().enumerate() {
+            for (index, path) in paths.iter().take(8).enumerate() {
                 let input = &batches[0]["body"]["variables"][format!("input{index}")];
                 assert_eq!(input["path"], *path);
                 assert_eq!(input["clientMutationId"], operations[index].id);
@@ -1275,28 +1542,39 @@ fn provider_child() {
                     .is_some_and(|query| query.contains("MarkFileAsViewedInput"))
             })
             .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 3);
         assert_eq!(
-            writes.len(),
-            if case == "viewed_cache_failure" { 2 } else { 1 }
+            writes
+                .iter()
+                .map(|request| request["body"]["variables"].as_object().unwrap().len())
+                .collect::<Vec<_>>(),
+            if case == "viewed_cache_failure" {
+                vec![8, 8, 5]
+            } else {
+                vec![8, 8, 4]
+            }
         );
-        assert_eq!(
-            writes[0]["body"]["variables"].as_object().unwrap().len(),
-            20
-        );
-        for (index, path) in paths.iter().enumerate() {
-            let input = &writes[0]["body"]["variables"][format!("input{index}")];
+        let inputs = writes
+            .iter()
+            .flat_map(|request| {
+                let variables = &request["body"]["variables"];
+                (0..variables.as_object().unwrap().len())
+                    .map(move |index| &variables[format!("input{index}")])
+            })
+            .collect::<Vec<_>>();
+        let mut sent = operations.clone();
+        if case == "viewed_cache_failure" {
+            sent.insert(8, operations[1].clone());
+        }
+        for (input, operation) in inputs.iter().zip(&sent) {
+            let Event::SetFileViewed { path, .. } = &operation.change else {
+                unreachable!()
+            };
             assert_eq!(input["path"], *path);
             assert_eq!(input["pullRequestId"], "PR1");
-            assert_eq!(input["clientMutationId"], operations[index].id);
+            assert_eq!(input["clientMutationId"], operation.id);
         }
-        if case == "viewed_cache_failure" {
-            assert_eq!(writes[1]["body"]["variables"].as_object().unwrap().len(), 1);
-            assert_eq!(writes[1]["body"]["variables"]["input0"]["path"], paths[1]);
-            assert_eq!(
-                writes[1]["body"]["variables"]["input0"]["clientMutationId"],
-                operations[1].id
-            );
-        }
+        assert_eq!(inputs.len(), sent.len());
         return;
     }
     if matches!(case.as_str(), "reply_first" | "reply_lookup_fail") {
@@ -1383,6 +1661,23 @@ fn provider_child() {
                 .unwrap();
             ids.push(workspace.saved_comment.clone().unwrap());
         }
+        if case == "bulk_large" {
+            for index in 2..18 {
+                workspace = store
+                    .mutate_workspace(
+                        &workspace.id,
+                        workspace.generation,
+                        Action::Save {
+                            comment: None,
+                            target: Some(location("old-head")),
+                            body: format!("Root {index}"),
+                            destination: None,
+                        },
+                    )
+                    .unwrap();
+                ids.push(workspace.saved_comment.clone().unwrap());
+            }
+        }
         if case.starts_with("bulk_boundary") {
             workspace = store
                 .mutate_workspace(
@@ -1410,7 +1705,7 @@ fn provider_child() {
                 ids.push(workspace.saved_comment.clone().unwrap());
             }
         }
-        if case == "bulk_conclude" {
+        if matches!(case.as_str(), "bulk_conclude" | "bulk_large") {
             workspace = store
                 .mutate_workspace(
                     &workspace.id,
@@ -1436,13 +1731,11 @@ fn provider_child() {
         assert!(workspace.pending().unwrap().operations.is_empty());
         assert_eq!(
             workspace.results.len(),
-            if case == "bulk_conclude" {
-                3
-            } else if case.starts_with("bulk_boundary") {
-                5
-            } else {
-                2
-            }
+            ids.len()
+                + usize::from(
+                    matches!(case.as_str(), "bulk_conclude" | "bulk_large")
+                        || case.starts_with("bulk_boundary")
+                )
         );
         for (index, id) in ids.iter().enumerate() {
             assert!(
@@ -1482,11 +1775,29 @@ fn provider_child() {
                     .is_some_and(|query| query.contains("AddPullRequestReviewThreadInput"))
             })
             .collect::<Vec<_>>();
-        assert_eq!(batches.len(), 1);
         assert_eq!(
-            batches[0]["body"]["variables"].as_object().unwrap().len(),
-            ids.len()
+            batches
+                .iter()
+                .map(|request| request["body"]["variables"].as_object().unwrap().len())
+                .collect::<Vec<_>>(),
+            if case == "bulk_large" {
+                vec![8, 8, 2]
+            } else {
+                vec![ids.len()]
+            }
         );
+        let sent = batches
+            .iter()
+            .flat_map(|request| {
+                let variables = &request["body"]["variables"];
+                (0..variables.as_object().unwrap().len())
+                    .map(move |index| &variables[format!("input{index}")])
+            })
+            .collect::<Vec<_>>();
+        for (input, result) in sent.iter().zip(&workspace.results) {
+            assert_eq!(input["clientMutationId"], result.operation.id);
+        }
+        assert_eq!(sent.len(), ids.len());
         assert_eq!(
             batches[0]["body"]["variables"]["input0"]["body"],
             "First bulk root"
@@ -1500,7 +1811,7 @@ fn provider_child() {
                     .as_str()
                     .is_some_and(|endpoint| endpoint.ends_with("/events")))
                 .count(),
-            usize::from(case == "bulk_conclude")
+            usize::from(matches!(case.as_str(), "bulk_conclude" | "bulk_large"))
         );
         if case.starts_with("bulk_external") {
             let mut fresh = workspace.review.read.clone();

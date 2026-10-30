@@ -244,6 +244,22 @@ Mutations include the workspace ID and its expected `generation`; stale saves
 fail without replacing newer work. The Lua frontend uses this structured API;
 provider logic and storage remain in Rust.
 
+Long-running operations stream newline-delimited JSON progress on stderr while
+stdout retains its final response. For example:
+
+```json
+{"event":"progress","stage":"publish_comments","message":"Comments","completed":8,"total":18}
+```
+
+`stage` identifies the current phase and `message` is its display label. Counts
+are present only when known; they describe that phase, not an overall percentage.
+Publication counts advance after receipts are committed and include confirmed
+work on retries. Fetch counts track validated pages; Git preparation reports its
+current phase. Ordinary error diagnostics also use stderr. Callers should frame
+complete lines, consume progress records, and retain other lines as diagnostics.
+Progress is ephemeral and never changes the final response or SQLite state.
+Neovim shows one updating command-line message through publication's final refresh.
+
 `{"op":"pr","base":"master"}` creates/selects the current branch's PR
 object and returns the same batch/session routing. Workspace views expose its
 canonical `pr`: logical `id`, metadata `revision`, `title`, `body`, and tagged
@@ -477,9 +493,10 @@ including pending review comments. Corrections are new comments or replies.
 Unsent create/edit/delete changes coalesce; deleting an unsent comment cancels
 its creation. Provider mappings preserve local identities across refreshes.
 
-Publication follows dependencies, sending one batch per operation family at each
-dependency depth. Independent comments share a request; replies wait until their
-new parents have confirmed identities. Viewed flags and reactions are batched
+Publication follows dependencies, splitting each operation family at each
+dependency depth into batches of at most eight operations. Independent comments
+share requests; replies wait for their new parents' confirmed identities.
+Viewed flags and reactions are batched
 by family, and a queued conclusion follows the other operations. One publication
 uses at most one provider review: it reuses the authenticated reviewer's pending
 review for that PR and head, or creates one when missing. A later publication may
@@ -487,9 +504,10 @@ extend or conclude that pending review without recreating confirmed comments.
 
 Batch writes use GraphQL aliases in one HTTP request. GitHub executes those
 fields serially, without atomicity or rollback: some may succeed while others
-fail. All confirmed results are saved, then any error, blocked operation or
-uncertain result stops later batches. Retry retains the publication ID and
-confirmed receipts; confirmed operations never resend. New unrelated work waits
+fail. Each request has a durable in-flight marker. Its confirmed receipts and
+unresolved response evidence are saved before the next batch. Any error, blocked
+operation or uncertain result stops later batches. Retry retains the publication
+ID and confirmed receipts; confirmed operations never resend. New unrelated work waits
 for another publication. Completed publications remain immutable.
 
 Publishing verifies the reviewer/account and known constraints before writing.
@@ -501,8 +519,13 @@ or treats them as successful receipts for new local operations.
 
 Publication holds `.review/publish.lock`; local saves remain available outside
 the frozen scope. Remote writes and SQLite cannot form one transaction. Lost
-responses remain explicitly uncertain. Unknown creates stay blocked until their
-provider identities are confirmed; they never blindly resend. Unknown viewed or
+responses remain explicitly uncertain. Partial comment identities and errors are
+retained for recovery. Resource-limited inline creates are reconciled only within
+their original pending review, checking reviewer, head, exact anchor and body;
+baseline comments and existing receipts cannot be claimed again. A unique exact
+match recovers its receipt. An explicitly resource-rejected missing alias becomes
+retryable only after a complete read confirms its absence in that scope. Other
+unknown creates stay blocked; they never blindly resend. Unknown viewed or
 reaction operations are reconciled together with one fresh fetch before retry
 decides which operations remain. Later batches stay blocked while results are
 unresolved.

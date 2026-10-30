@@ -299,7 +299,8 @@ include unpublished parents and replies together. Sent comments cannot move.
 Successfully sent comments/conclusions are immutable, including pending drafts.
 Corrections use new comments or replies. PR-wide comments retain targets.
 
-Composers are ordinary Markdown with read-only virtual metadata above their text.
+Composers contain only ordinary Markdown. Target and status appear in the
+window winbar, without virtual headers in the buffer.
     :w      Save locally; keep composer open. Never publish.
     :wq     Save locally; return to originating reader/context on success.
     :q      Normal modified-buffer protection; never publish comments.
@@ -342,18 +343,26 @@ review comments. A queued conclusion runs after preceding saved operations.
 Publication never prompts. Fetched pending roots/replies show [draft], remain
 read-only and stay outside Todo/Done until submitted and fetched.
 
-Publish follows dependencies, sending one batch per operation family at each
-dependency depth. Independent comments share a request; replies wait for newly
-created parents' confirmed identities. Viewed flags and reactions are batched
+Publish follows dependencies, splitting each operation family at each dependency
+depth into batches of at most eight operations. Independent comments share a
+request; replies wait for newly created parents' confirmed identities.
+Viewed flags and reactions are batched
 by family; the conclusion follows the other operations. The authenticated
 reviewer's matching pending review is reused, or created when missing.
 
 Each confirmed operation keeps its own receipt, including successes within a
 partially failed batch. Batch mutations use GraphQL aliases in one HTTP request;
-the server executes fields serially, without atomicity or rollback. An error,
-blocked operation or uncertain result stops later batches. Retry keeps the
+the server executes fields serially, without atomicity or rollback. Each request
+has a durable in-flight marker; receipts and unresolved response evidence are
+saved before the next batch. An error, blocked operation or uncertain result
+stops later batches. Retry keeps the
 publication ID and confirmed receipts; confirmed operations never resend.
-Unknown creates remain blocked until their provider identities are confirmed.
+Partial comment identities/errors are retained. Resource-limited inline creates
+reconcile only against their original pending review, matching reviewer, head,
+exact anchor and body. Baseline comments and existing receipts are excluded;
+one unique exact match recovers its receipt. An explicitly resource-rejected
+missing alias retries only after a complete scoped read confirms absence.
+Other unknown creates and ambiguous results remain blocked.
 Unknown viewed/reaction results reconcile together with one fresh fetch before
 retry decides what remains. New unrelated work waits for another publication.
 Completed publications stay immutable; later work may extend or conclude the
@@ -428,6 +437,16 @@ on HEAD normally contracts to original base and commented version. Replies/Done 
 threads; new roots and file-viewed marks require current code. PR-wide comments
 retain code.
 :Review context still opens original code explicitly in its auxiliary tab.
+
+Long-running publication, PR fetching and Git preparation show one updating
+command-line progress message. Counts are per phase and include confirmed work
+on publication retries. Publication remains active through its final refresh.
+Background and stale requests do not replace foreground progress.
+
+CLI callers receive newline-delimited JSON progress on stderr, alongside ordinary
+error diagnostics. Records have event="progress", stage, message, and optional
+completed/total counts. Stdout retains the final response. Progress is ephemeral;
+it adds no SQLite state and cannot change publication results.
 
 Git supplies file contents directly; SQLite retains snapshots, anchors and
 receipts. Confirmed receipts preserve your exact original comparisons across

@@ -36,6 +36,8 @@ def comment(identity, body):
 
 if sys.argv[1] == "reviews":
     pending = read("pending-review.json", None)
+    if case == "comment_resource_submitted" and (root / "resource-failed").exists():
+        (root / "submitted-during-read").touch()
     if case == "pending_reuse":
         pending = dict(id=900, node_id="R900", commit_id="old-head", state="PENDING", user=dict(id=7, login="reviewer"))
     print(json.dumps([[pending] if pending else []]))
@@ -53,6 +55,13 @@ if sys.argv[1] == "batch":
     fields = dict(re.findall(r"(op\d+)\s*:\s*(\w+)\s*\(", request["query"]))
     for alias, field in fields.items():
         value = request["variables"]["input" + alias[2:]]
+        resource_failure = case.startswith("comment_resource") and not (root / "resource-failed").exists()
+        if resource_failure and alias == "op7":
+            (root / "resource-failed").touch()
+            data[alias] = None
+            errors.append(dict(type="RESOURCE_LIMITS_EXCEEDED", path=[alias],
+                               message="Resource limits for this query exceeded."))
+            continue
         failure = None
         rejected = root / "rejected"
         progress = root / "progress"
@@ -117,6 +126,12 @@ if sys.argv[1] == "batch":
             write("batch-viewed.json", viewed)
         if case == "comment_unknown" and alias == "op1":
             payload.pop("thread", None)
+        if resource_failure and alias == "op6":
+            payload["thread"]["comments"] = None
+            if case == "comment_resource_node":
+                payload["thread"]["comments"] = dict(nodes=[dict(id="C999999")])
+            if case == "comment_resource_database":
+                payload["thread"]["comments"] = dict(nodes=[dict(databaseId=999999)])
         if case == "comment_internal" and alias == "op1":
             # The resolver failed after creating the comment. A root-level
             # error path is not proof that the mutation had no side effect.
@@ -182,7 +197,8 @@ for value in read("batch-comments.json", []):
                 commit=dict(oid="old-head"), originalCommit=dict(oid="old-head"),
                 pullRequestReview=dict(fullDatabaseId="100"), subjectType=value.get("subjectType", "LINE"),
                 replyTo=dict(fullDatabaseId=str(thread["comments"]["nodes"][0]["fullDatabaseId"])) if thread else None,
-                diffHunk="@@ -2 +2 @@", outdated=False, state="PENDING")
+                diffHunk="@@ -2 +2 @@", outdated=False,
+                state="SUBMITTED" if (root / "submitted-during-read").exists() else "PENDING")
     if thread:
         thread["comments"]["nodes"].append(node)
         thread["comments"]["totalCount"] += 1
@@ -194,8 +210,15 @@ for item in read_state.get("reviews", []):
     if identity:
         reviews.append(dict(id="R" + identity, fullDatabaseId=identity, body="Summary",
                             author=actor(), state="COMMENTED", submittedAt="2026-01-01T00:00:00Z", reactions=page([])))
+if case.startswith("comment_resource"):
+    pending = read("pending-review.json", None)
+    if pending:
+        reviews.append(dict(id=pending["node_id"], fullDatabaseId=str(pending["id"]), body="",
+                            author=dict(databaseId=pending["user"]["id"], login=pending["user"]["login"]),
+                            state="COMMENTED" if (root / "submitted-during-read").exists() else "PENDING",
+                            submittedAt=None, reactions=page([])))
 viewed = read("batch-viewed.json", {})
-files = [dict(path=item["path"], changeType="MODIFIED", viewerViewedState="VIEWED" if viewed.get(item["path"], True) else "UNVIEWED")
+files = [dict(path=item["path"], changeType="MODIFIED", viewerViewedState="VIEWED" if viewed.get(item["path"], not case.startswith("comment_resource")) else "UNVIEWED")
          for item in read_state.get("files", [dict(path="file.rs")])]
 head = (root / "remote-head").read_text().strip() if case == "uncertain_stale_viewed" else "old-head"
 if case == "uncertain_stale_viewed":

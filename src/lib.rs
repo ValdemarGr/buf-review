@@ -4,6 +4,7 @@ pub mod diff;
 pub mod github;
 pub mod log;
 pub mod model;
+mod progress;
 pub mod sessions;
 pub mod store;
 pub mod workspace;

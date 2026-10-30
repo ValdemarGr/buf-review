@@ -86,17 +86,21 @@ local function append(body, reader, window)
     assert(api.nvim_get_current_win() ~= window and api.nvim_win_get_buf(window) == reader, 'diff append replaced visible comparison pane')
   else assert(api.nvim_get_current_win() == window, 'reader append opened another pane') end
   assert(text() == body and vim.bo.filetype == 'markdown', 'a did not start inserting plain Markdown body')
-  local header = {}
+  local header_text = api.nvim_eval_statusline(vim.wo.winbar, { winid = api.nvim_get_current_win(), use_winbar = true, maxwidth = 10000 }).str
+  assert(header_text:find('src/file.rs', 1, true)
+    and header_text:find(require('buf_review.editor').get().target.kind == 'reply' and 'Reply:' or 'Comment:', 1, true),
+    'composer winbar lost target context')
   for _, namespace in pairs(api.nvim_get_namespaces()) do
     for _, mark in ipairs(api.nvim_buf_get_extmarks(0, namespace, 0, -1, { details = true })) do
-      for _, line in ipairs(mark[4].virt_lines or {}) do for _, chunk in ipairs(line) do header[#header + 1] = chunk[1] end end
+      assert(not mark[4].virt_lines and not mark[4].virt_text, 'composer retained virtual context')
     end
   end
-  local header_text = table.concat(header, '\n')
   assert(#header_text > 0 and not header_text:find('{', 1, true) and not header_text:find('target =', 1, true) and not header_text:find(revision.head, 1, true), 'comment header exposed target representation')
   input(':wq<CR>')
   wait(function() return api.nvim_get_current_buf() == reader end, 'wq did not return to original reader')
   assert(api.nvim_get_current_win() == window, 'wq closed append reader pane')
+  local returned_label = api.nvim_eval_statusline(vim.wo.winbar, { winid = window, use_winbar = true, maxwidth = 10000 }).str
+  assert(not returned_label:find('Comment:', 1, true) and not returned_label:find('Reply:', 1, true), 'composer winbar leaked into returned reader')
   if not comparison then reader_end() end
 end
 
@@ -145,6 +149,26 @@ assert(identity, 'first append write did not capture comment identity')
 api.nvim_buf_set_lines(0, 0, -1, false, { 'Saved twice' })
 vim.cmd('write')
 assert(require('buf_review.editor').get().comment == identity and #state().comments == 3, 'repeated append write duplicated creation')
+
+-- Context follows every composer view without becoming editable Markdown.
+local composing, composing_window = api.nvim_get_current_buf(), api.nvim_get_current_win()
+vim.cmd('split')
+local duplicate_window = api.nvim_get_current_win()
+require('buf_review.editor').get().status('Saved 100%\nlocally')
+for _, win in ipairs({ composing_window, duplicate_window }) do
+  local label = api.nvim_eval_statusline(vim.wo[win].winbar, { winid = win, use_winbar = true, maxwidth = 10000 }).str
+  assert(label:find('Saved 100%', 1, true) and label:find('locally', 1, true)
+    and not label:find('\n', 1, true) and not label:find('\r', 1, true), 'composer status was interpreted as winbar formatting or multiple lines')
+end
+api.nvim_win_set_buf(duplicate_window, list)
+local reader_label = api.nvim_eval_statusline(vim.wo[duplicate_window].winbar, { winid = duplicate_window, use_winbar = true, maxwidth = 10000 }).str
+assert(not reader_label:find('Saved 100', 1, true), 'composer status leaked into another buffer')
+api.nvim_win_set_buf(duplicate_window, composing)
+local reopened_label = api.nvim_eval_statusline(vim.wo[duplicate_window].winbar, { winid = duplicate_window, use_winbar = true, maxwidth = 10000 }).str
+assert(reopened_label:find('Saved 100%', 1, true) and text() == 'Saved twice' and not vim.bo.modified,
+  'reentering composer lost context or changed saved Markdown')
+api.nvim_win_close(duplicate_window, false)
+api.nvim_set_current_win(composing_window)
 input(':wq<CR>')
 wait(function() return api.nvim_get_current_buf() == list and text():find('Saved twice', 1, true) end, 'repeated write did not refresh returned reader')
 

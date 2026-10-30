@@ -310,9 +310,9 @@ can be created explicitly from a file row, including files without text hunks.
 ## Comment editing, suggestions and deletion
 
 All comment composers are ordinary Markdown buffers, with no protected prefix
-or special editable footer. Their read-only virtual context identifies target,
-revision, side/range and publication destination; metadata is
-not editable prose. A destination chosen for a draft stays fixed. Changing WIP
+or special editable footer. Target and status appear in the window winbar;
+the buffer contains only the Markdown body, without virtual headers.
+A destination chosen for a draft stays fixed. Changing WIP
 activity does not move existing drafts.
 
 | Operation | Result |
@@ -452,22 +452,32 @@ publication; never filter it out or bypass it with unrelated work.
 Persist a marker before each write and its confirmed result/provider identities
 before advancing. Successfully sent content is immutable immediately, even in
 an unsubmitted provider review. A failed publication retains its ID, ordered
-plan and confirmed prefix; retry sends only unapplied operations. Confirmed
+plan and all confirmed receipts; retry sends only unapplied operations. Confirmed
 failures permit editing unsent intent within that scope. Unknown results freeze
 the affected attempt until reconciliation, blocking later publication writes.
 No blind duplicate creation and no skip-ahead after errors.
 
-Adjacent compatible line-root creations use native bulk create-review. A final
-conclusion can be included when it immediately follows that group and ends the
-queue. Other operations split the group; existing pending reviews, file roots,
-replies and progress use supported sequential writes. Arbitrary GraphQL aliases
-are not atomic and can continue after individual errors, so they cannot replace
-strict stop-on-error sequencing.
+Group ready operations by family and dependency depth, then split each group into
+GraphQL requests containing at most eight aliased mutations. Replies wait for
+their parents' confirmed identities; the conclusion follows all other operations.
+Aliases execute serially without atomicity or rollback. Persist each request's
+in-flight marker before sending, and all confirmed receipts plus unresolved
+response evidence before advancing. Preserve successes after an individual alias
+fails, but stop later batches whenever the request has an error.
+
+Retain partial comment identities and GraphQL errors for reconciliation.
+Resource-limited unknown inline creates may recover only from the original
+pending review with the same reviewer and head, exact anchor and body. Exclude
+comments already in the baseline or claimed by receipts; require one unique
+exact match. An explicitly resource-rejected missing alias may retry only after
+a complete scoped read confirms absence. Ambiguous matches, incomplete reads and
+other unknown creates remain blocked rather than risking duplicate comments.
 
 Successful draft publication closes that publication while retaining the pending
 provider review identity for a later publication to extend or conclude. A
 completed publication and its results never reopen; new work gets a new ID.
-A provider-side review from another tool is not silently adopted or deleted.
+Reusing a matching pending review never deletes or claims its earlier comments
+as receipts for new local operations.
 Legacy identities, events, drafts, receipts and recovery data survive migration.
 
 Neovim waits for publication and a fresh subsequent fetch. Drain earlier
@@ -476,6 +486,16 @@ post-write refresh. Refresh after partial success without retrying writes.
 Report refresh failures separately, preserving all receipts and original errors.
 Ctrl-C interrupts waiting without canceling an already-started write; keep the
 publication guard until its result and refresh complete.
+
+Long-running CLI work emits newline-delimited JSON progress records on stderr:
+`event: progress`, `stage`, `message`, and optional `completed`/`total` phase counts.
+Stdout retains the final response; ordinary stderr diagnostics remain errors.
+Count confirmed publication operations only after durable receipts, including
+prior receipts on retries. Fetch/preparation reports phases and known counts,
+never a guessed overall percentage. Progress delivery cannot change publication
+or persist additional state. Neovim displays one updating command-line message
+until the whole foreground workflow, including post-publication refresh, finishes;
+background or stale requests cannot replace another foreground operation's message.
 
 ## Individual comment progress and navigation
 
@@ -907,7 +927,7 @@ The integration is complete only when these observable cases pass:
 7. `cc`/conclude queues one local conclusion event; Draft cancels its unsent
    value without changing history. All save/close paths remain
    local; only Publish writes. Draft and summary-only publications both work.
-8. Native batching, ordered stop-on-error, confirmed prefix receipts, unchanged
+8. Bounded alias batching, ordered stop-on-error, per-operation receipts, unchanged
    failed publication IDs, partial retries and uncertain reconciliation prevent
    duplicates and skip-ahead writes. Completed publications remain immutable.
 9. Checklist membership is fetched-only and individual, includes own fetched

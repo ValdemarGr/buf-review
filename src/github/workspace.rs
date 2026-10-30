@@ -458,6 +458,8 @@ struct Preparation {
     creating: Vec<Operation>,
     #[serde(default)]
     mappings: Vec<IdMapping>,
+    #[serde(default)]
+    failures: BTreeMap<String, Value>,
     inflight: Option<String>,
 }
 
@@ -779,6 +781,12 @@ fn send_level(
         .filter(|failure| failure.uncertain)
         .map(|failure| failure.operation.clone())
         .collect();
+    preparation.failures = outcome
+        .failures
+        .iter()
+        .filter(|failure| failure.uncertain)
+        .map(|failure| (failure.operation.id.clone(), failure.response.clone()))
+        .collect();
     preparation.inflight = (!preparation.creating.is_empty()).then(|| "operation batch".into());
     // Receipts and the remaining unknown-write marker become durable together.
     let mut actions = vec![Action::SetAttemptProvider {
@@ -970,6 +978,7 @@ pub fn publish_workspace(
     id: &str,
     generation: u64,
 ) -> Result<Workspace, WorkspacePublishError> {
+    crate::progress::report("publish_validate", "Checking publication", None);
     let _publication_lock = store.publication_lock()?;
     let result = publish_workspace_inner(store, id, generation);
     if let Err(error) = &result
@@ -993,7 +1002,47 @@ pub fn publish_workspace(
             },
         );
     }
+    crate::progress::report(
+        if result.is_ok() {
+            "publish_complete"
+        } else {
+            "publish_failed"
+        },
+        if result.is_ok() {
+            "Publication complete"
+        } else {
+            "Publication stopped"
+        },
+        None,
+    );
     result
+}
+
+fn publication_progress(workspace: &Workspace, operations: &[Operation], change: &Change) {
+    let (stage, message) = match change {
+        Change::CreateComment { .. } => ("publish_comments", "Comments"),
+        Change::SetFileViewed { .. } => ("publish_files", "Files"),
+        Change::SetCommentReaction { .. } => ("publish_reactions", "Reactions"),
+        Change::DismissReview { .. } => ("publish_dismissals", "Review dismissals"),
+        Change::SetReviewConclusion { .. } => ("publish_review", "Review conclusion"),
+        _ => return,
+    };
+    let confirmed = workspace
+        .results
+        .iter()
+        .map(|result| result.operation.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let family = std::mem::discriminant(change);
+    let (completed, total) = operations
+        .iter()
+        .filter(|operation| std::mem::discriminant(&operation.change) == family)
+        .fold((0, 0), |(completed, total), operation| {
+            (
+                completed + usize::from(confirmed.contains(operation.id.as_str())),
+                total + 1,
+            )
+        });
+    crate::progress::report(stage, message, Some((completed, total)));
 }
 
 fn publish_workspace_inner(
@@ -1013,6 +1062,7 @@ fn publish_workspace_inner(
     }
     let project = store.project_root().to_path_buf();
     let validated_head = workspace.comparison.head.clone();
+    crate::progress::report("publish_git", "Fetching Git refs", None);
     crate::diff::fetch_all(&project).map_err(|error| FetchError::Response(error.to_string()))?;
     let local_intent = store
         .pull_request(&workspace.review.read.pull_request.id)?
@@ -1021,6 +1071,7 @@ fn publish_workspace_inner(
         // Local intents validate the remote source head before creating a PR.
         None
     } else {
+        crate::progress::report("publish_validate", "Checking remote PR head", None);
         let backend = store
             .review_backend(&workspace.review.id)?
             .ok_or_else(|| unsupported("workspace lacks provider metadata"))?;
@@ -1050,6 +1101,7 @@ fn publish_workspace_inner(
                 remote_id: node.into(),
             })
     };
+    crate::progress::report("publish_prepare", "Preparing pull request", None);
     super::intent::resolve_pull_request(store, &project, &workspace)?;
     workspace = store
         .workspace(id)?
@@ -1100,6 +1152,11 @@ fn publish_workspace_inner(
     let operations = workspace.attempt.as_ref().unwrap().operations.clone();
     let mut backend = backend_for(store, &workspace, &preparation)?;
     if let Some(inflight) = preparation.inflight.clone() {
+        crate::progress::report(
+            "publish_reconcile",
+            "Reconciling previous publication",
+            None,
+        );
         if inflight == "operation batch" {
             let unknown = preparation
                 .creating
@@ -1111,74 +1168,121 @@ fn publish_workspace_inner(
                 .iter()
                 .any(|operation| matches!(operation.change, Change::CreateComment { .. }))
             {
-                return Err(unsupported("publication comment result uncertain; inspect provider comments before retry; no duplicate write sent").into());
-            }
-            let mut fresh =
-                fetch(&Url::parse(&backend.source.locator).map_err(|_| FetchError::InvalidUrl)?)?;
-            canonicalize_fetched(&mut fresh, &backend);
-            if fresh.reviewer.id != workspace.review.reviewer.id {
-                return Err(
-                    unsupported("authenticated reviewer changed during reconciliation").into(),
-                );
-            }
-            let mut reconciled = Vec::new();
-            for operation in unknown {
-                let applied = match &operation.change {
-                    Change::SetFileViewed { path, viewed, .. } => fresh
-                        .read
-                        .files
-                        .iter()
-                        .any(|file| file.path == *path && file.viewed == *viewed),
-                    Change::SetCommentReaction {
-                        comment,
-                        reaction,
-                        present,
-                    } => {
-                        fresh.read.reactions.iter().any(|item| {
-                            item.comment == *comment
-                                && item.author.as_ref() == Some(&workspace.review.reviewer.id)
-                                && item.reaction == *reaction
-                        }) == *present
-                    }
-                    Change::DismissReview { review, .. } => fresh.read.reviews.iter().any(|item| {
-                        item.id.as_ref() == Some(review)
-                            && matches!(
-                                item.state,
-                                ReadReviewState::Inactive {
-                                    state: InactiveReviewState::Dismissed,
-                                    ..
-                                }
-                            )
-                    }),
-                    _ => {
-                        return Err(unsupported(
-                            "uncertain batch contains an unsupported operation",
-                        )
-                        .into());
-                    }
-                };
-                if applied {
-                    reconciled.push(OperationResult {
-                        operation,
-                        mappings: vec![],
-                        response: json!({"reconciled":true}),
-                    });
+                let (reconciled, retryable) = super::recovery::comments(
+                    store,
+                    &workspace,
+                    &backend,
+                    preparation.pending.as_ref(),
+                    &unknown,
+                    &preparation.failures,
+                )?;
+                let resolved = reconciled
+                    .iter()
+                    .map(|result| result.operation.id.clone())
+                    .chain(retryable)
+                    .collect::<BTreeSet<_>>();
+                preparation.prepared.extend(reconciled.clone());
+                preparation.creating.retain(|operation| {
+                    !workspace.has_result(&operation.id) && !resolved.contains(&operation.id)
+                });
+                preparation
+                    .failures
+                    .retain(|operation, _| !resolved.contains(operation));
+                preparation.inflight =
+                    (!preparation.creating.is_empty()).then(|| "operation batch".into());
+                let actions = std::iter::once(Action::SetAttemptProvider {
+                    provider: serde_json::to_value(&preparation)
+                        .expect("provider preparation serializes"),
+                })
+                .chain(
+                    reconciled
+                        .into_iter()
+                        .map(|result| Action::RecordResult { result }),
+                )
+                .collect();
+                apply_publication_group(store, &mut workspace, actions)?;
+                if let Some(operation) = unknown.first() {
+                    publication_progress(&workspace, &operations, &operation.change);
                 }
+                if !preparation.creating.is_empty() {
+                    return Err(unsupported(
+                        "publication comment result uncertain; no duplicate write sent",
+                    )
+                    .into());
+                }
+            } else {
+                let mut fresh = fetch(
+                    &Url::parse(&backend.source.locator).map_err(|_| FetchError::InvalidUrl)?,
+                )?;
+                canonicalize_fetched(&mut fresh, &backend);
+                if fresh.reviewer.id != workspace.review.reviewer.id {
+                    return Err(unsupported(
+                        "authenticated reviewer changed during reconciliation",
+                    )
+                    .into());
+                }
+                let mut reconciled = Vec::new();
+                for operation in unknown {
+                    let applied = match &operation.change {
+                        Change::SetFileViewed { path, viewed, .. } => fresh
+                            .read
+                            .files
+                            .iter()
+                            .any(|file| file.path == *path && file.viewed == *viewed),
+                        Change::SetCommentReaction {
+                            comment,
+                            reaction,
+                            present,
+                        } => {
+                            fresh.read.reactions.iter().any(|item| {
+                                item.comment == *comment
+                                    && item.author.as_ref() == Some(&workspace.review.reviewer.id)
+                                    && item.reaction == *reaction
+                            }) == *present
+                        }
+                        Change::DismissReview { review, .. } => {
+                            fresh.read.reviews.iter().any(|item| {
+                                item.id.as_ref() == Some(review)
+                                    && matches!(
+                                        item.state,
+                                        ReadReviewState::Inactive {
+                                            state: InactiveReviewState::Dismissed,
+                                            ..
+                                        }
+                                    )
+                            })
+                        }
+                        _ => {
+                            return Err(unsupported(
+                                "uncertain batch contains an unsupported operation",
+                            )
+                            .into());
+                        }
+                    };
+                    if applied {
+                        reconciled.push(OperationResult {
+                            operation,
+                            mappings: vec![],
+                            response: json!({"reconciled":true}),
+                        });
+                    }
+                }
+                preparation.prepared.extend(reconciled.clone());
+                preparation.creating.clear();
+                preparation.failures.clear();
+                preparation.inflight = None;
+                let actions = std::iter::once(Action::SetAttemptProvider {
+                    provider: serde_json::to_value(&preparation)
+                        .expect("provider preparation serializes"),
+                })
+                .chain(
+                    reconciled
+                        .into_iter()
+                        .map(|result| Action::RecordResult { result }),
+                )
+                .collect();
+                apply_publication_group(store, &mut workspace, actions)?;
             }
-            preparation.prepared.extend(reconciled.clone());
-            preparation.creating.clear();
-            preparation.inflight = None;
-            let actions = std::iter::once(Action::SetAttemptProvider {
-                provider: serde_json::to_value(&preparation)
-                    .expect("provider preparation serializes"),
-            })
-            .chain(
-                reconciled
-                    .into_iter()
-                    .map(|result| Action::RecordResult { result }),
-            )
-            .collect();
-            apply_publication_group(store, &mut workspace, actions)?;
         } else if inflight == "submit" {
             let pending = preparation.pending.as_ref().ok_or_else(|| {
                 unsupported("uncertain submission lacks prepared review identity")
@@ -1210,6 +1314,11 @@ fn publish_workspace_inner(
                 }
                 preparation.submitted = true;
                 record_submission(store, &mut workspace, &preparation, &response)?;
+                if let Some(operation) = operations.iter().find(|operation| {
+                    matches!(operation.change, Change::SetReviewConclusion { .. })
+                }) {
+                    publication_progress(&workspace, &operations, &operation.change);
+                }
             }
             preparation.inflight = None;
             save_preparation(store, &mut workspace, &preparation)?;
@@ -1317,6 +1426,7 @@ fn publish_workspace_inner(
         )
     });
     if needs_review {
+        crate::progress::report("publish_prepare", "Preparing GitHub review", None);
         let existing: Vec<Value> = list(&format!("{}/reviews?per_page=100", endpoint(&backend)?))?;
         let user = backend
             .mappings
@@ -1420,6 +1530,7 @@ fn publish_workspace_inner(
         }) = level.first()
         {
             let operation = level[0].clone();
+            publication_progress(&workspace, &operations, &operation.change);
             let pending = preparation
                 .pending
                 .as_ref()
@@ -1449,6 +1560,7 @@ fn publish_workspace_inner(
                             Action::RecordResult { result },
                         ],
                     )?;
+                    publication_progress(&workspace, &operations, &level[0].change);
                 }
                 Err(error) => {
                     fail_attempt(store, &mut workspace, &mut preparation, &error)?;
@@ -1456,15 +1568,20 @@ fn publish_workspace_inner(
                 }
             }
         } else {
-            send_level(
-                store,
-                &mut workspace,
-                &mut preparation,
-                &mut backend,
-                &level,
-                &roots,
-                &mut pull_request_mapping,
-            )?;
+            for chunk in level.chunks(super::batch::MAX_OPERATIONS) {
+                publication_progress(&workspace, &operations, &chunk[0].change);
+                let sent = send_level(
+                    store,
+                    &mut workspace,
+                    &mut preparation,
+                    &mut backend,
+                    chunk,
+                    &roots,
+                    &mut pull_request_mapping,
+                );
+                publication_progress(&workspace, &operations, &chunk[0].change);
+                sent?;
+            }
         }
     }
     apply_publication(

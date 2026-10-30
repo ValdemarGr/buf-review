@@ -73,8 +73,12 @@ fn pages<T: DeserializeOwned>(
     mut variables: Value,
     pointer: &str,
     key: impl Fn(&T) -> String,
+    progress: Option<(&str, &str)>,
 ) -> Result<Vec<T>, FetchError> {
     let total = page.total_count;
+    if let Some((stage, message)) = progress {
+        crate::progress::report(stage, message, Some((0, total)));
+    }
     let mut nodes = Vec::new();
     let mut identities = BTreeSet::new();
     let mut cursors = BTreeSet::new();
@@ -95,13 +99,24 @@ fn pages<T: DeserializeOwned>(
             }
             nodes.push(node);
         }
+        if nodes.len() > total {
+            return Err(FetchError::Response(
+                "GraphQL connection pagination incomplete".into(),
+            ));
+        }
         if !page.page_info.has_next_page {
             if nodes.len() != total {
                 return Err(FetchError::Response(
                     "GraphQL connection pagination incomplete".into(),
                 ));
             }
+            if let Some((stage, message)) = progress {
+                crate::progress::report(stage, message, Some((nodes.len(), total)));
+            }
             return Ok(nodes);
+        }
+        if let Some((stage, message)) = progress {
+            crate::progress::report(stage, message, Some((nodes.len(), total)));
         }
         let cursor = page
             .page_info
@@ -279,6 +294,9 @@ fn reactions(
     identities: &mut Identities,
     values: &mut Vec<CommentReaction>,
 ) -> Result<(), FetchError> {
+    if page.page_info.has_next_page {
+        crate::progress::report("fetch_reactions", "Fetching reactions", None);
+    }
     let query = "query CommentReactions($id:ID!,$cursor:String){node(id:$id){... on Reactable{reactions(first:100,after:$cursor){...ReactionPage}}}}";
     for reaction in pages(
         page,
@@ -286,6 +304,7 @@ fn reactions(
         json!({"id":node}),
         "/node/reactions",
         |reaction| reaction.id.clone(),
+        None,
     )? {
         let value = match reaction.content.as_str() {
             "THUMBS_UP" => "👍",
@@ -311,6 +330,7 @@ fn reactions(
 }
 
 pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
+    crate::progress::report("fetch_pr", "Fetching PR", None);
     let variables = json!({"owner":address.owner,"name":address.repo,"number":address.number});
     let query = "query ReviewSnapshot($owner:String!,$name:String!,$number:Int!){viewer{login databaseId} repository(owner:$owner,name:$name){pullRequest(number:$number){id fullDatabaseId title body author{...ActorIdentity} state baseRefOid headRefOid headRefName baseRefName headRepository{url} changedFiles files(first:100){...FilePage} comments(first:100){...IssueCommentPage} reviews(first:50){...ReviewPage} reviewThreads(first:50){...ThreadPage}}}}";
     let snapshot: Snapshot = serde_json::from_value(response(query, variables.clone())?)?;
@@ -337,7 +357,9 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
         variables.clone(),
         "/repository/pullRequest/files",
         |file| file.path.clone(),
+        Some(("fetch_files", "Files")),
     )?;
+    crate::progress::report("fetch_file_stats", "Fetching file stats", None);
     let rest_files: Vec<RestFile> = list(&format!("{endpoint}/files?per_page=100"))?;
     let mut viewed = files
         .into_iter()
@@ -403,12 +425,18 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    crate::progress::report(
+        "fetch_file_stats",
+        "File stats",
+        Some((files.len(), pull.changed_files)),
+    );
     let issue_comments = pages(
         pull.comments,
         &pull_page("comments", "IssueCommentPage"),
         variables.clone(),
         "/repository/pullRequest/comments",
         |comment| comment.id.clone(),
+        Some(("fetch_comments", "PR comments")),
     )?;
     let threads = pages(
         pull.review_threads,
@@ -416,6 +444,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
         variables.clone(),
         "/repository/pullRequest/reviewThreads",
         |thread| thread.id.clone(),
+        Some(("fetch_threads", "Threads")),
     )?;
     let reviews = pages(
         pull.reviews,
@@ -423,6 +452,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
         variables,
         "/repository/pullRequest/reviews",
         |review| review.id.clone(),
+        Some(("fetch_reviews", "Reviews")),
     )?;
     let mut identities = Identities::default();
     let reviewer = snapshot.viewer.user(&mut identities)?;
@@ -453,6 +483,9 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
         });
     }
     for thread in threads {
+        if thread.comments.page_info.has_next_page {
+            crate::progress::report("fetch_thread_comments", "Fetching thread comments", None);
+        }
         let query = "query ThreadComments($id:ID!,$cursor:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$cursor){...ReviewCommentPage}}}}";
         for inline in pages(
             thread.comments,
@@ -460,6 +493,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
             json!({"id":thread.id}),
             "/node/comments",
             |comment| comment.comment.id.clone(),
+            None,
         )? {
             let draft = match inline.state.as_str() {
                 "PENDING" => true,
@@ -669,6 +703,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
             })
         })
         .collect::<Result<Vec<_>, FetchError>>()?;
+    crate::progress::report("fetch_verify", "Verifying PR revision", None);
     let latest: RestPullRequest = api(&endpoint, &["--method", "GET"])?;
     if latest.base.sha != revision.base
         || latest.head.sha != revision.head
@@ -700,7 +735,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
                 branch,
             },
         });
-    Ok(FetchedReview {
+    let fetched = FetchedReview {
         reviewer,
         read: ReadState {
             pull_request: PullRequest {
@@ -731,5 +766,7 @@ pub(super) fn fetch(address: &Address) -> Result<FetchedReview, FetchError> {
             },
             mappings: identities.0.into_values().collect(),
         },
-    })
+    };
+    crate::progress::report("fetch_pr", "PR fetched", Some((1, 1)));
+    Ok(fetched)
 }

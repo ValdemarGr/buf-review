@@ -107,6 +107,7 @@ pub fn run(directory: &Path, request: Value) -> Result<Value> {
         .to_owned();
     if op == "list" {
         let query: Listing = serde_json::from_value(request)?;
+        crate::progress::report("fetch_prs", "Fetching pull requests", None);
         let repository = github::repository()?;
         let assignee = query.assignee.as_deref().filter(|s| *s != "all");
         return Ok(
@@ -118,6 +119,7 @@ pub fn run(directory: &Path, request: Value) -> Result<Value> {
         let base = request["base"]
             .as_str()
             .ok_or_else(|| io::Error::other("Review pr requires a base branch"))?;
+        crate::progress::report("fetch_prs", "Finding pull request", None);
         let branches = github::pr_branches(&project, base)?;
         if let Some(url) = github::matching_pr_url(&branches)? {
             if let Some(intent) = store.intent_for_branches(&branches)?
@@ -151,6 +153,7 @@ pub fn run(directory: &Path, request: Value) -> Result<Value> {
         }));
     }
     if op == "entry" {
+        crate::progress::report("fetch_prs", "Finding pull request", None);
         let pulls = github::branch_pull_requests(&project)?;
         return if pulls.len() == 1 {
             route_pr(&mut store, &pulls[0].url, None)

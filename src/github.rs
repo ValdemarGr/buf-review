@@ -18,6 +18,7 @@ pub(crate) mod batch;
 mod batch_ids;
 mod intent;
 mod publish;
+mod recovery;
 mod snapshot;
 mod workspace;
 pub use intent::*;

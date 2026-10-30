@@ -156,7 +156,10 @@ fn fetched_id(output: Output) -> ReviewId {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
+    for line in String::from_utf8(output.stderr).unwrap().lines() {
+        let progress: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(progress["event"], "progress");
+    }
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1);
     Uuid::parse_str(stdout.trim()).unwrap();
@@ -510,9 +513,79 @@ fn late_request_failure_leaves_existing_snapshot_and_mappings_unchanged() {
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
     assert!(String::from_utf8_lossy(&failed.stderr).contains("Fixture request failed: pr"));
+    let progress = String::from_utf8_lossy(&failed.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(progress.last().unwrap()["stage"], "fetch_verify");
+    assert!(
+        !progress
+            .iter()
+            .any(|event| event["message"] == "PR fetched")
+    );
     assert_eq!(store.review_ids().unwrap(), vec![id.clone()]);
     assert_eq!(store.get_review(&id).unwrap(), snapshot);
     assert_eq!(store.review_backend(&id).unwrap(), backend);
+}
+
+#[test]
+fn fetch_progress_reports_actual_page_counts_without_polluting_stdout() {
+    let fake = FakeGh::new();
+    let output = fake.fetch(URL, None);
+    let events = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["stage"], "fetch_pr");
+    assert!(events[0].get("total").is_none());
+    let files = events
+        .iter()
+        .filter(|event| event["stage"] == "fetch_files")
+        .map(|event| json!([event["completed"], event["total"]]))
+        .collect::<Vec<_>>();
+    assert_eq!(files, vec![json!([0, 2]), json!([1, 2]), json!([2, 2])]);
+    for (stage, total) in [
+        ("fetch_file_stats", 2),
+        ("fetch_comments", 1),
+        ("fetch_threads", 2),
+        ("fetch_reviews", 3),
+    ] {
+        let complete = events
+            .iter()
+            .rev()
+            .find(|event| event["stage"] == stage)
+            .unwrap();
+        assert_eq!(complete["completed"], total);
+        assert_eq!(complete["total"], total);
+    }
+    let complete = events.last().unwrap();
+    assert_eq!(complete["stage"], "fetch_pr");
+    assert_eq!(complete["completed"], 1);
+    assert_eq!(complete["total"], 1);
+    fetched_id(output);
+}
+
+#[test]
+fn malformed_page_never_reports_more_items_than_its_total() {
+    let fake = FakeGh::new();
+    let mut snapshot = fake.read("snapshot");
+    snapshot["data"]["repository"]["pullRequest"]["files"]["totalCount"] = json!(0);
+    fake.write("snapshot", snapshot);
+    let failed = fake.fetch(URL, None);
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    let events = String::from_utf8_lossy(&failed.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    assert!(events.iter().all(|event| {
+        event["completed"]
+            .as_u64()
+            .zip(event["total"].as_u64())
+            .is_none_or(|(completed, total)| completed <= total)
+    }));
+    assert!(!events.iter().any(|event| event["message"] == "PR fetched"));
+    fake.assert_no_store();
 }
 
 #[test]

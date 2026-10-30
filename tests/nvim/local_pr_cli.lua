@@ -95,8 +95,10 @@ local function active()
   return view
 end
 local function home()
+  local expected_head = git('rev-parse', 'HEAD'):sub(1, 10)
   vim.cmd('Review')
-  wait(function() return kind() == 'home' end, 'Local overview missing')
+  wait(function() return kind() == 'home' and text():find('HEAD ' .. expected_head, 1, true)
+    and text():find('Code: ready', 1, true) end, 'Current local overview missing')
 end
 local function draft(view)
   for _, value in ipairs(view.comments) do

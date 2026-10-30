@@ -408,7 +408,10 @@ impl Store {
                 (&review, &backend.source.backend, &backend.source.locator),
             )?;
             for mapping in &backend.mappings {
-                let core = if mapping.resource == "pull_request" {
+                let core = if matches!(
+                    mapping.resource.as_str(),
+                    "pull_request" | "pull_request_node"
+                ) {
                     &id.0
                 } else {
                     &mapping.core_id
@@ -787,7 +790,10 @@ impl Store {
         Self::write_pr(&transaction, &object)?;
         read.pull_request.id = object.id.clone();
         for mapping in &mut backend.mappings {
-            if mapping.resource == "pull_request" {
+            if matches!(
+                mapping.resource.as_str(),
+                "pull_request" | "pull_request_node"
+            ) {
                 mapping.core_id = object.id.0.clone();
             }
         }

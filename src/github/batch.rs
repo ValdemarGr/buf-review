@@ -1,4 +1,4 @@
-//! One GraphQL request for an independent, ready publication level.
+//! One bounded GraphQL request for independent, ready publication operations.
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -9,10 +9,13 @@ use crate::{
     store::{IdMapping, OperationResult},
 };
 
+pub(super) const MAX_OPERATIONS: usize = 8;
+
 pub struct BatchFailure {
     pub operation: Operation,
     pub error: String,
     pub uncertain: bool,
+    pub response: Value,
 }
 
 #[derive(Default)]
@@ -274,6 +277,13 @@ fn outcome(operations: &[Operation], response: &Value) -> BatchOutcome {
                 error.pointer("/path/0").and_then(Value::as_str) == Some(alias.as_str())
             })
             .collect::<Vec<_>>();
+        let evidence = json!({
+            "data": {(alias.clone()): payload},
+            "errors": errors.iter().filter(|error| {
+                error.pointer("/path/0").and_then(Value::as_str)
+                    .is_none_or(|path| path == alias)
+            }).collect::<Vec<_>>()
+        });
         if let Some(payload) = payload {
             let confirmed = payload.get("clientMutationId").and_then(Value::as_str)
                 == Some(operation.id.as_str());
@@ -299,6 +309,7 @@ fn outcome(operations: &[Operation], response: &Value) -> BatchOutcome {
                 operation: operation.clone(),
                 error,
                 uncertain: true,
+                response: evidence,
             });
         } else {
             outcome.failures.push(BatchFailure {
@@ -319,6 +330,7 @@ fn outcome(operations: &[Operation], response: &Value) -> BatchOutcome {
                                 .and_then(Value::as_array)
                                 .is_some_and(|path| path.len() == 1)
                     }),
+                response: evidence,
             });
         }
     }
@@ -335,6 +347,11 @@ pub fn send(
 ) -> Result<BatchOutcome, PublishError> {
     if operations.is_empty() {
         return Ok(BatchOutcome::default());
+    }
+    if operations.len() > MAX_OPERATIONS {
+        return Err(PublishError::Unsupported(format!(
+            "publication batch exceeds {MAX_OPERATIONS} operations"
+        )));
     }
     if backend.source.backend != "github" {
         return Err(PublishError::Unsupported(
@@ -393,6 +410,7 @@ pub fn send(
                     operation: operation.clone(),
                     error: error.to_string(),
                     uncertain: !super::workspace::confirmed_rejection(&error),
+                    response: Value::Null,
                 })
                 .collect(),
         }),
@@ -624,6 +642,35 @@ mod tests {
     }
 
     #[test]
+    fn resource_exhaustion_retains_partial_identities_without_allowing_blind_retry() {
+        let operations = [root("confirmed"), root("partial"), root("limited")];
+        let partial = json!({"clientMutationId":"partial","thread":{"id":"T2","comments":null}});
+        let field_error = json!({"path":["op1","thread","comments"],"type":"RESOURCE_LIMITS_EXCEEDED","message":"Read interrupted after write"});
+        let mutation_error = json!({"path":["op2"],"type":"RESOURCE_LIMITS_EXCEEDED","message":"Resource limits for this query exceeded."});
+        let result = outcome(
+            &operations,
+            &json!({"data":{
+                "op0":{"clientMutationId":"confirmed","thread":{"id":"T1","comments":{"nodes":[{"id":"C1","fullDatabaseId":"11"}]}}},
+                "op1":partial,"op2":null
+            },"errors":[field_error,mutation_error]}),
+        );
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].operation, operations[0]);
+        assert_eq!(result.failures.len(), 2);
+        assert!(result.failures.iter().all(|failure| failure.uncertain));
+        assert_eq!(result.failures[0].operation, operations[1]);
+        assert_eq!(
+            result.failures[0].response,
+            json!({"data":{"op1":partial},"errors":[field_error]})
+        );
+        assert_eq!(result.failures[1].operation, operations[2]);
+        assert_eq!(
+            result.failures[1].response,
+            json!({"data":{"op2":null},"errors":[mutation_error]})
+        );
+    }
+
+    #[test]
     fn created_receipts_retain_comment_nodes_and_only_root_thread_mappings() {
         let operations = [
             root("root"),
@@ -658,6 +705,24 @@ mod tests {
         let (review, mut backend, pending) = fixture();
         backend.mappings.clear();
         assert!(send(&review, &backend, Some(&pending), &[viewed("viewed")]).is_err());
+    }
+
+    #[test]
+    fn oversized_batch_rejected_before_request_preparation() {
+        let (review, mut backend, pending) = fixture();
+        backend.mappings.clear();
+        let operations = (0..=MAX_OPERATIONS)
+            .map(|index| viewed(&format!("viewed-{index}")))
+            .collect::<Vec<_>>();
+        let error = send(&review, &backend, Some(&pending), &operations)
+            .err()
+            .expect("oversized request must fail before preparing any mutation");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cannot publish to GitHub: publication batch exceeds {MAX_OPERATIONS} operations"
+            )
+        );
     }
 
     #[test]
@@ -733,6 +798,12 @@ mod tests {
             assert!(result.results.is_empty());
             assert_eq!(result.failures.len(), 2);
             assert!(result.failures.iter().all(|failure| failure.uncertain));
+            assert!(
+                result
+                    .failures
+                    .iter()
+                    .all(|failure| failure.response.is_null())
+            );
         }
     }
 }
