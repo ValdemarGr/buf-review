@@ -384,6 +384,68 @@ fn code_returns_last_viewed_content_only_after_that_file_changes() {
 }
 
 #[test]
+fn marking_an_already_viewed_file_records_each_head_for_later_diff() {
+    let (root, mut store, workspace, base, first_head) = fixture();
+    let mut read = snapshot(root.path(), &base, &first_head);
+    read.files
+        .iter_mut()
+        .find(|file| file.path == "a")
+        .unwrap()
+        .viewed = true;
+    let review = ReviewId("remote-viewed".into());
+    store
+        .create_review(&review, &workspace.review.reviewer, &read)
+        .unwrap();
+    let workspace = store
+        .refresh_workspace(&workspace.id, workspace.generation, &review)
+        .unwrap();
+    let workspace = mark(&mut store, workspace, "a");
+    assert_eq!(workspace.batch.write.events.len(), 1);
+    assert!(matches!(&workspace.batch.write.events[0].event,
+        Event::SetFileViewed { viewed: true, commit: Some(commit), .. } if commit == &first_head));
+    assert!(workspace.publication_plan().unwrap().operations.is_empty());
+
+    let next_head = commit(root.path(), "a", "new\n", "New A");
+    let workspace = store.prepare_worktree(&workspace.id).unwrap();
+    assert!(
+        workspace
+            .projected()
+            .unwrap()
+            .files
+            .iter()
+            .find(|file| file.path == "a")
+            .unwrap()
+            .viewed
+    );
+    assert_eq!(
+        buf_review::context::code(root.path(), &workspace, "a").unwrap()["last_viewed"]["commit"],
+        first_head
+    );
+    let workspace = mark(&mut store, workspace, "a");
+    let workspace = mark(&mut store, workspace, "a");
+    assert_eq!(workspace.batch.write.events.len(), 3);
+    assert_ne!(
+        workspace.batch.write.events[1].id,
+        workspace.batch.write.events[2].id
+    );
+    assert!(workspace.batch.write.events[1..].iter().all(|record|
+        matches!(&record.event, Event::SetFileViewed { viewed: true, commit: Some(commit), .. } if commit == &next_head)));
+    assert!(workspace.publication_plan().unwrap().operations.is_empty());
+    assert!(
+        buf_review::context::code(root.path(), &workspace, "a").unwrap()["last_viewed"].is_null()
+    );
+
+    commit(root.path(), "a", "newer\n", "Newer A");
+    let id = workspace.id;
+    drop(store);
+    let mut store = Store::open(root.path()).unwrap();
+    let workspace = store.prepare_worktree(&id).unwrap();
+    let code = buf_review::context::code(root.path(), &workspace, "a").unwrap();
+    assert_eq!(code["last_viewed"]["commit"], next_head);
+    assert_eq!(code["last_viewed"]["content"], "new\n");
+}
+
+#[test]
 fn last_viewed_follows_latest_intent_including_net_zero_marks() {
     let (root, mut store, workspace, base, _) = fixture();
     let workspace = mark(&mut store, workspace, "a");

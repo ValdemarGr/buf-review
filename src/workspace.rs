@@ -1216,7 +1216,7 @@ impl Workspace {
                     .into_iter()
                     .find(|f| f.path == path)
                     .ok_or_else(|| CoreError::MissingFile(path.clone()))?;
-                if previous.viewed != viewed {
+                if viewed || previous.viewed != viewed {
                     let event = Event::SetFileViewed {
                         path,
                         viewed,
