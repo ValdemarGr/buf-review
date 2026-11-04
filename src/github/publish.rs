@@ -144,10 +144,10 @@ pub fn preflight(
                 }
             }
             Change::SetReviewConclusion { conclusion } => {
-                if conclusion.outcome != ReviewOutcome::Approve {
+                if conclusion.outcome == ReviewOutcome::Comment {
                     nonempty(
                         conclusion.body.as_deref().unwrap_or_default(),
-                        "COMMENT and REQUEST_CHANGES review body",
+                        "COMMENT review body",
                     )?;
                 }
             }

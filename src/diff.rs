@@ -412,6 +412,32 @@ pub fn files(project_root: &Path, revision: &DiffRevision) -> Result<Vec<Changed
     Ok(files.into_values().collect())
 }
 
+/// List committed file paths without consulting the index or working tree.
+pub fn tree_paths(project_root: &Path, revision: &str) -> Result<BTreeSet<String>, DiffError> {
+    let commit = resolve(project_root, revision)?;
+    let output = checked(
+        Command::new("git")
+            .current_dir(project_root)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args([
+                "--literal-pathspecs",
+                "ls-tree",
+                "--full-tree",
+                "--name-only",
+                "-r",
+                "-z",
+                &commit,
+            ])
+            .output()?,
+    )?;
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
+}
+
 /// Reads a literal file from an available commit. Absence is distinct from a
 /// missing commit or Git error; neither case consults the working tree.
 pub fn contents(

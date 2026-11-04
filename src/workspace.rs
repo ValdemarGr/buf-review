@@ -1602,14 +1602,14 @@ impl Workspace {
                 ));
             }
             if let Event::SetReviewConclusion { conclusion } = &operation.change
-                && conclusion.outcome != ReviewOutcome::Approve
+                && conclusion.outcome == ReviewOutcome::Comment
                 && conclusion
                     .body
                     .as_ref()
                     .is_none_or(|body| body.trim().is_empty())
             {
                 return Err(WorkspaceError::Invalid(
-                    "Comment and Request changes require a nonblank summary".into(),
+                    "Comment requires a nonblank summary".into(),
                 ));
             }
         }

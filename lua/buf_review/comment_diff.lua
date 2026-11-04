@@ -22,18 +22,18 @@ function M.window(win, active)
   end
 end
 
-function M.sides(code)
-  local original = code.original_base
-  local same_original = original and original.content == code.base_content
-    and (original.missing == true) == (code.base_missing == true)
-  local same_head = code.base_content == code.head_content
-    and (code.base_missing == true) == (code.head_missing == true)
+function M.sides(versions)
+  local original, middle, head = versions.base, versions.middle, versions.right
+  local same_original = original and original.content == middle.content
+    and (original.missing == true) == (middle.missing == true)
+  local same_head = middle.content == head.content
+    and (middle.missing == true) == (head.missing == true)
   return original and not same_original, not same_head
 end
 
-function M.highlight(buf, code, working_text)
+function M.highlight(buf, versions, binary, working_text)
   api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
-  if not code.historical or code.binary then return end
+  if binary then return end
   local function mark(hunks, offset, group, priority)
     for _, hunk in ipairs(hunks) do
       for line = hunk[offset], hunk[offset] + hunk[offset + 1] - 1 do
@@ -45,10 +45,10 @@ function M.highlight(buf, code, working_text)
       end
     end
   end
-  if code.original_base then
-    mark(vim.diff(code.original_base.content, code.base_content, { result_type = 'indices' }), 3, 'BufReviewCommentAdded', 210)
+  if versions.base then
+    mark(vim.diff(versions.base.content, versions.middle.content, { result_type = 'indices' }), 3, 'BufReviewCommentAdded', 210)
   end
-  mark(vim.diff(code.base_content, working_text or code.head_content, { result_type = 'indices' }), 1, 'BufReviewCommentRemoved', 220)
+  mark(vim.diff(versions.middle.content, working_text or versions.right.content, { result_type = 'indices' }), 1, 'BufReviewCommentRemoved', 220)
 end
 
 return M

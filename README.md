@@ -122,6 +122,11 @@ their existing labels.
 Local viewed changes record their commit. Later commits touching that file make
 the mark ineffective for both display and publication; its saved event remains.
 Checking out the earlier commit and reopening restores the mark.
+Opening a file changed since its last recorded viewed mark shows target base,
+last-viewed version, and `HEAD`. Empty adjacent diffs contract. The last-viewed
+pane shows additions from the target in green and subsequent removals in red.
+Local edits still use the editable working file on the right. Opening this view
+does not change the saved mark.
 
 Overview file rows show `M +12 -3  path`: modified, added (`A`) or deleted (`D`),
 with added/removed line counts. Renames, copies and type changes use `M`.
@@ -160,8 +165,9 @@ panes: original base, commented version, and checked-out `HEAD`. Adjacent panes
 contract when their file diff is empty; the commented version and its anchor stay
 visible even when both surrounding panes contract. Different commit IDs alone do
 not require separate panes. A comment on `HEAD` normally needs only its original
-base and commented version. File navigation restores the ordinary base/`HEAD`
-comparison, using the editable local file on the right when it has local edits.
+base and commented version. File navigation shows base/`HEAD`, adding the last
+viewed version when the file changed since its recorded mark, and using the
+editable local file on the right when it has local edits.
 The commented version shows additions relative to its original base in green and
 lines removed toward checked-out `HEAD` in red. Red takes precedence when a
 line was both added and later removed. Replies use their root's original anchor;

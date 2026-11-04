@@ -2,7 +2,11 @@
 use crate::{diff, github, model::*, store::Store, workspace::Workspace};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, error::Error, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    path::Path,
+};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -415,14 +419,69 @@ pub fn code(project: &Path, workspace: &Workspace, path: &str) -> Result<Value> 
         project,
         &workspace.comparison.base,
         file.previous_path.as_deref().unwrap_or(path),
-    )?
-    .unwrap_or_default();
-    let head = diff::contents(project, &workspace.comparison.head, path)?.unwrap_or_default();
-    let binary = base.contains(&0)
-        || head.contains(&0)
-        || std::str::from_utf8(&base).is_err()
-        || std::str::from_utf8(&head).is_err();
-    let mut code = json!({"path":path,"revision":workspace.comparison,"base_content":String::from_utf8_lossy(&base),"head_content":String::from_utf8_lossy(&head),"binary":binary});
+    )?;
+    let head = diff::contents(project, &workspace.comparison.head, path)?;
+    let mut last_viewed = None;
+    let mut current_paths = None;
+    let mut previous_paths = BTreeMap::new();
+    for record in workspace.batch.write.events.iter().rev() {
+        let Event::SetFileViewed {
+            path: marked_path,
+            viewed,
+            commit: Some(commit),
+        } = &record.event
+        else {
+            continue;
+        };
+        if marked_path != path {
+            let paths = match current_paths {
+                Some(ref paths) => paths,
+                None => {
+                    current_paths.insert(diff::tree_paths(project, &workspace.comparison.head)?)
+                }
+            };
+            if paths.contains(marked_path) {
+                continue;
+            }
+            if let std::collections::btree_map::Entry::Vacant(entry) = previous_paths.entry(commit)
+            {
+                entry.insert(diff::renamed_path(
+                    project,
+                    &DiffRevision {
+                        base: commit.clone(),
+                        head: workspace.comparison.head.clone(),
+                    },
+                    path,
+                    DiffSide::Head,
+                )?);
+            }
+            if previous_paths[commit].as_deref() != Some(marked_path.as_str()) {
+                continue;
+            }
+        }
+        if *viewed {
+            let content = diff::contents(project, commit, marked_path)?;
+            if content != head {
+                last_viewed = Some((commit, marked_path, content));
+            }
+        }
+        break;
+    }
+    let base_bytes = base.as_deref().unwrap_or_default();
+    let head_bytes = head.as_deref().unwrap_or_default();
+    let binary = base_bytes.contains(&0)
+        || head_bytes.contains(&0)
+        || std::str::from_utf8(base_bytes).is_err()
+        || std::str::from_utf8(head_bytes).is_err()
+        || last_viewed.as_ref().is_some_and(|(_, _, content)| {
+            content.as_deref().is_some_and(|content| {
+                content.contains(&0) || std::str::from_utf8(content).is_err()
+            })
+        });
+    let mut code = json!({"path":path,"base_path":file.previous_path.as_deref().unwrap_or(path),"revision":workspace.comparison,"base_content":String::from_utf8_lossy(base_bytes),"head_content":String::from_utf8_lossy(head_bytes),"base_missing":base.is_none(),"head_missing":head.is_none(),"binary":binary});
+    if let Some((commit, path, content)) = last_viewed {
+        code["last_viewed"] = json!({"commit":commit,"path":path,"content":String::from_utf8_lossy(content.as_deref().unwrap_or_default()),"missing":content.is_none()});
+    }
     if workspace.worktree_context {
         code["local_path"] = json!(std::fs::canonicalize(project)?.join(path));
         code["local_dirty"] = json!(diff::local_changes(project, path)?);

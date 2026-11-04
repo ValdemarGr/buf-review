@@ -283,6 +283,9 @@ fn reverted_content_still_invalidates_local_viewed_mark() {
             .viewed
     );
     assert!(workspace.publication_plan().unwrap().operations.is_empty());
+    assert!(
+        buf_review::context::code(root.path(), &workspace, "a").unwrap()["last_viewed"].is_null()
+    );
 }
 
 #[test]
@@ -316,6 +319,9 @@ fn remote_viewed_flags_are_not_subject_to_local_filtering() {
             .viewed
     );
     assert!(workspace.pending().unwrap().operations.is_empty());
+    assert!(
+        buf_review::context::code(root.path(), &workspace, "a").unwrap()["last_viewed"].is_null()
+    );
 }
 
 #[test]
@@ -330,5 +336,161 @@ fn invalid_saved_comparison_does_not_mutate_workspace() {
     assert_eq!(
         serde_json::to_value(store.workspace(&workspace.id).unwrap().unwrap()).unwrap(),
         before
+    );
+}
+
+#[test]
+fn code_returns_last_viewed_content_only_after_that_file_changes() {
+    let (root, mut store, workspace, _, viewed_head) = fixture();
+    let workspace = mark(&mut store, workspace, "a");
+    let workspace = mark(&mut store, workspace, "b");
+    let recorded = workspace.batch.write.clone();
+    let unchanged = buf_review::context::code(root.path(), &workspace, "a").unwrap();
+    assert!(unchanged["last_viewed"].is_null());
+    let operation = workspace.publication_plan().unwrap().operations[0].clone();
+    store
+        .record_operation_result(
+            &workspace.batch.id,
+            &operation,
+            &[],
+            &json!({"confirmed":true}),
+        )
+        .unwrap();
+
+    let head = commit(root.path(), "a", "new\n", "New A");
+    let changed = workspace_cli::run(
+        root.path(),
+        json!({"op":"code", "workspace":workspace.id, "path":"a"}),
+    )
+    .unwrap();
+    assert_eq!(changed["code"]["revision"]["head"], head);
+    assert_eq!(changed["code"]["head_content"], "new\n");
+    assert_eq!(
+        changed["code"]["last_viewed"],
+        json!({
+            "commit":viewed_head, "path":"a", "content":"reviewed\n", "missing":false,
+        })
+    );
+    let other = workspace_cli::run(
+        root.path(),
+        json!({"op":"code", "workspace":workspace.id, "path":"b"}),
+    )
+    .unwrap();
+    assert!(other["code"]["last_viewed"].is_null());
+    assert_eq!(
+        store.workspace(&workspace.id).unwrap().unwrap().batch.write,
+        recorded
+    );
+}
+
+#[test]
+fn last_viewed_follows_latest_intent_including_net_zero_marks() {
+    let (root, mut store, workspace, base, _) = fixture();
+    let workspace = mark(&mut store, workspace, "a");
+    let workspace = store
+        .mutate_workspace(
+            &workspace.id,
+            workspace.generation,
+            Action::Viewed {
+                path: "a".into(),
+                viewed: false,
+            },
+        )
+        .unwrap();
+    let next = commit(root.path(), "a", "new\n", "New A");
+    let workspace = refresh(&mut store, workspace, root.path(), &base, &next, "second");
+    let workspace = store.prepare_worktree(&workspace.id).unwrap();
+    assert!(
+        buf_review::context::code(root.path(), &workspace, "a").unwrap()["last_viewed"].is_null()
+    );
+
+    let mut read = snapshot(root.path(), &base, &next);
+    read.files
+        .iter_mut()
+        .find(|file| file.path == "a")
+        .unwrap()
+        .viewed = true;
+    let review = ReviewId("remote-viewed".into());
+    store
+        .create_review(&review, &workspace.review.reviewer, &read)
+        .unwrap();
+    let workspace = store
+        .refresh_workspace(&workspace.id, workspace.generation, &review)
+        .unwrap();
+    // Returning to a viewed baseline cancels the publication change while still
+    // recording the commit explicitly seen by the user.
+    let workspace = store
+        .mutate_workspace(
+            &workspace.id,
+            workspace.generation,
+            Action::Viewed {
+                path: "a".into(),
+                viewed: false,
+            },
+        )
+        .unwrap();
+    let workspace = mark(&mut store, workspace, "a");
+    let record = workspace.batch.write.events.last().unwrap();
+    assert!(record.cancelled);
+    assert!(
+        matches!(&record.event, Event::SetFileViewed { viewed:true, commit:Some(commit), .. } if commit == &next)
+    );
+    commit(root.path(), "a", "newer\n", "Newer A");
+    let workspace = store.prepare_worktree(&workspace.id).unwrap();
+    let code = buf_review::context::code(root.path(), &workspace, "a").unwrap();
+    assert_eq!(code["last_viewed"]["commit"], next);
+    assert_eq!(code["last_viewed"]["content"], "new\n");
+}
+
+#[test]
+fn last_viewed_maps_renamed_paths_and_preserves_missing_versions() {
+    let (root, mut store, workspace, _, _) = fixture();
+    let viewed_head = commit(root.path(), "a", "one\ntwo\nthree\nfour\nfive\n", "Long A");
+    let workspace = store.prepare_worktree(&workspace.id).unwrap();
+    let workspace = mark(&mut store, workspace, "a");
+    git(root.path(), &["mv", "a", "renamed"]);
+    let renamed_head = commit(
+        root.path(),
+        "renamed",
+        "one\ntwo\nnew\nfour\nfive\n",
+        "Rename A",
+    );
+    let workspace = store.prepare_worktree(&workspace.id).unwrap();
+    let code = buf_review::context::code(root.path(), &workspace, "renamed").unwrap();
+    assert_eq!(code["base_path"], "renamed");
+    assert_eq!(code["base_missing"], true);
+    assert_eq!(
+        code["last_viewed"],
+        json!({
+            "commit":viewed_head, "path":"a", "content":"one\ntwo\nthree\nfour\nfive\n", "missing":false,
+        })
+    );
+
+    let workspace = mark(&mut store, workspace, "renamed");
+    git(root.path(), &["checkout", "--quiet", &viewed_head]);
+    let workspace = store.prepare_worktree(&workspace.id).unwrap();
+    let code = buf_review::context::code(root.path(), &workspace, "a").unwrap();
+    assert_eq!(code["last_viewed"]["commit"], renamed_head);
+    assert_eq!(code["last_viewed"]["path"], "renamed");
+    assert_eq!(
+        code["last_viewed"]["content"],
+        "one\ntwo\nnew\nfour\nfive\n"
+    );
+    git(root.path(), &["checkout", "--quiet", &renamed_head]);
+
+    git(root.path(), &["rm", "b"]);
+    git(root.path(), &["commit", "--quiet", "-m", "Delete B"]);
+    let deleted = git(root.path(), &["rev-parse", "HEAD"]);
+    let workspace = store.prepare_worktree(&workspace.id).unwrap();
+    let workspace = mark(&mut store, workspace, "b");
+    commit(root.path(), "b", "", "Empty B");
+    let workspace = store.prepare_worktree(&workspace.id).unwrap();
+    let code = buf_review::context::code(root.path(), &workspace, "b").unwrap();
+    assert_eq!(code["head_missing"], false);
+    assert_eq!(
+        code["last_viewed"],
+        json!({
+            "commit":deleted, "path":"b", "content":"", "missing":true,
+        })
     );
 }

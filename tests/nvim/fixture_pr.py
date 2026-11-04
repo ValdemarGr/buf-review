@@ -300,8 +300,8 @@ def mutate(request):
         conclusion = (view.get("wip") or {}).get("conclusion")
         if conclusion and (directory / "fail_submit").exists():
             response["error"] = "Fixture submission failed"
-        elif conclusion and conclusion["outcome"] != "approve" and not (conclusion.get("body") or "").strip():
-            response["error"] = "Comment and Request changes require a nonblank summary"
+        elif conclusion and conclusion["outcome"] == "comment" and not (conclusion.get("body") or "").strip():
+            response["error"] = "Comment requires a nonblank summary"
         else:
             published = directory / "published_pr.json"
             if published.exists():

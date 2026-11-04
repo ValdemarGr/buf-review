@@ -57,6 +57,33 @@ fn compares_commits_without_touching_dirty_worktree() {
 }
 
 #[test]
+fn committed_tree_paths_preserve_literal_names_and_ignore_local_changes() {
+    let project = tempdir().unwrap();
+    revisions(project.path());
+    let path = "directory/file\twith\nλ";
+    fs::create_dir(project.path().join("directory")).unwrap();
+    fs::write(project.path().join(path), "committed\n").unwrap();
+    git(project.path(), &["--literal-pathspecs", "add", path]);
+    git(project.path(), &["commit", "--quiet", "-m", "Literal tree"]);
+    let head = git(project.path(), &["rev-parse", "HEAD"]);
+    fs::remove_file(project.path().join(path)).unwrap();
+    fs::write(project.path().join("untracked"), "local\n").unwrap();
+    let paths = diff::tree_paths(project.path(), &head).unwrap();
+    assert_eq!(
+        paths,
+        ["file.rs", ":(glob)*", path]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert!(!project.path().join(path).exists());
+    assert_eq!(
+        fs::read_to_string(project.path().join("untracked")).unwrap(),
+        "local\n"
+    );
+}
+
+#[test]
 fn committed_file_metadata_preserves_renames_binary_files_and_line_counts() {
     let project = tempdir().unwrap();
     revisions(project.path());

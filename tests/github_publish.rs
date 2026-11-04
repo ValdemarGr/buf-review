@@ -418,18 +418,12 @@ fn authenticated_user_lookup_failure_leaves_plan_unpublished() {
 }
 
 #[test]
-fn github_requires_review_text_and_dismissal_reason_before_writes() {
+fn github_requires_comment_review_text_and_dismissal_reason_before_writes() {
     for invalid in [
         Event::SetReviewConclusion {
             conclusion: ReviewConclusion {
                 outcome: ReviewOutcome::Comment,
                 body: None,
-            },
-        },
-        Event::SetReviewConclusion {
-            conclusion: ReviewConclusion {
-                outcome: ReviewOutcome::RequestChanges,
-                body: Some(" \n".into()),
             },
         },
         Event::DismissReview {
@@ -445,6 +439,31 @@ fn github_requires_review_text_and_dismissal_reason_before_writes() {
         let error = preflight(project.path(), None).unwrap_err();
         assert!(error.contains("must be nonempty"));
         assert!(requests(project.path()).is_empty());
+    }
+}
+
+#[test]
+fn request_changes_allows_blank_summary_in_plan_and_provider_preflight() {
+    for body in [None, Some(String::new()), Some(" \n".into())] {
+        let project = fixture();
+        let conclusion = Event::SetReviewConclusion {
+            conclusion: ReviewConclusion {
+                outcome: ReviewOutcome::RequestChanges,
+                body,
+            },
+        };
+        seed_events(project.path(), std::slice::from_ref(&conclusion));
+        let store = Store::open(project.path()).unwrap();
+        let workspace = store.workspace("batch").unwrap().unwrap();
+        let plan = workspace.publication_plan().unwrap();
+        assert_eq!(plan.operations.len(), 1);
+        assert_eq!(plan.operations[0].change, conclusion);
+        preflight(project.path(), None).unwrap();
+        assert!(
+            requests(project.path())
+                .iter()
+                .all(|request| request["method"] == "GET")
+        );
     }
 }
 

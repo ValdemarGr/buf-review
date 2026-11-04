@@ -529,14 +529,14 @@ local function require_view(state)
 end
 
 local function render_file_winbar(buf, meta, view)
-  if meta.historical and not meta.comment_label then return end
+  if meta.historical and not meta.pane_label then return end
   local progress = ''
   if vim.deep_equal(meta.action_revision or meta.revision, view.comparison) then
     for _, file in ipairs(view.files) do
       if file.path == meta.path then progress = file.viewed and ' [viewed]' or ' [unviewed]'; break end
     end
   end
-  local title = meta.comment_label and (meta.comment_label .. progress)
+  local title = meta.pane_label and (meta.pane_label .. progress)
     or ('%s %s  %s%s'):format(meta.side == 'base' and 'Base' or 'Head', meta.revision[meta.side], meta.source_path, progress):gsub('%%', '%%%%')
   for _, win in ipairs(vim.fn.win_findbuf(buf)) do vim.wo[win].winbar = title end
 end
@@ -1475,12 +1475,12 @@ navigate = function(state, payload)
   client.request(state.root, payload, receive, progress.update)
 end
 
-local function immutable(state, path, side, revision, text, code)
+local function immutable(state, slot, path, side, revision, text, code)
   local lines = vim.split(text or '', '\n', { plain = true })
   if lines[#lines] == '' and #lines > 1 then table.remove(lines) end
-  local buf, meta = scratch(state, 'diff', path, lines, false, 'diff:' .. side)
+  local buf, meta = scratch(state, 'diff', path, lines, false, 'diff:' .. slot)
   meta.path, meta.side, meta.revision = path, side, revision
-  meta.comment_label = nil
+  meta.pane_label = nil
   meta.historical, meta.location, meta.root = code and code.historical, code and code.location, code and code.root
   meta.source_path = code and code.source_path or (side == 'base' and code and code.base_path or path)
   meta.source_lines = text == '' and 0 or #lines
@@ -1489,17 +1489,17 @@ local function immutable(state, path, side, revision, text, code)
   marker.historical, marker.provenance = meta.historical, meta.historical and code.provenance or nil
   marker.source_path = meta.source_path
   meta.action_revision, meta.action_side = nil, nil
-  if code and code.comment_role then
-    meta.comment_role = code.comment_role
-    marker.comment_role = code.comment_role
-    marker.missing = code.missing == true
+  meta.comment_role = code and code.comment_role
+  marker.comment_role = meta.comment_role
+  marker.missing = meta.historical and code.missing == true or nil
+  if meta.historical then
     local commit = side == 'head' and revision.head or revision.base
     if not code.missing then
       if commit == state.view.comparison.head then meta.action_side = 'head'
       elseif commit == state.view.comparison.base then meta.action_side = 'base' end
       if meta.action_side then meta.action_revision = state.view.comparison end
     end
-  else meta.comment_role, marker.comment_role, marker.missing = nil, nil, nil end
+  end
   vim.b[buf].buf_review = marker
   local ft = vim.filetype.match({ filename = meta.source_path })
   if ft then vim.bo[buf].filetype = ft end
@@ -1561,9 +1561,10 @@ show_diff = function(context, panes)
     end
   end
   state.diff_windows = {}
-  local comment_buf, working_buf
+  local middle_buf, working_buf
   for index, role in ipairs(roles) do
     local pane, win = panes[role], windows[index]
+    state.diff_windows[role] = win
     leave_diff(win)
     local buf
     if pane.kind == 'local' then
@@ -1574,22 +1575,20 @@ show_diff = function(context, panes)
       vim.wo[win].winbar = ('Working tree  %s'):format(code.path):gsub('%%', '%%%%')
     else
       local version = context.versions[role]
-      local side = role == 'right' and 'head' or (role == 'base' and code.historical and 'original_base' or 'base')
-      local revision = role == 'base' and code.historical and { base = pane.commit, head = code.revision.head } or code.revision
-      local data = vim.tbl_extend('force', {}, code, { source_path = pane.path, missing = version.missing, provenance = version.provenance })
-      if code.historical then data.comment_role = role == 'base' and 'original_base' or (role == 'middle' and 'comment' or 'selected_head') end
-      buf = immutable(state, code.path, side, revision, version.content, data)
+      local data = vim.tbl_extend('force', {}, code, { source_path = pane.path, missing = version.missing,
+        provenance = version.provenance, historical = pane.historical, comment_role = pane.comment_role })
+      local slot = role == 'right' and 'head' or (role == 'base' and panes.middle and 'original_base' or 'base')
+      buf = immutable(state, slot, code.path, pane.side, pane.revision, version.content, data)
       buffers[buf].binary, buffers[buf].diff_context = code.binary, context
       show_buffer(win, buf)
-      if code.historical then
-        local label = ({ base = 'Original base', middle = 'Comment', right = 'HEAD' })[role]
+      if pane.label then
+        local label = pane.label
         if version.provenance == 'reconstructed' then label = label .. ' (reconstructed)' end
-        buffers[buf].comment_label = ('%s %s  %s%s'):format(label, pane.commit, pane.path, version.missing and ' [file absent]' or ''):gsub('%%', '%%%%')
+        buffers[buf].pane_label = ('%s %s  %s%s'):format(label, pane.commit, pane.path, version.missing and ' [file absent]' or ''):gsub('%%', '%%%%')
       end
       render_file_winbar(buf, buffers[buf], state.view)
-      if role == 'middle' then comment_buf = buf end
+      if role == 'middle' then middle_buf = buf end
     end
-    state.diff_windows[role] = win
     api.nvim_win_call(win, function()
       if #roles > 1 then vim.cmd('diffthis') end
       vim.wo.wrap = false
@@ -1600,8 +1599,8 @@ show_diff = function(context, panes)
   state.right = state.diff_windows.right ~= state.left and state.diff_windows.right or nil
   state.top, state.path, state.diff_context, state.diff_panes = state.left, code.path, context, panes
   context.panes = panes
-  if comment_buf then
-    comment_diff.highlight(comment_buf, code, working_buf and local_text(working_buf))
+  if middle_buf then
+    comment_diff.highlight(middle_buf, context.versions, code.binary, working_buf and local_text(working_buf))
     comment_diff.window(state.diff_windows.middle, true)
   end
   for buf in pairs(previous_buffers) do
@@ -1626,20 +1625,36 @@ local function show_code(state, code)
   local context = { state = state, code = code, versions = {} }
   local function commit(role, hash, path, content, missing, provenance)
     context.versions[role] = { content = content, missing = missing, provenance = provenance }
-    return { kind = 'commit', commit = hash, path = path }
+    return { kind = 'commit', commit = hash, path = path,
+      side = role == 'right' and 'head' or (role == 'base' and code.historical and 'original_base' or 'base'),
+      revision = (role == 'base' and code.historical or role == 'middle' and code.last_viewed)
+        and { base = hash, head = code.revision.head } or code.revision,
+      historical = code.historical or role == 'middle',
+      comment_role = code.historical and ({ base = 'original_base', middle = 'comment', right = 'selected_head' })[role] or nil,
+      label = code.historical and ({ base = 'Original base', middle = 'Comment', right = 'HEAD' })[role]
+        or (role == 'middle' and 'Last viewed' or nil),
+    }
   end
   local panes = {}
   if code.historical then
-    local original, selected = comment_diff.sides(code)
-    if original then
+    if code.original_base then
       local source = code.original_base
       panes.base = commit('base', source.commit, source.path, source.content, source.missing, source.provenance)
     end
     panes.middle = commit('middle', code.revision.base, code.base_path or code.path, code.base_content, code.base_missing, code.provenance)
-    if selected then panes.right = commit('right', code.revision.head, code.path, code.head_content, code.head_missing, 'recorded') end
+    panes.right = commit('right', code.revision.head, code.path, code.head_content, code.head_missing, 'recorded')
   else
     panes.base = commit('base', code.revision.base, code.base_path or code.path, code.base_content, code.base_missing, 'recorded')
     panes.right = commit('right', code.revision.head, code.path, code.head_content, code.head_missing, 'recorded')
+    if code.last_viewed then
+      local source = code.last_viewed
+      panes.middle = commit('middle', source.commit, source.path, source.content, source.missing, 'recorded')
+    end
+  end
+  if panes.middle then
+    local base, right = comment_diff.sides(context.versions)
+    if not base then panes.base = nil end
+    if not right then panes.right = nil end
   end
   local loaded = code.local_path and vim.fn.bufnr(code.local_path) or -1
   local unsaved = loaded >= 0 and api.nvim_buf_is_loaded(loaded)
@@ -2758,7 +2773,7 @@ function M.register()
             if state.diff_context ~= context or not valid(win) or api.nvim_win_get_buf(win) ~= event.buf then return end
             api.nvim_win_call(win, function() vim.cmd('diffupdate') end)
             local middle = state.diff_windows.middle
-            if valid(middle) then comment_diff.highlight(api.nvim_win_get_buf(middle), context.code, local_text(event.buf)) end
+            if valid(middle) then comment_diff.highlight(api.nvim_win_get_buf(middle), context.versions, context.code.binary, local_text(event.buf)) end
           end)
         end
       end
