@@ -20,10 +20,8 @@ local function active()
   return vim.json.decode(result.stdout, { luanil = { object = true, array = true } }).workspace
 end
 local function home()
-  local notices_before = #notices
   vim.cmd('Review')
   wait(function() return kind() == 'home' end, 'cached home missing')
-  wait(function() return #notices > notices_before and notices[#notices]:find('fixture offline', 1, true) and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Error:', 1, true) end, 'offline refresh did not retain cached home')
 end
 
 vim.cmd('Review sessions')

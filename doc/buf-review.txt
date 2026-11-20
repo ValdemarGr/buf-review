@@ -15,7 +15,8 @@ installing manually. Optional executable override: >lua
                                 existing PR or save a local creation intent.
 :Review sessions                Browse saved sessions, grouped by PR.
 :Review sessions new            New session for current/selected PR.
-:Review refresh                 Refresh current browser or bound session.
+:Review pull                    Fetch/reconcile bound session and prepare Git;
+                                or reread current browser. Waits for completion.
 :Review checkout                Explicitly switch local checkout to bound PR.
 :Review start                   Legacy activity command; new inline drafts join review.
 :Review leave                   Legacy activity command; membership stays unchanged.
@@ -31,7 +32,7 @@ sessions when several are unfinished. Rust owns these routing decisions.
 
 :Review sessions shows every saved session grouped by PR, current PR first.
 The same browser is filtered to one PR when selection is ambiguous. Enter
-resumes a session; :Review refresh rereads saved session state. Rows show
+resumes a session; :Review pull rereads saved session state. Rows show
 publication status, pending comments/changes, published counts and conflicts.
 :Review sessions new creates a distinct session for the PR under the browser
 cursor, selected remote PR, or bound session's PR. Existing :Review start only
@@ -41,12 +42,13 @@ A session is a batch with a stable identity across refresh and publication.
 Several sessions may belong to the same PR. Selection and saved work persist
 in .review/state.sqlite3 at the repository root, scoped to the authenticated
 reviewer. Switching sessions never retargets existing buffers or composers.
-The first home load in a Neovim session waits for a remote refresh before
-displaying review objects. Neovim stays responsive while review actions wait.
-A PR fetched during routing already satisfies this first load; it is not
-immediately fetched again.
-Later remote refreshes run in the background with the current view and
-actions available; selecting a PR first waits for Git preparation. A PR without cached data still needs its initial fetch.
+Cached sessions open from saved state, including after restarting Neovim.
+Opening or navigating them does not automatically refresh remote state.
+A PR without cached data needs its initial fetch; a PR fetched during routing
+is not immediately fetched again. Selection waits for Git preparation.
+:Review pull explicitly fetches remote changes, reconciles local intent and
+prepares Git objects. It shows progress and waits for completion while Neovim
+stays responsive. There is no :Review refresh alias.
 Failed fetches retain cached work with a visible error and saved drafts.
 Review comparisons follow checked-out Git HEAD. Fetch never pulls or switches
 branches; reopen a diff after changing the checkout.
@@ -59,7 +61,8 @@ create/resume/choose session rules apply. Plain :Review entry stays unchanged.
 Committed comparisons use checked-out HEAD. Dirty files open their editable
 local version on the right; comments require committed code and a reopened diff.
 BASE must name an available local branch; fetch/create it first when absent.
-Refresh fetches remotes and reads checked-out HEAD without changing branches.
+Pull fetches remotes and reads checked-out HEAD without changing branches.
+It does not run git pull or merge branches.
 
 Enter on a local PR's title opens Markdown: first line title, remaining text
 body. :w / :wq save locally. Sessions share the logical PR object; stale metadata
@@ -76,8 +79,8 @@ while preserving both objects and their sessions/drafts.
 
 Selecting a PR prepares checked-out HEAD, its review base, latest fetched PR head and
 original comment commits before showing review objects. Rust batch-checks local
-objects and fetches only missing hashes, together. Later refreshes prepare new
-hashes in the background.
+objects and fetches only missing hashes, together. Explicit pulls wait for
+preparation of newly discovered hashes.
 Missing historical commits report warnings and use recorded-hunk fallback;
 missing current comparison commits report an error. Preparation never checks out files.
 
@@ -159,7 +162,7 @@ closing the pane clears the highlight. BufReviewCommentRange defaults to Visual.
                                                         *buf-review-mappings*
 Global normal-mode defaults, using your configured <leader>:
     <leader>rs   :Review
-    <leader>rr   :Review refresh
+    <leader>rr   :Review pull
     <leader>rp   :Review publish
     <leader>rcc  :Review conclude
     <leader>rcs  :Review suggest (in an eligible comment composer)
@@ -231,8 +234,8 @@ switches flush earlier local writes; a save finishes its own write before
 returning. Pending local writes finish on editor exit. Complete a/type/save/return
 sequences work in native commands. :normal! bypasses mappings as usual.
 Remote publication is explicit and waits for writes and subsequent PR refresh.
-Background refresh fetches an immutable snapshot, then queues its local merge
-alongside writes. Local actions never wait for that network fetch.
+Pull fetches an immutable snapshot, then queues its local merge alongside writes.
+The explicit command waits for reconciliation and Git preparation.
 
 Marking keeps cursor row/column and scroll position when entries move between
 sections; positions clamp at the buffer end. Navigation uses the object under
@@ -393,7 +396,7 @@ for scripts. No close/unload/window/editor action initiates provider writes.
     todo/comment skip Done; file skips viewed. Native ]c/[c handle hunks.
     Internal pane changes preserve jump history. Ordinary user motions still
     record jumps normally.
-PR state fetches run git fetch --all first. Refresh updates remote evidence;
+PR state fetches run git fetch --all first. Pull updates remote evidence;
 the comparison follows checked-out HEAD. Fetch does not pull or switch branches.
 :Review context
     Open selected comment's recorded original code in separate reusable context

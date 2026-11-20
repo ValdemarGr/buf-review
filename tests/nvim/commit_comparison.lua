@@ -104,11 +104,11 @@ assert(kind() == 'home' and #requests('code') == 0 and #requests('actions') == 0
 
 -- Normal Git checkout controls the next projection without comparison events.
 worktree = vim.deepcopy(latest)
-vim.cmd('Review refresh')
+vim.cmd('Review pull')
 wait(function() return not text():find('not at remote head', 1, true) end, 'refresh ignored checked-out HEAD')
 assert(not text():find('Unpulled commits', 1, true), 'current HEAD retained unpulled commits')
 worktree = vim.deepcopy(old)
-vim.cmd('Review refresh')
+vim.cmd('Review pull')
 wait(function() return text():find('Unpulled commits (2)', 1, true) end, 'checkout of old commit lost commit visibility')
 assert(#requests('actions') == 0 and #requests('compare_saved') == 0, 'checkout wrote comparison events')
 
@@ -122,7 +122,7 @@ for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
   if meta and meta.kind == 'diff' then panes[win] = buf end
 end
 worktree = vim.deepcopy(latest)
-vim.cmd('Review refresh')
+vim.cmd('Review pull')
 wait(function() return vim.deep_equal(read('state.json').comparison, latest) end, 'refresh did not derive HEAD')
 for win, buf in pairs(panes) do
   assert(api.nvim_win_is_valid(win) and api.nvim_win_get_buf(win) == buf, 'refresh replaced open committed pane')
@@ -148,14 +148,32 @@ local fresh = read('state.json')
 fresh.review.id = 'fresh-object-snapshot'
 write('state.json', fresh)
 hold_objects = true
-vim.cmd('Review refresh')
-wait(function() return held_objects ~= nil end, 'object response not held')
-row('src/file.rs')
-require('buf_review').progress(false, false, 'file')
-wait(function() return not read('state.json').files[1].viewed and text():find('Unviewed files (1)', 1, true) end, 'local action not accepted during object preparation')
-local deliver = held_objects
-held_objects, hold_objects = nil, false
-deliver()
+local action_timed_out = false
+vim.defer_fn(function()
+  if not hold_objects then return end
+  action_timed_out, hold_objects = true, false
+  local deliver = held_objects
+  held_objects = nil
+  if deliver then deliver() end
+end, 5000)
+local function act_when_held()
+  if not hold_objects then return end
+  if not held_objects then vim.defer_fn(act_when_held, 5); return end
+  row('src/file.rs')
+  require('buf_review').progress(false, false, 'file')
+  local function deliver_after_action()
+    if not hold_objects then return end
+    if read('state.json').files[1].viewed then vim.defer_fn(deliver_after_action, 5); return end
+    local deliver = held_objects
+    held_objects, hold_objects = nil, false
+    deliver()
+  end
+  vim.defer_fn(deliver_after_action, 5)
+end
+vim.defer_fn(act_when_held, 0)
+vim.cmd('Review pull')
+assert(not action_timed_out, 'local action did not settle during held object preparation')
+assert(not read('state.json').files[1].viewed, 'local action not accepted during object preparation')
 ReviewTest.wait(40)
 assert(text():find('Unviewed files (1)', 1, true) and text():find('Viewed files (0)', 1, true), 'stale object response replaced accepted local progress')
 assert(#requests('actions') == 1, 'object preparation repeated local action')

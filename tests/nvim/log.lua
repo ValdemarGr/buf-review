@@ -135,7 +135,7 @@ write('log.json', {})
 command('log'); wait(function() return kind() == 'log' and text():find('0 events', 1, true) end, 'empty log missing')
 assert(vim.bo.readonly and not vim.bo.modifiable and text():find('Review log', 1, true), 'empty log lost viewer layout')
 for _, request in ipairs(requests()) do
-  assert(vim.tbl_contains({ 'entry', 'select', 'fetch_objects', 'fetch_refresh', 'apply_refresh', 'log', 'list', 'route' }, request.op), 'log viewer caused unexpected action: ' .. request.op)
+  assert(vim.tbl_contains({ 'entry', 'select', 'fetch_objects', 'get', 'log', 'list', 'route' }, request.op), 'log viewer caused unexpected action: ' .. request.op)
 end
 print('Neovim review log viewer passed')
 vim.fn.delete(fixture, 'rf')

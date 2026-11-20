@@ -70,7 +70,7 @@ end
 local function refreshed(snapshot)
   local notices_before = #notices
   write(snapshot)
-  vim.cmd('Review refresh')
+  vim.cmd('Review pull')
   wait(function() return #notices > notices_before and notices[#notices]:find('workspace changed in another session', 1, true) end, 'bound refresh did not apply external state')
 end
 local function draft(body)

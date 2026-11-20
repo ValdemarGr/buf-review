@@ -105,28 +105,88 @@ end
 assert(comments and refreshed and comments < refreshed and echoes[#echoes]:find('Complete', 1, true),
   'publication did not progress through comments then final refresh')
 
--- Background preparation stays quiet; opening a file while it runs takes
--- ownership of that wait without changing the preparation/cache algorithm.
+-- Pull owns the full fetch/apply/preparation wait. Opening prepared code needs
+-- no second preparation or progress workflow.
 echoes = {}
 local changed = read('state.json')
 changed.comparison.head = string.rep('c', 40)
 write('state.json', changed)
-vim.cmd('Review refresh')
-wait(function() return echoes[#echoes] and echoes[#echoes]:find('Refresh · Complete', 1, true) end, 'foreground refresh did not finish')
+api.nvim_feedkeys(api.nvim_replace_termcodes(':Review pull<CR>', true, false, true), 'xt', false)
+assert(echoes[#echoes] and echoes[#echoes]:find('Pull · Complete', 1, true), 'pull returned before completion')
+local prepared = false
+for _, message in ipairs(echoes) do prepared = prepared or message:find('Pull · Preparing Git objects 2/2', 1, true) end
+assert(prepared, 'pull completed without streamed Git preparation counts')
+local preparations = 0
+for _, request in ipairs(records()) do if request.op == 'fetch_objects' then preparations = preparations + 1 end end
+count = #echoes
 for line, value in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
   if value:sub(-#'src/file.rs' - 2) == '  src/file.rs' then api.nvim_win_set_cursor(0, { line, 0 }); break end
 end
 require('buf_review').enter()
-assert(echoes[#echoes]:find('Prepare · Preparing Git objects', 1, true), 'opening code did not show its foreground Git wait')
 wait(function() return kind() == 'diff' end, 'foreground prepared code did not open')
-local prepared = false
-for _, message in ipairs(echoes) do prepared = prepared or message:find('Prepare · Preparing Git objects 2/2', 1, true) end
-assert(prepared, 'foreground code wait lost streamed Git counts')
+local opened_preparations = 0
+for _, request in ipairs(records()) do if request.op == 'fetch_objects' then opened_preparations = opened_preparations + 1 end end
+assert(opened_preparations == preparations and #echoes == count, 'prepared code started another progress workflow')
+
+-- A deferred fetch/apply is not a successful pull. Keep current data visible,
+-- report the retry instruction, and avoid preparing an unapplied snapshot.
+local request, notify = client.request, vim.notify
+local notices = {}
+vim.notify = function(message) notices[#notices + 1] = message end
+client.request = function(root, payload, callback, on_progress)
+  return request(root, payload, function(response, err)
+    if payload.op == 'fetch_refresh' and response and response.prepared_refresh then
+      response.prepared_refresh.review = nil
+      response.prepared_refresh.deferred = true
+    end
+    callback(response, err)
+  end, on_progress)
+end
+echoes = {}
+api.nvim_feedkeys(api.nvim_replace_termcodes(':Review pull<CR>', true, false, true), 'xt', false)
+client.request, vim.notify = request, notify
+assert(echoes[#echoes]:find('Pull · Finished with errors', 1, true), 'deferred pull falsely completed')
+assert(notices[#notices] and notices[#notices]:find('Pull deferred; remote state was not applied. Run :Review pull to retry.', 1, true),
+  'deferred pull lost retry instruction')
+local deferred_preparations = 0
+for _, entry in ipairs(records()) do if entry.op == 'fetch_objects' then deferred_preparations = deferred_preparations + 1 end end
+assert(deferred_preparations == preparations and kind() == 'diff', 'deferred pull prepared or replaced current snapshot')
+
+-- A second caller joins preparation already in flight. Its active progress
+-- owner must receive the remaining counts without another fetch/preparation.
+echoes = {}
+local joined_at, joined_finished
+local joined_requests = #records()
+client.request = function(root, payload, callback, on_progress)
+  if payload.op == 'fetch_objects' then
+    vim.defer_fn(function()
+      joined_at = #echoes + 1
+      api.nvim_feedkeys(api.nvim_replace_termcodes(':Review pull<CR>', true, false, true), 'xt', false)
+      joined_finished = true
+    end, 50)
+  end
+  return request(root, payload, callback, on_progress)
+end
+api.nvim_feedkeys(api.nvim_replace_termcodes(':Review pull<CR>', true, false, true), 'xt', false)
+client.request = request
+assert(joined_finished, 'second pull did not finish inside shared preparation')
+local joined_prepared, joined_fetches, joined_objects = false, 0, 0
+for index = joined_at, #echoes do
+  joined_prepared = joined_prepared or echoes[index]:find('Pull · Preparing Git objects 2/2', 1, true)
+end
+for index, entry in ipairs(records()) do
+  if index > joined_requests then
+    if entry.op == 'fetch_refresh' then joined_fetches = joined_fetches + 1 end
+    if entry.op == 'fetch_objects' then joined_objects = joined_objects + 1 end
+  end
+end
+assert(joined_fetches == 1 and joined_objects == 1, 'coalesced pull duplicated fetch/preparation')
+assert(joined_prepared, 'coalesced pull lost remaining Git preparation counts')
 
 -- Native borrowed-window context must not make a delayed browser look visible
 -- while the user is actually in another tab.
 vim.cmd('Review')
-wait(function() return kind() == 'home' and echoes[#echoes]:find('Refresh · Complete', 1, true) end, 'home before delayed browser missing')
+wait(function() return kind() == 'home' end, 'home before delayed browser missing')
 vim.fn.writefile({ '0.15' }, fixture .. '/delay_list')
 vim.cmd('Review prs')
 local source = api.nvim_get_current_win()

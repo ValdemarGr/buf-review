@@ -181,7 +181,7 @@ local unrelated = git('rev-parse', 'HEAD')
 assert(unrelated ~= head)
 local generation = active().generation
 home()
-vim.cmd('Review refresh')
+vim.cmd('Review pull')
 wait(function() return active().generation > generation end, 'Actual local refresh did not complete')
 assert(active().comparison.head == unrelated and active().review.read.pull_request.revision.head == head, 'Refresh mixed checked-out HEAD with saved PR source')
 assert(draft(active()).target.target.revision.head == head, 'Checkout rewrote existing draft anchor')

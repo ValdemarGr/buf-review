@@ -55,13 +55,14 @@ selected stable session ID. `:Review sessions new` creates another session for
 the PR under the browser cursor, selected remote PR, or bound session's PR.
 `start` continues to control WIP activity within one session.
 
-The first home load in a Neovim session shows a loading view until remote
-comments, reactions and file progress have been fetched. Review actions wait
-while Neovim remains responsive. PR selection also waits for Git preparation.
-Later remote refreshes retain cached data
-and run in the background. Fetch failures preserve cached work with a visible
-error. Explicit navigation is serialized; background responses update only
-their original session and never select it or retarget another session's UI.
+Cached sessions open from saved local state without an automatic remote refresh,
+including after restarting Neovim. A PR without cached state is fetched before
+its initial view opens. PR selection also waits for Git preparation.
+`:Review pull` explicitly fetches remote comments, reactions and file progress,
+reconciles saved intent and prepares Git objects before returning. Neovim stays
+responsive while the command waits. Fetch failures preserve cached work with a
+visible error. Explicit navigation is serialized; asynchronous responses update
+only their original session and never select it or retarget another session's UI.
 
 The PR list initially shows open PRs across all authors and assignees in the
 current repository. Rows show number, title, author and assignees, sorted by
@@ -70,9 +71,10 @@ most recently updated, then PR number. `/` searches visible rows. The optional
 query. The optional `state=open|closed|merged|all` argument defaults to open;
 this also makes saved closed or merged PRs reachable through the list. No
 assignee argument means all assignees. The header shows the applied filters.
-`:Review refresh` in the PR list refreshes that query and retains its filters;
+`:Review pull` in the PR list refreshes that query and retains its filters;
 in the sessions browser it rereads local state and preserves its PR filter;
-elsewhere it refreshes the bound session. Listing failure preserves the
+elsewhere it fetches and reconciles the bound session, then waits for Git
+preparation. There is no `:Review refresh` alias. Listing failure preserves the
 previous rows and shows the error.
 
 `:Review` opens in the current window and tab, without creating or locating a
@@ -481,7 +483,7 @@ as receipts for new local operations.
 Legacy identities, events, drafts, receipts and recovery data survive migration.
 
 Neovim waits for publication and a fresh subsequent fetch. Drain earlier
-background refreshes before writing; an earlier snapshot cannot satisfy this
+in-flight fetches before writing; an earlier snapshot cannot satisfy this
 post-write refresh. Refresh after partial success without retrying writes.
 Report refresh failures separately, preserving all receipts and original errors.
 Ctrl-C interrupts waiting without canceling an already-started write; keep the
@@ -609,10 +611,11 @@ Use native `keepjumps` for internal buffer switches and pane creation, including
 composer returns and original-context tabs. Preserve existing jump history;
 ordinary user motions retain their native jump behavior.
 
-## Refresh, conflicts and comparison updates
+## Pull, conflicts and comparison updates
 
-`:Review refresh` fetches a new immutable snapshot of remote comments, reactions
-and metadata. It does not change the pinned comparison. Match resources by typed
+`:Review pull` fetches a new immutable snapshot of remote comments, reactions
+and metadata, reconciles it, then waits for Git preparation. It does not change
+the pinned comparison or merge Git branches. Match resources by typed
 provider identities, including receipt mappings for previously local drafts;
 there must be only one logical item after publication and refetch.
 
@@ -651,11 +654,11 @@ metadata if needed, but never changes local source, branch or worktree. Missing
 local commits for the selected comparison are fetched from the PR repository,
 using the exact pinned base/head IDs. PR selection prepares that history, latest
 fetched PR head and original comment commits before displaying review objects;
-existing objects skip the network. Later refreshes prepare new hashes while local staging stays
-available. Preserve the index, refs and FETCH_HEAD;
+existing objects skip the network. Explicit pulls wait for preparation of new
+hashes. Preserve the index, refs and FETCH_HEAD;
 never check out the PR during object preparation or substitute newer revisions when a pin is unavailable.
 Show fetch progress or an actionable failure, and retry on opening code or an
-explicit refresh. Saved drafts retain exact original anchors. They remain
+explicit pull. Saved drafts retain exact original anchors. They remain
 publishable if the provider accepts them, even when historical. Flag rejected
 anchors and require explicit relocation or deletion before submission.
 
@@ -703,8 +706,8 @@ Git owns file contents. On PR selection, prepare pinned base/head history and
 latest fetched PR head before showing review objects. Batch-check original thread
 commits locally, then fetch remaining hashes together; a commit outside current
 branch history may already
-exist locally. Later refreshes prepare new hashes without replacing the current
-view. Missing historical objects report explicit warnings and keep hunk fallback;
+exist locally. Explicit pulls wait for preparation of new hashes without replacing
+the current view. Missing historical objects report explicit warnings and keep hunk fallback;
 missing current pins report an error. Preserve the worktree, index, branch, refs
 and FETCH_HEAD. SQLite keeps snapshots/anchors/receipts, not duplicate Git blobs.
 Use confirmed publication receipts and stable provider identities to recover
@@ -729,7 +732,7 @@ home header is the explicit PR-wide creation context.
 | `start` / `leave` | Activate or leave saved WIP |
 | `conclude` | Outcome picker and review summary; home `cc` |
 | `publish` | Send the ordered saved queue; missing conclusion leaves a draft review |
-| `refresh` | Refresh remote PR query, reread local session browser, or refresh bound session; never repin comparison |
+| `pull` | Refresh remote PR query, reread local session browser, or fetch/reconcile bound session and prepare Git objects; wait for completion; never repin comparison |
 | `comment [review\|standalone]` | New comment at current line, range, file row or home header |
 | `reply [review\|standalone]` | Reply to selected inline comment, including own comment |
 | `edit` / `delete` | Edit or cancel the selected unsent local comment |
@@ -762,7 +765,7 @@ Native `]c`/`[c` remain diff-hunk navigation. Review-local `]f`/`[f` replace the
 native `gf` aliases; `gf` itself remains available.
 
 Global normal-mode defaults are `<leader>rs` (`:Review`), `<leader>rr`
-(`:Review refresh`), `<leader>rp` (`:Review publish`), `<leader>rcc`
+(`:Review pull`), `<leader>rp` (`:Review publish`), `<leader>rcc`
 (`:Review conclude`), and `<leader>rcs` (`:Review suggest` in an eligible composer).
 Use `mapleader` as configured before plugin loading. Existing user mappings
 take precedence over these and the Review-local navigation defaults. Source
@@ -862,10 +865,11 @@ Routine projections query publication lifecycle fields without decoding every
 historical workspace snapshot. Hidden readers become stale and rebuild before
 display or interaction; only visible readers redraw immediately.
 
-A newly fetched routing snapshot suppresses the duplicate initial refresh only
-when the backend confirms that exact snapshot is selected. Cached entry still
-waits for the first home refresh of the Neovim session; later refreshes remain in
-the background.
+A newly fetched routing snapshot satisfies initial loading when the backend
+confirms that exact snapshot is selected. Cached entry reuses saved state, even
+on the first home load of a Neovim session. Opening or navigating a cached session
+does not automatically refresh remote state; only explicit pull and publication's
+final reconciliation update it.
 Fetch ordinary PR connections together, paginate overflow completely and retain
 supplemental reads required for file metadata and revision consistency.
 

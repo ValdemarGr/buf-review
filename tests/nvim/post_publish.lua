@@ -102,9 +102,12 @@ wait(function() return kind() == 'home' and text():find('Code: ready', 1, true) 
 assert(#requests('fetch_refresh') == 0, 'Fresh entry unexpectedly started a remote refresh')
 if scenario == 'inflight' then
   vim.fn.writefile({ '0.20' }, fixture .. '/delay_refresh')
-  command('refresh')
-  wait(function() return #records('post_publish_events.jsonl') == 1 end, 'Background snapshot did not start')
-  assert(not records('post_publish_events.jsonl')[1].publication, 'Background snapshot already contains later publication')
+  vim.defer_fn(function()
+    wait(function() return #records('post_publish_events.jsonl') == 1 end, 'Pull snapshot did not start')
+    assert(not records('post_publish_events.jsonl')[1].publication, 'Pull snapshot already contains later publication')
+    command('publish')
+  end, 0)
+  command('pull')
 elseif refresh_error then
   vim.fn.writefile({ '' }, fixture .. '/fail_refresh')
 elseif scenario == 'interrupt' then
@@ -130,7 +133,7 @@ if scenario == 'interrupt' then
   end
   vim.defer_fn(interrupt, 0)
 end
-command('publish')
+if scenario ~= 'inflight' then command('publish') end
 if scenario == 'interrupt' then
   assert(notice('Publication continues in the background; wait for it to finish before retrying'), 'Native Ctrl-C did not interrupt publication wait')
   assert(not state().publications[1], 'Interrupted wait did not return before publication finished')

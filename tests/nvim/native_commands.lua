@@ -162,7 +162,7 @@ row('Delete-alpha')
 before = #requests('actions')
 vim.cmd('normal ddu')
 sent = batch_since(before, 2)
-wait(function() return notices[#notices]:find('immutable', 1, true) end, 'published deletion was not rejected')
+wait(function() return notices[#notices] and notices[#notices]:find('immutable', 1, true) end, 'published deletion was not rejected')
 assert(sent.actions[1].action == 'delete_comments' and sent.actions[2].action == 'undo'
   and #state().comments == 2,
   'immutable comment deletion changed saved state')
@@ -294,17 +294,18 @@ vim.cmd('global/one\\|changed/normal u')
 batch_since(before)
 wait(function() return not state().files[1].viewed end, 'diff global undo lost file')
 
--- Async refresh callbacks may arrive within a native command; reader stays fixed.
+-- After explicit pull, native command actions still defer reader rebuilding.
 reset({ 'Refresh-alpha', 'Refresh-beta', 'Refresh-gamma' })
 vim.fn.writefile({ '0.02' }, fixture .. '/delay_refresh')
-local stable, pauses = text(), 0
+local stable, pauses
 vim.keymap.set('n', 'T', function()
   pauses = pauses + 1
   local entry_state = vim.fn.state()
   vim.wait(120)
   assert(text() == stable, 'callback rebuilt rows inside native command: ' .. entry_state .. ' -> ' .. vim.fn.state() .. '\nBEFORE\n' .. stable .. '\nAFTER\n' .. text())
 end, { buffer = true })
-vim.cmd('Review refresh')
+vim.cmd('Review pull')
+stable, pauses = text(), 0
 before = #requests('actions')
 vim.cmd('global/Refresh-/normal sT')
 wait(function() return #state().done == 3 end, 'refresh overtook queued local actions')

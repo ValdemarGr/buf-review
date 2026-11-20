@@ -98,15 +98,23 @@ end
 local function reset(transform)
   local value = populated()
   if transform then transform(value) end
-  value.generation = state().generation
-  local todos = 0
-  for _, item in ipairs(value.comments) do if item.fetched and not item.done then todos = todos + 1 end end
+  value.generation = state().generation + 1
+  value.review.read.pull_request.title = "Mark and move reset " .. value.generation
+  value.todo, value.done = {}, {}
+  for _, item in ipairs(value.comments) do
+    if item.fetched then
+      local items = item.done and value.done or value.todo
+      items[#items + 1] = item.comment.comment.id
+    end
+  end
+  local todos = #value.todo
   write('state.json', value)
-  local browser, selected, refreshed = kind() == 'prs', #requests('select'), #records('refresh_complete.jsonl')
+  local browser, selected, gets = kind() == 'prs', #requests('select'), #requests('get')
   command('')
   wait(function()
     return kind() == 'home' and text():find('Todo (' .. todos .. ')', 1, true)
-      and (browser and #requests('select') > selected or #records('refresh_complete.jsonl') > refreshed)
+      and text():find(value.review.read.pull_request.title, 1, true)
+      and (browser and #requests('select') > selected or #requests('get') > gets)
   end, 'reset did not refresh home')
 end
 local function file(path) return kind() == 'diff' and vim.b.buf_review.path == path end

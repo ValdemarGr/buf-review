@@ -57,26 +57,42 @@ local cold = vim.env.BUF_REVIEW_COLD
 local route = { route = 'batch', batch = initial.id }
 if cold ~= 'cached' then route.fresh_review = cold == 'mismatch' and 'another-snapshot' or initial.review.id end
 write('routes.json', { entry = route })
-if cold then vim.fn.writefile({ '0.2' }, fixture .. '/delay_refresh') end
 command('')
+wait(function() return kind() == 'home' end, 'initial cached home missing')
+assert(#requests('fetch_refresh') == 0, 'cached initial entry fetched remotely')
 if cold then
-  wait(function() return kind() == 'loading' and #requests('fetch_refresh') == 1 end, 'cached/mismatched first open skipped remote wait')
-  assert(not text():find('initial-root', 1, true), 'initial wait exposed cached objects')
-end
-wait(function() return kind() == 'home' end, 'initial home missing')
-if cold then
-  assert(#requests('fetch_refresh') == 1, 'cached/mismatched first open refreshed more than once')
-  print('Cold snapshot proof ' .. cold .. ' passed')
+  print('Cached snapshot proof ' .. cold .. ' passed')
   vim.fn.delete(fixture, 'rf')
   vim.cmd('qa!')
 end
-assert(#requests('fetch_refresh') == 0, 'authoritative fresh route was fetched twice')
 assert(requests('select')[1].fresh_review == initial.review.id, 'route snapshot proof was not forwarded')
-vim.fn.writefile({ '0.15' }, fixture .. '/delay_refresh')
 command('')
-assert(kind() == 'home', 'later cached entry blocked on refresh')
-wait(function() return #requests('fetch_refresh') == 1 and state().generation > 0 end, 'fresh proof incorrectly suppressed later refresh')
+wait(function() return kind() == 'home' end, 'later cached home missing')
+ReviewTest.wait(180)
+assert(#requests('fetch_refresh') == 0 and state().generation == 0, 'cached reopen fetched remotely')
+-- Remote changes stay invisible until explicit pull; local reopen never fetches.
+local remote = state()
+remote.pr.title = 'Remote title after publication elsewhere'
+write('remote_state.json', { pr = remote.pr })
+command('')
+wait(function() return kind() == 'home' end, 'cached reopen missing')
+ReviewTest.wait(180)
+assert(not text():find(remote.pr.title, 1, true) and #requests('fetch_refresh') == 0, 'reopen fetched remote changes')
+vim.fn.writefile({ '0.1' }, fixture .. '/delay_refresh')
+vim.fn.writefile({ '0.1' }, fixture .. '/delay_fetch_objects')
+local before_objects = #requests('fetch_objects')
+command('pull')
+assert(text():find(remote.pr.title, 1, true) and #requests('fetch_refresh') == 1, 'pull returned before applying remote changes')
+assert(#requests('fetch_objects') > before_objects and #records('fetch_objects_complete.jsonl') == #requests('fetch_objects')
+  and text():find('Code: ready', 1, true), 'pull returned before Git preparation')
+vim.fn.delete(fixture .. '/remote_state.json')
 vim.fn.delete(fixture .. '/delay_refresh')
+vim.fn.delete(fixture .. '/delay_fetch_objects')
+local completed = #requests('fetch_refresh')
+command('refresh')
+assert(#requests('fetch_refresh') == completed and notices[#notices]:find('Unknown Review command', 1, true), 'removed refresh command still performs pull')
+assert(vim.tbl_contains(vim.fn.getcompletion('Review ', 'cmdline'), 'pull')
+  and not vim.tbl_contains(vim.fn.getcompletion('Review ', 'cmdline'), 'refresh'), 'pull completion retained refresh alias')
 local home = api.nvim_get_current_buf()
 local home_changes = watch(home)
 local function reset(comments)
@@ -170,7 +186,7 @@ local changed_pin = state()
 changed_pin.generation = changed_pin.generation + 1
 changed_pin.comparison = { base = 'new-base', head = 'new-head' }
 write('state.json', changed_pin)
-command('refresh')
+command('pull')
 wait(function() return text():find('new-base', 1, true) end, 'comparison change did not reach home')
 api.nvim_win_set_buf(0, list)
 local before_pin_action = #requests('actions')

@@ -225,7 +225,7 @@ wait(function() return #requests('historical_code') > historical_reads end, 'his
 local refreshed = read('state.json')
 refreshed.review.read.pull_request.revision.head = string.rep('d', 40)
 write('state.json', refreshed)
-command('refresh')
+command('pull')
 wait(function() return read('state.json').generation > refreshed.generation end, 'PR-head refresh missing')
 wait(function() return #requests('historical_code') == historical_reads + 1 and kind() == 'thread' and vim.b.buf_review.object == 'recorded' end,
   'historical response changed selected comparison after PR-head refresh')

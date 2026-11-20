@@ -113,44 +113,12 @@ local function discussion_body_preserved()
   return first_body
 end
 
-local function loading_blocks_actions(reason)
-  wait(function() return kind() == 'loading' end, reason .. ': loading buffer missing')
-  assert(vim.bo.readonly and not vim.bo.modifiable, reason .. ': loading buffer is writable')
-  local visible = table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n')
-  assert(visible:find('Loading remote review', 1, true), reason .. ': no loading status')
-  assert(not visible:find('Feedback first', 1, true), reason .. ': stale home remained visible')
-  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
-    local buf = api.nvim_win_get_buf(win)
-    local marker = vim.b[buf].buf_review
-    assert(not (marker and marker.kind == 'home'), reason .. ': another stale home window remained visible')
-  end
-  local guarded = { 'start', 'save', 'reaction', 'viewed', 'publish', 'submit', 'summary', 'code' }
-  local before = {}
-  for _, operation in ipairs(guarded) do before[operation] = #requests(operation) end
-  local picker = vim.ui.select
-  local opened_picker = false
-  vim.ui.select = function() opened_picker = true end
-  for _, action in ipairs({ 'start', 'comment', 'conclude', 'publish', 'done', 'viewed' }) do
-    command(action)
-    assert(kind() == 'loading', reason .. ': ' .. action .. ' replaced loading view')
-  end
-  require('buf_review').enter()
-  require('buf_review').progress(true)
-  assert(kind() == 'loading' and not opened_picker, reason .. ': loading allowed object actions')
-  vim.ui.select = picker
-  local responsive = false
-  vim.defer_fn(function() responsive = true end, 30)
-  assert(ReviewTest.wait(80, function() return responsive end, 5), reason .. ': remote fetch blocked Neovim event loop')
-  assert(kind() == 'loading', reason .. ': fixture fetch ended before loading checks')
-  for _, operation in ipairs(guarded) do assert(#requests(operation) == before[operation], reason .. ': loading sent ' .. operation) end
-end
-
 local function refresh_completions()
   local path = fixture .. '/refresh_complete.jsonl'
   return vim.fn.filereadable(path) == 1 and #vim.fn.readfile(path) or 0
 end
 
-local function background_home(reason, completed_before)
+local function cached_home(reason, completed_before)
   wait(function() return kind() == 'home' end, reason .. ': saved home missing')
   assert(refresh_completions() == completed_before, reason .. ': home waited for remote completion')
   assert(table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Feedback first', 1, true), reason .. ': saved content hidden')
@@ -165,33 +133,28 @@ local function background_home(reason, completed_before)
 end
 
 if vim.env.BUF_REVIEW_FIRST_FAILURE == '1' then
-  vim.fn.writefile({ '0.3' }, fixture .. '/delay_refresh')
-  vim.fn.writefile({ '' }, fixture .. '/fail_refresh')
   command('')
-  loading_blocks_actions('failed first load')
-  wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Fixture refresh failed', 1, true) end)
+  wait(function() return kind() == 'home' end, 'cached initial home missing')
+  assert(#requests('fetch_refresh') == 0, 'cached first visit fetched remotely')
+  vim.fn.writefile({ '' }, fixture .. '/fail_refresh')
+  command('pull')
+  assert(table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Fixture refresh failed', 1, true), 'pull returned before failure rendered')
   local completed = refresh_completions()
   local cached = vim.deepcopy(state().comments)
   vim.fn.delete(fixture .. '/fail_refresh')
   command('')
-  background_home('entry after failed first fetch', completed)
-  local before_start = #requests('start')
-  command('start')
-  wait(function() return #requests('start') == before_start + 1 and state().wip and state().wip.active end)
-  assert(refresh_completions() == completed, 'failure consumed first wait only after a later fetch finished')
-  wait(function() return refresh_completions() > completed end)
-  assert(vim.deep_equal(state().comments, cached), 'failed initial fetch or later background action lost cached comments')
-  print('Failed first fetch unlocks later background refresh')
+  cached_home('entry after failed explicit pull', completed)
+  assert(refresh_completions() == completed, 'cached reopen retried failed pull automatically')
+  command('pull')
+  assert(refresh_completions() == completed + 1 and vim.deep_equal(state().comments, cached), 'explicit retry lost cached comments')
+  print('Failed pull retains cached state until explicit retry')
   vim.fn.delete(fixture, 'rf')
   vim.cmd('qa!')
 end
 
-vim.fn.writefile({ '0.3' }, fixture .. '/delay_refresh')
-
 command('')
-loading_blocks_actions('initial entry')
-wait(function() return kind() == 'home' and #requests('fetch_refresh') == 1 and state().generation == 1 end)
-vim.fn.delete(fixture .. '/delay_refresh')
+wait(function() return kind() == 'home' and #requests('fetch_objects') == 1 end, 'initial cached review missing')
+assert(#requests('fetch_refresh') == 0 and state().generation == 0, 'cached initial entry fetched remote state')
 assert(vim.bo.readonly and not vim.bo.modifiable)
 assert(api.nvim_buf_get_lines(0, 0, 1, false)[1]:find(initial.locator, 1, true))
 local home_lines = table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n')
@@ -236,9 +199,9 @@ wait(function() return #state().done == 0 end)
 stationary_view(body_view, 'discussion body u')
 discussion_body_preserved()
 local discussion_refresh_generation = state().generation
-command('refresh')
+command('pull')
 wait(function() return state().generation > discussion_refresh_generation end)
-stationary_view(body_view, 'discussion body background refresh')
+stationary_view(body_view, 'discussion body pull')
 
 command('')
 wait(function() return kind() == 'home' end)
@@ -259,7 +222,7 @@ wait(function() return #state().done == 1 end)
 stationary_view(before_progress, 'home preview s')
 assert(requests('reaction')[#requests('reaction')].comment == 'first', 'preview progress targeted another comment')
 local progress_refresh = refresh_completions()
-command('refresh')
+command('pull')
 wait(function() return refresh_completions() > progress_refresh end)
 local current_position, before_next = vim.fn.winsaveview(), #messages
 command('next')
@@ -298,7 +261,7 @@ wait(function() return #state().done == 0 end)
 stationary_view(before_progress, 'visual Done u')
 assert(#requests('reaction') == before_bulk + 2, 'visual unmark repeated objects or acted on heading')
 
--- Later fetches leave home usable and preserve native fold/cursor choices.
+-- Explicit pulls preserve native fold/cursor choices.
 todo_heading = home_row('Todo (2)')
 vim.cmd('normal! zc')
 local folded_file = home_row('Unviewed files') + 1
@@ -306,26 +269,18 @@ api.nvim_win_set_cursor(0, { folded_file, 2 })
 local before_refresh_cursor = api.nvim_win_get_cursor(0)
 local completed_before = refresh_completions()
 vim.fn.writefile({ '0.3' }, fixture .. '/delay_refresh')
-command('refresh')
-background_home('later manual refresh', completed_before)
-assert(vim.fn.foldclosed(todo_heading) == todo_heading and vim.deep_equal(api.nvim_win_get_cursor(0), before_refresh_cursor), 'background fetch displaced home folds or cursor while pending')
-wait(function() return refresh_completions() > completed_before end)
-assert(vim.fn.foldclosed(todo_heading) == todo_heading, 'background refresh discarded closed Todo fold')
-assert(vim.deep_equal(api.nvim_win_get_cursor(0), before_refresh_cursor) and api.nvim_get_current_line():find('src/file.rs', 1, true), 'background refresh moved selected file: ' .. vim.inspect(before_refresh_cursor) .. ' -> ' .. vim.inspect(api.nvim_win_get_cursor(0)) .. ' ' .. api.nvim_get_current_line())
+command('pull')
+assert(refresh_completions() > completed_before, 'pull returned before remote completion')
+assert(vim.fn.foldclosed(todo_heading) == todo_heading, 'pull discarded closed Todo fold')
+assert(vim.deep_equal(api.nvim_win_get_cursor(0), before_refresh_cursor) and api.nvim_get_current_line():find('src/file.rs', 1, true), 'pull moved selected file')
 completed_before = refresh_completions()
 local before_background_viewed = #requests('viewed')
-command('refresh')
-background_home('actionable background home', completed_before)
+command('pull')
+assert(refresh_completions() > completed_before, 'pull returned before remote completion')
 before_progress = vim.fn.winsaveview()
 require('buf_review').progress(true)
 wait(function() return #requests('viewed') == before_background_viewed + 1 and state().files[1].viewed end)
-stationary_view(before_progress, 'home file s during background refresh')
-assert(refresh_completions() == completed_before and kind() == 'home', 'progress waited for background refresh')
-local after_mark_view = vim.fn.winsaveview()
-wait(function() return refresh_completions() > completed_before end)
-assert(state().files[1].viewed, 'stale background completion overwrote accepted progress')
-local after_background = vim.fn.winsaveview()
-assert(after_background.lnum == after_mark_view.lnum and after_background.col == after_mark_view.col, 'later refresh jumped to previously marked file')
+stationary_view(before_progress, 'home file s after pull')
 local moved_file = home_row('Viewed files') + 1
 api.nvim_win_set_cursor(0, { moved_file, 0 })
 before_progress = vim.fn.winsaveview()
@@ -597,7 +552,7 @@ first.target.target.current = vim.deepcopy(first.target.target)
 first.target.target.current.revision = { head = revision.head }
 first.target.target.revision = { base = 'old-base', head = 'old-head' }
 write('state.json', next_state)
-command('refresh')
+command('pull')
 wait(function() return #requests('fetch_refresh') > 0 and state().generation > next_state.generation end)
 command('')
 wait(function() return kind() == 'home' end)
@@ -611,7 +566,7 @@ next_state = state()
 first = next_state.comments[1].comment.comment
 first.target.target.current = nil
 write('state.json', next_state)
-command('refresh')
+command('pull')
 wait(function() return state().generation > next_state.generation end)
 local review_tab = api.nvim_get_current_tabpage()
 local pinned = {}
@@ -645,7 +600,7 @@ wide.comment.comment.target = { kind = 'pull_request' }
 next_state.comments[#next_state.comments + 1] = unknown
 next_state.comments[#next_state.comments + 1] = wide
 write('state.json', next_state)
-command('refresh')
+command('pull')
 wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Feedback unknown', 1, true) end)
 home_row('Feedback unknown')
 require('buf_review').enter()
@@ -688,12 +643,10 @@ vim.fn.writefile({ '0.3' }, fixture .. '/delay_refresh')
 local cached_comments = vim.deepcopy(state().comments)
 completed_before = refresh_completions()
 command('')
-background_home('later cached entry', completed_before)
-wait(function() return refresh_completions() > completed_before end)
-wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('workspace changed in another session', 1, true) end)
+cached_home('later cached entry', completed_before)
+assert(refresh_completions() == completed_before, 'cached entry fetched remote state')
 completed_before = refresh_completions()
-command('refresh')
-background_home('later failed manual refresh', completed_before)
+command('pull')
 wait(function() return refresh_completions() > completed_before end)
 wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Fixture refresh failed', 1, true) end)
 vim.fn.delete(fixture .. '/delay_refresh')
@@ -720,7 +673,7 @@ local second_pr = home_row('#42 Other review')
 assert(api.nvim_buf_get_lines(0, second_pr - 1, second_pr, false)[1]:find('with details', 1, true), 'multiline PR title split its object row')
 vim.fn.writefile({ 'Listing failed\r', 'Provider list diagnostic', '  Final list diagnostic' }, fixture .. '/fail_list')
 local before_failed_list = #requests('list')
-command('refresh')
+command('pull')
 wait(function() return #requests('list') > before_failed_list and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Provider list diagnostic', 1, true) end)
 local failed_list = table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n')
 assert(failed_list:find('Listing failed\nProvider list diagnostic\n  Final list diagnostic', 1, true), 'list diagnostic lines were lost')
@@ -734,7 +687,7 @@ vim.fn.writefile({ '' }, fixture .. '/switch_workspace')
 completed_before = refresh_completions()
 require('buf_review').enter()
 wait(function() return #requests('route') > before_open and kind() == 'home' and vim.b.buf_review.workspace == 'workspace-42' end)
-background_home('PR switch after first session fetch', completed_before)
+cached_home('PR switch after first session fetch', completed_before)
 vim.fn.delete(fixture .. '/switch_workspace')
 assert(vim.b.buf_review.workspace == 'workspace-42', 'PR selection retained previous workspace identity')
 local selected_leave = #requests('leave')
@@ -742,22 +695,22 @@ command('leave')
 wait(function() return #requests('leave') == selected_leave + 1 end)
 assert(requests('leave')[#requests('leave')].workspace == 'workspace-42', 'selected workspace remained locked or action targeted old PR')
 assert(refresh_completions() == completed_before, 'PR switch action waited for remote refresh')
-wait(function() return refresh_completions() > completed_before end)
+assert(refresh_completions() == completed_before, 'cached PR switch fetched remote state')
 vim.fn.delete(fixture .. '/delay_refresh')
 assert(requests('route')[#requests('route')].url == 'https://github.com/acme/repo/pull/42', 'diagnostic lines shifted cached PR Enter target')
 assert(vim.deep_equal(api.nvim_buf_get_lines(source_buffer, 0, -1, false), source_body) and vim.bo[source_buffer].modified, 'review navigation changed ordinary source text')
 assert(state().comments[1].comment.comment.body == initial.comments[1].comment.comment.body)
 
--- Background refresh and unrelated own actions must not strand a composer.
+-- Explicit pull and unrelated own actions must not strand a composer.
 vim.fn.delete(fixture .. '/fail_refresh')
 vim.fn.writefile({ '0.2' }, fixture .. '/delay_refresh')
 local before_background = state().generation
 api.nvim_win_set_cursor(0, { 1, 0 })
 command('comment')
-edit('Typed while background refresh ran')
+edit('Typed before explicit pull')
 local retained_composer = api.nvim_get_current_buf()
-command('refresh')
-assert(api.nvim_get_current_buf() == retained_composer and kind() == 'composer' and vim.bo.modified and api.nvim_get_current_line() == 'Typed while background refresh ran', 'refresh replaced existing modified composer')
+command('pull')
+assert(api.nvim_get_current_buf() == retained_composer and kind() == 'composer' and vim.bo.modified and api.nvim_get_current_line() == 'Typed before explicit pull', 'refresh replaced existing modified composer')
 wait(function() return state().generation > before_background end)
 vim.fn.delete(fixture .. '/delay_refresh')
 local before_background_save = #requests('save')
@@ -877,7 +830,7 @@ receipt_view.comments[#receipt_view.comments + 1] = {
   fetched = false, done = false, conflict = false, summary = false,
 }
 write('state.json', receipt_view)
-command('refresh')
+command('pull')
 wait(function() return state().generation > receipt_view.generation end)
 assert(not table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('Published root before first refetch', 1, true), 'confirmed receipt appeared as an unpublished draft')
 local function open_receipt()

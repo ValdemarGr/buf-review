@@ -56,10 +56,11 @@ local home_buffer = api.nvim_get_current_buf()
 local function reset()
   for _, name in ipairs({ 'delay_code', 'delay_historical_code', 'delay_actions', 'delay_context', 'delay_log' }) do vim.fn.delete(fixture .. '/' .. name) end
   local value = vim.deepcopy(initial)
-  value.generation = state().generation
+  value.generation = state().generation + 1
+  value.review.read.pull_request.title = "Navigation reset " .. value.generation
   write('state.json', value)
   command('')
-  wait(function() return kind() == 'home' and state().generation > value.generation end, 'home reset did not complete')
+  wait(function() return kind() == 'home' and table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find(value.review.read.pull_request.title, 1, true) end, 'home reset did not complete')
   home_buffer = api.nvim_get_current_buf()
 end
 local function open(id)

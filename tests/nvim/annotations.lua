@@ -241,19 +241,19 @@ row('Feedback root'); progress('s', '2 comments [x]')
 local changed = state()
 changed.comments[1].done, changed.comments[2].done = false, false
 write(changed)
-command('refresh')
+command('pull')
 wait(function() return marker(head, 1):find('2 comments [ ]', 1, true) end, 'remote refresh did not recompute markers')
 ranges({ 1, 2 })
 changed = state()
 local moved = vim.deepcopy(changed.comments[1].comment.comment.target.target)
 moved.range.start.line, moved.range['end'].line = 2, 3
 changed.comments[1].comment.comment.target.target.current = moved
-write(changed); command('refresh')
+write(changed); command('pull')
 wait(function() return state().generation > changed.generation end, 'current anchor did not refresh')
 ranges({ 1, 2 })
 changed = state()
 changed.comments[1].comment.comment.target.target.current = nil
-write(changed); command('refresh')
+write(changed); command('pull')
 wait(function() return state().generation > changed.generation end, 'original anchor did not refresh')
 ranges({ 1, 2 })
 
@@ -270,7 +270,7 @@ ranges({ 1, 2 })
 vim.v.errmsg = ''
 api.nvim_win_call(duplicate_window, function() vim.fn.clearmatches() end)
 local before_cleared_refresh = state().generation
-command('refresh')
+command('pull')
 wait(function() return state().generation > before_cleared_refresh end, 'refresh after external match cleanup did not finish')
 ranges({ 1, 2 })
 assert(not vim.v.errmsg:find('E803', 1, true), 'external clearmatches caused stale match deletion error')
@@ -355,7 +355,7 @@ assert(marker(head, 1):find('2 comments', 1, true), 'selected-head markers lost 
 changed = state()
 changed.comments[9].comment.comment.target.target.range.start.line = 2
 changed.comments[9].comment.comment.target.target.range['end'].line = 7
-write(changed); command('refresh')
+write(changed); command('pull')
 wait(function() return state().generation > changed.generation end, 'out-of-bounds fixture did not refresh')
 open('far'); ranges({})
 open('missing'); ranges({})

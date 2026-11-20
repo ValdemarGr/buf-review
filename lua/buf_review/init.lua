@@ -11,9 +11,8 @@ local namespace = api.nvim_create_namespace('buf-review')
 local range_namespace = api.nvim_create_namespace('buf-review-comment-range')
 local highlighted, range_matches, range_pending = {}, {}, false
 local sequence = 0
-local first_load = true
 local commands = {
-  'prs', 'pr', 'start', 'leave', 'conclude', 'publish', 'refresh', 'comment', 'reply',
+  'prs', 'pr', 'start', 'leave', 'conclude', 'publish', 'pull', 'comment', 'reply',
   'edit', 'delete', 'restore', 'move', 'suggest', 'done', 'todo', 'viewed', 'unviewed',
   'next', 'previous', 'context', 'relocate', 'resolve', 'log', 'sessions', 'checkout',
 }
@@ -980,7 +979,7 @@ render_home = function(state, cursor)
   end
   local objects = state.objects
   local code_status = (not objects or not objects.done) and 'preparing pinned commits'
-    or (objects.error and 'fetch failed; open a file or :Review refresh to retry') or 'ready'
+    or (objects.error and 'fetch failed; open a file or :Review pull to retry') or 'ready'
   lines[#lines + 1] = 'Code: ' .. code_status
   highlights[#highlights + 1] = { line = #lines, group = objects and objects.error and 'BufReviewError' or 'BufReviewState' }
   local problem = state.error or view.comparison_error or view.last_error
@@ -1295,17 +1294,15 @@ refresh = function(state, callback, progress)
   end
   settle(state)
   local job = { callbacks = callback and { callback } or {}, report = not callback, progress = progress }
+  local function report(event) if job.progress then job.progress.update(event) end end
   state.refreshing = job
-  local was_loading = state.loading
-  local loading = first_load and 'Fetching comments, reactions and file progress.' or nil
-  if loading then state.loading = loading end
-  first_load = false
-  if (state.loading or was_loading) and valid(state.top) and (api.nvim_win_get_buf(state.top) == state.home or api.nvim_win_get_buf(state.top) == state.loading_buf) then
-    display_home(state)
-  end
   refresh_snapshot(state, function(response, err)
-    state.refreshing = nil
-    if loading and state.loading == loading then state.loading = nil end
+    local function complete(preparation_error)
+      state.refreshing = nil
+      err = err or preparation_error
+      if err and job.report then notify(err, vim.log.levels.ERROR) end
+      for _, receive in ipairs(job.callbacks) do receive(response, err) end
+    end
     local rendered, problem = pcall(function()
       state.refresh_deferred = response and response.refresh_deferred or false
       if not (response and response.refresh_deferred) then
@@ -1314,16 +1311,18 @@ refresh = function(state, callback, progress)
       end
       if response then apply(state, response, 'object') end
       refresh_checkout(state)
-      prepare_objects(state)
       if valid(state.top) and api.nvim_win_get_buf(state.top) == state.loading_buf then display_home(state) end
     end)
     if not rendered then
       err = err or ('Could not display refreshed review: ' .. tostring(problem))
       state.error = err
     end
-    if err and job.report then notify(err, vim.log.levels.ERROR) end
-    for _, receive in ipairs(job.callbacks) do receive(response, err) end
-  end, function(event) if job.progress then job.progress.update(event) end end)
+    if err or response and response.refresh_deferred then complete()
+    else
+      local started, preparation_error = pcall(prepare_objects, state, complete, true, { update = report })
+      if not started then complete(tostring(preparation_error)) end
+    end
+  end, report)
 end
 
 local function publish(state)
@@ -1349,7 +1348,7 @@ local function publish(state)
       if refresh_error then
         notify('Publication finished; refresh failed: ' .. refresh_error, vim.log.levels.WARN)
       elseif latest and latest.refresh_deferred then
-        notify('Publication finished; refresh deferred. Run :Review refresh to reconcile remote state.', vim.log.levels.WARN)
+        notify('Publication finished; refresh deferred. Run :Review pull to reconcile remote state.', vim.log.levels.WARN)
       end
     end
     local function fetch()
@@ -1390,7 +1389,7 @@ navigate = function(state, payload)
   progress.update({ message = 'Finding review' })
   if payload.op == 'list' then repository.query = { assignee = payload.assignee, state = payload.state } end
   repository.navigating = true
-  if (first_load or not state.view) and payload.op ~= 'sessions' and payload.op ~= 'list' then
+  if not state.view and payload.op ~= 'sessions' and payload.op ~= 'list' then
     state.loading = 'Finding review session.'
     home(state)
   end
@@ -1431,7 +1430,6 @@ navigate = function(state, payload)
           state.loading = nil
         end
         if response.fresh == true then
-          first_load = false
           current.loading, current.error, current.refresh_deferred = nil, nil, false
           current.refreshed_at = os.date('%H:%M:%S')
         end
@@ -1441,12 +1439,7 @@ navigate = function(state, payload)
         prepare_objects(current, function(preparation_error)
           current.loading = nil
           if valid(current.top) and api.nvim_win_get_buf(current.top) == current.loading_buf then display_home(current) end
-          if response.fresh ~= true then
-            refresh(current, function(_, err)
-              progress.finish(preparation_error or err)
-              if err then notify(err, vim.log.levels.ERROR) end
-            end, progress)
-          else progress.finish(preparation_error) end
+          progress.finish(preparation_error)
         end, true, progress)
         repository.navigating = nil
       elseif response.sessions then
@@ -2607,11 +2600,10 @@ dispatch = function(command, arguments, opts)
     guard(state)
     if state.view and ((meta and meta.kind ~= 'prs' and meta.kind ~= 'sessions') or vim.t.buf_review) then
       home(state, api.nvim_get_current_win())
-      local progress = progress_ui.start('Refresh')
-      refresh(state, function(_, err)
-        progress.finish(err)
+      request(state, 'get', {}, function(_, err)
         if err then notify(err, vim.log.levels.ERROR) end
-      end, progress)
+        if not err then prepare_objects(state) end
+      end)
     else navigate(state, { op = 'entry' }) end
     return
   end
@@ -2642,9 +2634,36 @@ dispatch = function(command, arguments, opts)
     navigate(state, payload)
     return
   end
-  if command == 'refresh' and meta and meta.kind == 'prs' then list(state); return end
-  if command == 'refresh' and meta and meta.kind == 'sessions' then
-    navigate(state, { op = 'sessions', workspace = state.view and state.view.id, pr = meta.pr })
+  if command == 'pull' then
+    local browser = meta and (meta.kind == 'prs' or meta.kind == 'sessions')
+    local finished = false
+    if browser then
+      if meta.kind == 'prs' then list(state)
+      else navigate(state, { op = 'sessions', workspace = state.view and state.view.id, pr = meta.pr }) end
+    else
+      require_view(state)
+      local progress = progress_ui.start('Pull')
+      refresh(state, function(response, err)
+        local rendered, problem = pcall(function()
+          render_pending(true)
+          highlight_comment(true)
+        end)
+        if not rendered then err = err or ('Could not redraw review: ' .. tostring(problem)) end
+        finished = true
+        progress.finish(err or response and response.refresh_deferred)
+        if err then notify(err, vim.log.levels.ERROR) end
+        if response and response.refresh_deferred then
+          notify('Pull deferred; remote state was not applied. Run :Review pull to retry.', vim.log.levels.WARN)
+        end
+      end, progress)
+    end
+    while not (finished or browser and not state.repository.navigating) do
+      local _, reason = vim.wait(1000, function()
+        if state.writer then state.writer.flush(true) end
+        return finished or browser and not state.repository.navigating
+      end, 10)
+      if reason == -2 then error('Pull continues in the background; wait for it to finish before retrying') end
+    end
     return
   end
   require_view(state)
@@ -2653,12 +2672,6 @@ dispatch = function(command, arguments, opts)
   elseif command == 'checkout' then
     if #arguments > 0 then error('Use :Review checkout') end
     checkout_current(state)
-  elseif command == 'refresh' then
-    local progress = progress_ui.start('Refresh')
-    refresh(state, function(_, err)
-      progress.finish(err)
-      if err then notify(err, vim.log.levels.ERROR) end
-    end, progress)
   elseif command == 'conclude' then conclude(state)
   elseif command == 'comment' then M.new_comment(arguments[1], false, opts)
   elseif command == 'reply' then reply(state, picked(state, meta), arguments[1])
@@ -2807,7 +2820,7 @@ function M.register()
   end, { nargs = '*', range = true, complete = complete, desc = 'Review and address PR feedback' })
   local mappings = api.nvim_get_keymap('n')
   for _, binding in ipairs({
-    { '<leader>rs', 'Review' }, { '<leader>rr', 'Review refresh' },
+    { '<leader>rs', 'Review' }, { '<leader>rr', 'Review pull' },
     { '<leader>rp', 'Review publish' }, { '<leader>rcc', 'Review conclude' },
     { '<leader>rcs', 'Review suggest' },
   }) do

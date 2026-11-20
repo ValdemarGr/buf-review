@@ -54,6 +54,8 @@ if request["op"] == "fetch_refresh":
     publication_event("fetch", publication=published and published["tag"])
     if published:
         prepared["fixture_snapshot"] = published["snapshot"]
+    elif (directory / "remote_state.json").exists():
+        prepared["fixture_snapshot"] = json.loads((directory / "remote_state.json").read_text())
     if (directory / "delay_refresh").exists():
         time.sleep(float((directory / "delay_refresh").read_text()))
     if (directory / "fail_refresh").exists():
@@ -477,6 +479,8 @@ elif op == "actions":
     response["workspace"], response["applied"] = view, applied
     with (directory / "action_results.jsonl").open("a") as stream:
         stream.write(json.dumps(response) + "\n")
+elif op == "get":
+    response["workspace"] = view
 elif op in {"active", "open", "refresh", "apply_refresh", "compare_latest", "publish", "submit"}:
     response = mutate(request)
 else:

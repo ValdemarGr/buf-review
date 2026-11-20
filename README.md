@@ -41,6 +41,12 @@ or jumps to a dedicated Review tab. If that repository's review is active
 elsewhere, the current tab takes over. Other user splits and unsaved source
 buffers are preserved.
 
+Cached sessions open from local state without an automatic remote refresh.
+A PR without cached state is fetched before its first view opens. Use
+`:Review pull` to fetch remote changes, reconcile saved intent and prepare Git
+objects; the command waits for completion and shows progress. It does not merge
+Git branches or change the checkout.
+
 Use `:Review pr master` to review the current branch against `master` before a
 GitHub PR exists. The command reuses an existing open PR for that exact source/
 target repository and branch pair, or creates a local PR intent before opening
@@ -83,8 +89,8 @@ composer locally; `:wq` returns to its originating reader or code context.
 Existing source editing and navigation remain ordinary Neovim.
 
 Default normal-mode shortcuts use your configured leader: `<leader>rs` shows
-Review, `<leader>rr` refreshes, `<leader>rp` publishes, `<leader>rcc` concludes a
-review, and `<leader>rcs` inserts a suggestion in its comment composer. Set
+Review, `<leader>rr` runs `:Review pull`, `<leader>rp` publishes, `<leader>rcc`
+concludes a review, and `<leader>rcs` inserts a suggestion in its comment composer. Set
 `mapleader` before loading the plugin. Existing user mappings take precedence.
 
 In the home buffer, `cc` or `:Review conclude` chooses Comment, Approve or
@@ -216,8 +222,8 @@ own write before returning. Pending local writes finish on editor exit.
 `a` supports complete insert/save/return sequences in native commands. Provider
 publication remains explicit and blocks until publication and its refresh
 complete; `:normal!` bypasses mappings.
-Background refresh fetches an immutable snapshot, then queues its local merge
-alongside writes. Local actions never wait for that network fetch.
+Pull fetches an immutable snapshot, then queues its local merge alongside writes.
+The explicit command waits for reconciliation and Git preparation.
 
 The selected session and saved drafts persist in the repository root's
 `.review/state.sqlite3`. Refresh preserves local intent, reports conflicts and
@@ -311,8 +317,8 @@ commands below remain available independently. Local mutation input is always an
 
 Routing that fetched a new snapshot can return `fresh_review`. Pass it to
 `select`; the backend returns `fresh:true` only when it matches the selected
-snapshot. This skips a duplicate first refresh. Cached selections still refresh;
-later refreshes run in the background. Hidden readers rebuild when displayed,
+snapshot. Cached selections reuse saved state without another remote fetch;
+`:Review pull` explicitly updates it. Hidden readers rebuild when displayed,
 so local actions redraw only visible review buffers.
 
 Selection runs `{"op":"fetch_objects","workspace":"BATCH-ID"}` before showing
@@ -320,9 +326,9 @@ review objects. Rust prepares checked-out `HEAD`, its review base and latest fet
 first, then batch-checks all original comment commits in Git's local object
 database. Any remaining missing hashes fetch together. Already-local commits need
 no network, including
-commits outside current branch history. Later refreshes prepare newly discovered
-hashes while the existing view remains usable. Unavailable historical hashes
-produce explicit warnings and retain the recorded-hunk fallback; unavailable
+commits outside current branch history. Explicit pulls prepare newly discovered
+hashes before returning. Unavailable historical hashes produce explicit warnings
+and retain the recorded-hunk fallback; unavailable
 current comparison commits produce an error. Git-object preparation never changes the current branch,
 worktree, index, refs or FETCH_HEAD.
 

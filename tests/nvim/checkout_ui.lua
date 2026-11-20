@@ -211,7 +211,7 @@ local refreshed = state()
 refreshed.review.read.pull_request.revision = { base = base, head = base }
 refreshed.review.read.pull_request.source.branch = 'updated-feature'
 write('state.json', refreshed)
-vim.cmd('Review refresh')
+vim.cmd('Review pull')
 wait(function()
   local row = checkout_row()
   return row and row:find('updated-feature', 1, true)
