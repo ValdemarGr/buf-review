@@ -10,8 +10,9 @@ comment checklist.
 Pushing a `v*` tag runs `.github/workflows/release.yml`, builds the `pr` CLI with
 the committed Cargo lockfile, checks `pr --version`, then immediately publishes a
 GitHub release with generated notes. The release asset
-`pr-<tag>-x86_64-unknown-linux-gnu.tar.gz` contains the `pr` executable, built on
-Ubuntu 24.04 for Linux x86_64 with glibc.
+`pr-<tag>-x86_64-unknown-linux-musl.tar.gz` contains the statically linked `pr`
+executable for Linux x86_64, built with musl and requiring no glibc. Git and
+authenticated `gh` remain runtime requirements.
 
 Commit the workflow and desired package version in `Cargo.toml` and `Cargo.lock`
 before tagging. For example:

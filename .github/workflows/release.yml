@@ -18,15 +18,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl compiler
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
 
       - name: Build CLI
-        run: cargo build --release --locked --bin pr
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl --bin pr
+
+      - name: Verify static linking
+        run: |
+          program_headers=$(readelf -lW target/x86_64-unknown-linux-musl/release/pr)
+          dynamic_section=$(readelf -dW target/x86_64-unknown-linux-musl/release/pr)
+          if grep -q INTERP <<< "$program_headers" || grep -q NEEDED <<< "$dynamic_section"; then
+            echo 'Expected a fully static musl binary' >&2
+            exit 1
+          fi
 
       - name: Smoke test CLI
-        run: target/release/pr --version
+        run: target/x86_64-unknown-linux-musl/release/pr --version
 
       - name: Package CLI
-        run: tar -czf "pr-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C target/release pr
+        run: tar -czf "pr-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz" -C target/x86_64-unknown-linux-musl/release pr
 
       - name: Publish release
         env:
@@ -34,5 +49,5 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          "pr-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          "pr-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz"
           --verify-tag --generate-notes
