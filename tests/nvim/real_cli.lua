@@ -1,7 +1,8 @@
 -- Invoked by the Rust integration harness with an isolated Git/gh fixture.
 local api = vim.api
 vim.opt.runtimepath:append(assert(vim.env.BUF_REVIEW_RUNTIME))
-vim.g.buf_review_executable = assert(vim.env.BUF_REVIEW_PR)
+local executable = assert(vim.env.BUF_REVIEW_PR)
+require('buf_review').setup({ executable = executable })
 vim.cmd('runtime plugin/buf_review.lua')
 local notices = {}
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end
@@ -15,7 +16,7 @@ local function input(keys)
   ReviewTest.wait(50)
 end
 local function active()
-  local result = vim.system({ vim.g.buf_review_executable, 'workspace' }, { stdin = vim.json.encode({ op = 'active' }), text = true }):wait()
+  local result = vim.system({ executable, 'workspace' }, { stdin = vim.json.encode({ op = 'active' }), text = true }):wait()
   assert(result.code == 0, result.stderr)
   return vim.json.decode(result.stdout, { luanil = { object = true, array = true } }).workspace
 end
@@ -66,7 +67,7 @@ require('buf_review').enter()
 assert(kind() == 'composer')
 api.nvim_buf_set_lines(0, 0, -1, false, { 'Unsaved local edit must survive external change' })
 local concurrent_edit = active()
-local external_edit = vim.system({ vim.g.buf_review_executable, 'workspace' }, {
+local external_edit = vim.system({ executable, 'workspace' }, {
   stdin = vim.json.encode({ op = 'actions', workspace = concurrent_edit.id, generation = concurrent_edit.generation, actions = { { action = 'save', comment = draft.comment.comment.id, body = 'Externally changed review reply' } } }), text = true,
 }):wait()
 assert(external_edit.code == 0, external_edit.stderr)
@@ -93,7 +94,7 @@ vim.cmd('Review conclude')
 wait(function() return kind() == 'composer' end, 'conclusion composer missing')
 api.nvim_buf_set_lines(0, 0, -1, false, { 'Saved summary, cancelled submission' })
 local concurrent = active()
-local changed = vim.system({ vim.g.buf_review_executable, 'workspace' }, {
+local changed = vim.system({ executable, 'workspace' }, {
   stdin = vim.json.encode({ op = 'actions', workspace = concurrent.id, generation = concurrent.generation, actions = { { action = 'viewed', path = 'file.rs', viewed = true } } }), text = true,
 }):wait()
 assert(changed.code == 0, changed.stderr)
@@ -210,7 +211,7 @@ for _, identity in ipairs({ 'own-root', assert(vim.env.BUF_REVIEW_RECEIPT_COMMEN
     { action = 'move', comments = { identity } },
   }) do
     local current = active()
-    local result = vim.system({ vim.g.buf_review_executable, 'workspace' }, {
+    local result = vim.system({ executable, 'workspace' }, {
       stdin = vim.json.encode({ op = 'actions', workspace = current.id, generation = current.generation, actions = { action } }), text = true,
     }):wait()
     assert(result.code == 0, result.stderr)
@@ -226,7 +227,7 @@ for _, identity in ipairs({ 'own-root', assert(vim.env.BUF_REVIEW_RECEIPT_COMMEN
   assert(unchanged, 'published validation changed identity, body, anchor, destination or deletion state')
   if not published.fetched then
     local current = active()
-    local result = vim.system({ vim.g.buf_review_executable, 'workspace' }, {
+    local result = vim.system({ executable, 'workspace' }, {
       stdin = vim.json.encode({ op = 'actions', workspace = current.id, generation = current.generation,
         actions = { { action = 'undo', comments = { identity } } } }), text = true,
     }):wait()

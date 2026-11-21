@@ -27,8 +27,41 @@ git push origin v0.1.0
 Install the CLI with `cargo install --path .`. Add this repository to Neovim's
 runtime path through your package manager or `pack/*/start` directory. Neovim
 0.10+, Git and authenticated `gh` are required; no setup call or Lua dependency
-is needed. The optional `vim.g.buf_review_executable` selects a different `pr`
-executable; otherwise it is found on PATH.
+is needed. By default, `pr` is found on PATH. To select another executable:
+
+```lua
+require("buf_review").setup({ executable = "/absolute/path/to/pr" })
+```
+
+Setup is optional and can run before or after plugin loading. Calling it without
+an executable preserves the current default.
+
+### Nix
+
+The flake exports `packages.x86_64-linux.cli` (the static musl Rust executable)
+and `packages.x86_64-linux.plugin` (the Neovim plugin). The plugin defaults to
+the CLI's absolute store path, so installing the plugin also builds and retains
+the matching CLI. No PATH lookup or Lua setup is needed for that default.
+
+Add the input to your flake:
+
+```nix
+inputs.buf-review.url = "github:valdemargr/buf-review";
+```
+
+For Home Manager, with `inputs` available to the module:
+
+```nix
+programs.neovim.plugins = [
+  inputs.buf-review.packages.${pkgs.system}.plugin
+];
+home.packages = [ pkgs.git pkgs.gh ];
+```
+
+Authenticate `gh` normally. An explicit Lua `setup({ executable = ... })`
+overrides the packaged path. To build either derivation locally, use
+`nix build .#cli` or `nix build .#plugin`. The existing `nix develop` shell remains
+available.
 
 Run `:Review` inside a Git repository. From source, the current branch's only
 open PR is selected; zero or multiple matches open the PR picker. Selecting a

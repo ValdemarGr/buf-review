@@ -9,8 +9,8 @@ end
 local fixture = vim.fn.tempname()
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.g.buf_review_executable = repository .. '/tests/nvim/fixture_pr.py'
 vim.opt.runtimepath:append(repository)
+require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 vim.cmd('runtime plugin/buf_review.lua')
 local messages = {}
 vim.notify = function(message) messages[#messages + 1] = tostring(message) end
@@ -1456,7 +1456,7 @@ end
 
 local first_failure = run('workflows', { BUF_REVIEW_FIRST_FAILURE = '1' })
 assert(first_failure.code == 0, first_failure.stderr)
-for _, name in ipairs({ 'sessions', 'review_tab', 'append', 'performance', 'object_fetch', 'commit_comparison', 'historical_panes', 'comment_panes', 'viewed_panes', 'local_panes', 'mark_move', 'diff_lifecycle', 'annotations', 'navigation', 'log', 'native_commands', 'composer_native', 'append_native', 'action_queue', 'overview_stats', 'diff_scroll', 'checkout_git', 'checkout_ui', 'local_pr', 'local_pr_cli', 'post_publish', 'mappings', 'jumplist', 'reader_reuse', 'review_queue', 'progress' }) do
+for _, name in ipairs({ 'setup', 'sessions', 'review_tab', 'append', 'performance', 'object_fetch', 'commit_comparison', 'historical_panes', 'comment_panes', 'viewed_panes', 'local_panes', 'mark_move', 'diff_lifecycle', 'annotations', 'navigation', 'log', 'native_commands', 'composer_native', 'append_native', 'action_queue', 'overview_stats', 'diff_scroll', 'checkout_git', 'checkout_ui', 'local_pr', 'local_pr_cli', 'post_publish', 'mappings', 'jumplist', 'reader_reuse', 'review_queue', 'progress' }) do
   local child = run(name)
   assert(child.code == 0, name .. ': ' .. child.stderr)
 end

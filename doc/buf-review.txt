@@ -4,8 +4,16 @@ Requires Neovim 0.10+, matching `pr` executable, Git, and authenticated `gh`.
 Install this repository as a Neovim plugin (or add its root to 'runtimepath').
 No setup call or Lua dependency is required. Run `:helptags {plugin}/doc` when
 installing manually. Optional executable override: >lua
-    vim.g.buf_review_executable = '/absolute/path/to/pr'
+    require('buf_review').setup({ executable = '/absolute/path/to/pr' })
 <
+Setup may run before or after plugin loading. Without an executable option it
+preserves the current default. Ordinary installations use pr on PATH.
+
+The Nix flake exports packages.x86_64-linux.cli (static musl) and
+packages.x86_64-linux.plugin. The plugin defaults to the matching CLI's absolute
+store path; installing it includes the CLI automatically. Lua setup can override
+that path. Git and authenticated gh remain environment requirements.
+
                                                         *:Review*
 :Review                         Bound review: its session home. Source buffer:
                                 resolve current branch's open PRs.

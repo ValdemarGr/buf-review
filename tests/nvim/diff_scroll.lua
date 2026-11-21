@@ -2,8 +2,8 @@ local api = vim.api
 local repository, fixture = vim.fn.getcwd(), vim.fn.tempname()
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.g.buf_review_executable = repository .. '/tests/nvim/fixture_pr.py'
 vim.opt.runtimepath:append(repository)
+require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 vim.cmd('runtime plugin/buf_review.lua')
 vim.o.lines, vim.o.columns = 60, 180
 vim.opt.diffopt = { 'internal', 'filler', 'closeoff', 'context:9999' }

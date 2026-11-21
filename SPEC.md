@@ -28,7 +28,13 @@ context is included. Existing core capabilities remain available through the CLI
 
 Require Neovim 0.10 or newer, the matching `pr` executable, Git and authenticated
 `gh` on PATH. Loading the plugin defines `:Review`; no setup call or required
-Lua dependency is needed. Report a missing executable/authentication with the
+Lua dependency is needed. Optional `require('buf_review').setup({ executable =
+PATH })` selects the CLI before or after plugin loading; omitting the option
+preserves its current default. Ordinary installations default to `pr` on PATH.
+The Nix flake exports `packages.x86_64-linux.cli` (static musl) and `.plugin`;
+the packaged plugin defaults to the matching CLI's absolute store path and
+retains it in its closure. Explicit Lua configuration overrides that path.
+Report a missing executable/authentication with the
 failing dependency identified. Use standard [Neovim process APIs](https://raw.githubusercontent.com/neovim/neovim/v0.10.0/runtime/doc/news.txt)
 with argument arrays, not interpolated shell commands.
 

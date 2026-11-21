@@ -1,9 +1,9 @@
-local M = {}
+local M = { executable = 'pr' }
 
 -- Rust owns provider operations and business rules. Lua sends typed requests;
 -- paths and comment bodies are never interpolated into a shell command.
 function M.request(root, request, callback, on_progress)
-  local executable = vim.g.buf_review_executable or 'pr'
+  local executable = M.executable
   if vim.fn.executable(executable) == 0 then
     callback(nil, 'Missing executable: ' .. executable .. ' (install the matching buf-review CLI)')
     return

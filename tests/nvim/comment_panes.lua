@@ -2,8 +2,8 @@ local api = vim.api
 local repository, fixture = vim.fn.getcwd(), vim.fn.tempname()
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.g.buf_review_executable = repository .. '/tests/nvim/fixture_pr.py'
 vim.opt.runtimepath:append(repository)
+require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 vim.cmd('runtime plugin/buf_review.lua')
 -- The first inspection enables highlight-state tracking and resets attribute IDs.
 api.nvim__inspect_cell(1, 0, 0)

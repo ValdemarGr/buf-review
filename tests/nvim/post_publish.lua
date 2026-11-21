@@ -16,8 +16,8 @@ end
 local fixture = vim.fn.tempname()
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.g.buf_review_executable = repository .. '/tests/nvim/fixture_pr.py'
 vim.opt.runtimepath:append(repository)
+require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 vim.cmd('runtime plugin/buf_review.lua')
 local notices = {}
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end

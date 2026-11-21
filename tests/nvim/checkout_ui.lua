@@ -45,8 +45,8 @@ vim.fn.writefile({
   'sys.exit(subprocess.run(["git", "switch", "feature"]).returncode)',
 }, bin .. '/gh')
 assert(vim.fn.setfperm(bin .. '/gh', 'rwxr-xr-x') == 1)
-vim.g.buf_review_executable = repository .. '/tests/nvim/fixture_pr.py'
 vim.opt.runtimepath:append(repository)
+require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 vim.cmd('runtime plugin/buf_review.lua')
 vim.cmd.cd(project)
 local notices = {}

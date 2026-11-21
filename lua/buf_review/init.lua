@@ -2773,6 +2773,14 @@ local function complete(lead, line)
   return vim.tbl_filter(function(value) return value:sub(1, #lead) == lead end, candidates)
 end
 
+function M.setup(opts)
+  vim.validate({ opts = { opts, 'table', true } })
+  if opts and opts.executable ~= nil then
+    vim.validate({ executable = { opts.executable, 'string' } })
+    client.executable = opts.executable
+  end
+end
+
 function M.register()
   api.nvim_create_autocmd({ 'TextChanged', 'TextChangedI', 'BufWritePost' }, { callback = function(event)
     for _, repository in pairs(repositories) do

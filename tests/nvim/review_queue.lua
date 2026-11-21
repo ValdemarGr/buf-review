@@ -2,8 +2,9 @@ local api = vim.api
 local repository, fixture = vim.fn.getcwd(), vim.fn.tempname()
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.g.buf_review_executable = repository .. '/tests/nvim/fixture_pr.py'
+local executable = repository .. '/tests/nvim/fixture_pr.py'
 vim.opt.runtimepath:append(repository)
+require('buf_review').setup({ executable = executable })
 vim.cmd('runtime plugin/buf_review.lua')
 local notices = {}
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end
@@ -133,7 +134,7 @@ assert(not vim.tbl_contains(state().pending, function(operation) return operatio
 command('publish')
 assert(#records('requests.jsonl', 'publish') == 1 and not (state().wip and state().wip.conclusion), 'Draft publication invented a review conclusion')
 local sent = state()
-local attempted = vim.system({ vim.g.buf_review_executable, 'workspace' }, {
+local attempted = vim.system({ executable, 'workspace' }, {
   cwd = repository, stdin = vim.json.encode({ op = 'actions', workspace = sent.id, generation = sent.generation,
     actions = { { action = 'save', comment = 'legacy-root', body = 'Attempted sent edit' } } }), text = true,
 }):wait()
