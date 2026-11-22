@@ -3,7 +3,7 @@ local repository, fixture = vim.fn.getcwd(), vim.fn.tempname()
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
 local executable = repository .. '/tests/nvim/fixture_pr.py'
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 require('buf_review').setup({ executable = executable })
 vim.cmd('runtime plugin/buf_review.lua')
 local notices = {}

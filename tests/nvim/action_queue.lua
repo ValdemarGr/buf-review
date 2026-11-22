@@ -1,5 +1,5 @@
 -- Queue contracts independent of rendering, Rust and provider fixtures.
-vim.opt.runtimepath:append(vim.fn.getcwd())
+vim.opt.runtimepath:prepend(vim.fn.getcwd())
 local actions = require('buf_review.actions')
 local notices = {}
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end

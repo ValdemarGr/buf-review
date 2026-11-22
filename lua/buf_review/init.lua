@@ -7,6 +7,7 @@ local checkout = require('buf_review.checkout')
 local comment_diff = require('buf_review.comment_diff')
 local progress_ui = require('buf_review.progress')
 local repositories, buffers = {}, {}
+local managed_diffs = {}
 local namespace = api.nvim_create_namespace('buf-review')
 local range_namespace = api.nvim_create_namespace('buf-review-comment-range')
 local highlighted, range_matches, range_pending = {}, {}, false
@@ -291,11 +292,50 @@ local function guard(state)
 end
 
 local function leave_diff(win)
+  if win then managed_diffs[win] = nil end
   if valid(win) then comment_diff.window(win, false) end
   if valid(win) and vim.wo[win].diff then
     api.nvim_win_call(win, function() vim.cmd('diffoff') end)
   end
 end
+
+api.nvim_create_autocmd('BufWinLeave', { callback = function(event)
+  local meta = buffers[event.buf]
+  for _, win in ipairs(vim.fn.win_findbuf(event.buf)) do
+    if managed_diffs[win] == event.buf or meta and meta.role then leave_diff(win) end
+  end
+end })
+
+api.nvim_create_autocmd({ 'BufEnter', 'BufWinEnter' }, { callback = function()
+  for win, previous in pairs(managed_diffs) do
+    if not valid(win) then managed_diffs[win] = nil
+    elseif api.nvim_win_get_buf(win) ~= previous then
+      managed_diffs[win] = nil
+      if api.nvim_buf_is_valid(previous) then
+        api.nvim_win_call(win, function()
+          local current, view = api.nvim_get_current_buf(), vim.fn.winsaveview()
+          local hidden = vim.bo[current].bufhidden
+          -- Clear this window's remembered diff options for the outgoing file,
+          -- including when another window still displays that file.
+          vim.bo[current].bufhidden = 'hide'
+          local ok, err = pcall(function()
+            api.nvim_cmd({ cmd = 'buffer', args = { tostring(previous) }, mods = {
+              noautocmd = true, keepalt = true, keepjumps = true, hide = true,
+            } }, {})
+            if vim.wo.diff then api.nvim_cmd({ cmd = 'diffoff', mods = { noautocmd = true } }, {}) end
+          end)
+          api.nvim_cmd({ cmd = 'buffer', args = { tostring(current) }, mods = {
+            noautocmd = true, keepalt = true, keepjumps = true, hide = true,
+          } }, {})
+          vim.bo[current].bufhidden = hidden
+          vim.fn.winrestview(view)
+          comment_diff.window(win, false)
+          if not ok then error(err) end
+        end)
+      end
+    end
+  end
+end })
 
 local function close_original(state)
   if valid(state.original) then
@@ -316,7 +356,7 @@ api.nvim_create_autocmd('WinClosed', { callback = function(event)
   local win = tonumber(event.match)
   comment_diff.window(win, false)
   local meta = valid(win) and buffers[api.nvim_win_get_buf(win)]
-  if meta and meta.role then leave_diff(win) end
+  if managed_diffs[win] or meta and meta.role then leave_diff(win) end
 end })
 
 local function tab(state)
@@ -375,11 +415,16 @@ local function delete_motion(visual)
 end
 
 local reader_windows = {
-  home = 'top', loading = 'top', prs = 'top', sessions = 'top', historical = 'left',
-  ['diff:base'] = 'left', ['diff:head'] = 'right', context = 'context_left',
-  ['diff:original_base'] = 'original',
-  ['context:base'] = 'context_left', ['context:head'] = 'context_right',
+  home = 'top', loading = 'top', prs = 'top', sessions = 'top',
 }
+
+local function retire_source(buf)
+  local meta = buffers[buf]
+  if meta and (meta.kind == 'diff' or meta.kind == 'context' or meta.kind == 'historical')
+    and api.nvim_buf_is_valid(buf) and #vim.fn.win_findbuf(buf) == 0 and not editor.retains(buf) then
+    api.nvim_buf_delete(buf, { force = true })
+  end
+end
 
 local function reader_slot(state, role)
   state.readers = state.readers or {}
@@ -401,7 +446,8 @@ end
 local function scratch(state, kind, object, lines, writable, role)
   role = role or kind
   local slot, buf
-  if not writable then slot, buf = reader_slot(state, role) end
+  local source = kind == 'diff' or kind == 'context' or kind == 'historical'
+  if not writable and not source then slot, buf = reader_slot(state, role) end
   local fresh = not buf
   if fresh then
     sequence = sequence + 1
@@ -440,9 +486,9 @@ local function scratch(state, kind, object, lines, writable, role)
     if meta.dirty then render_reader(buf, 'position') end
     activate(buf)
   end })
-  if not writable then
-    api.nvim_create_autocmd('BufWinLeave', { buffer = buf, callback = function()
-      for _, win in ipairs(vim.fn.win_findbuf(buf)) do leave_diff(win) end
+  if source then
+    api.nvim_create_autocmd('BufHidden', { buffer = buf, callback = function()
+      vim.schedule(function() retire_source(buf) end)
     end })
   end
   if kind == 'home' then
@@ -1516,6 +1562,37 @@ end
 show_diff = function(context, panes)
   local state, code = context.state, context.code
   guard(state)
+  local roles, prepared = {}, {}
+  local middle_buf, working_buf
+  for _, role in ipairs({ 'base', 'middle', 'right' }) do
+    local pane = panes[role]
+    if pane then
+      roles[#roles + 1] = role
+      local buf
+      if pane.kind == 'local' then
+        buf = vim.fn.bufadd(pane.path)
+        vim.fn.bufload(buf)
+        working_buf = buf
+      else
+        local version = context.versions[role]
+        local data = vim.tbl_extend('force', {}, code, { source_path = pane.path, missing = version.missing,
+          provenance = version.provenance, historical = pane.historical, comment_role = pane.comment_role })
+        local slot = role == 'right' and 'head' or (role == 'base' and panes.middle and 'original_base' or 'base')
+        buf = immutable(state, slot, code.path, pane.side, pane.revision, version.content, data)
+        buffers[buf].binary, buffers[buf].diff_context = code.binary, context
+        if pane.label then
+          local label = pane.label
+          if version.provenance == 'reconstructed' then label = label .. ' (reconstructed)' end
+          buffers[buf].pane_label = ('%s %s  %s%s'):format(label, pane.commit, pane.path, version.missing and ' [file absent]' or ''):gsub('%%', '%%%%')
+        end
+        if role == 'middle' then middle_buf = buf end
+      end
+      prepared[role] = buf
+    end
+  end
+  if middle_buf then
+    comment_diff.highlight(middle_buf, context.versions, code.binary, working_buf and local_text(working_buf))
+  end
   tab(state)
   if valid(state.discussion) then
     local buf = api.nvim_win_get_buf(state.discussion)
@@ -1537,14 +1614,10 @@ show_diff = function(context, panes)
   end
   table.sort(windows, function(a, b) return api.nvim_win_get_position(a)[2] < api.nvim_win_get_position(b)[2] end)
   if #windows == 0 then windows[1] = valid(state.top) and state.top or api.nvim_get_current_win() end
-  local previous_buffers = {}
-  for _, win in ipairs(windows) do previous_buffers[api.nvim_win_get_buf(win)] = true end
-  local roles = {}
-  for _, role in ipairs({ 'base', 'middle', 'right' }) do if panes[role] then roles[#roles + 1] = role end end
+  for _, win in ipairs(windows) do leave_diff(win) end
   while #windows > #roles do
     local win = table.remove(windows)
-    leave_diff(win)
-    api.nvim_win_close(win, true)
+    api.nvim_win_hide(win)
   end
   for index = 2, #roles do
     if not windows[index] then
@@ -1554,38 +1627,23 @@ show_diff = function(context, panes)
     end
   end
   state.diff_windows = {}
-  local middle_buf, working_buf
   for index, role in ipairs(roles) do
-    local pane, win = panes[role], windows[index]
+    local pane, win, buf = panes[role], windows[index], prepared[role]
     state.diff_windows[role] = win
-    leave_diff(win)
-    local buf
+    show_buffer(win, buf)
     if pane.kind == 'local' then
-      buf = vim.fn.bufadd(pane.path)
-      vim.fn.bufload(buf)
-      show_buffer(win, buf)
-      working_buf = buf
       vim.wo[win].winbar = ('Working tree  %s'):format(code.path):gsub('%%', '%%%%')
     else
-      local version = context.versions[role]
-      local data = vim.tbl_extend('force', {}, code, { source_path = pane.path, missing = version.missing,
-        provenance = version.provenance, historical = pane.historical, comment_role = pane.comment_role })
-      local slot = role == 'right' and 'head' or (role == 'base' and panes.middle and 'original_base' or 'base')
-      buf = immutable(state, slot, code.path, pane.side, pane.revision, version.content, data)
-      buffers[buf].binary, buffers[buf].diff_context = code.binary, context
-      show_buffer(win, buf)
-      if pane.label then
-        local label = pane.label
-        if version.provenance == 'reconstructed' then label = label .. ' (reconstructed)' end
-        buffers[buf].pane_label = ('%s %s  %s%s'):format(label, pane.commit, pane.path, version.missing and ' [file absent]' or ''):gsub('%%', '%%%%')
-      end
       render_file_winbar(buf, buffers[buf], state.view)
-      if role == 'middle' then middle_buf = buf end
     end
-    api.nvim_win_call(win, function()
-      if #roles > 1 then vim.cmd('diffthis') end
-      vim.wo.wrap = false
-    end)
+    vim.wo[win].wrap = false
+  end
+  if #roles > 1 then
+    for _, role in ipairs(roles) do
+      local win = state.diff_windows[role]
+      api.nvim_win_call(win, function() vim.cmd('diffthis') end)
+      managed_diffs[win] = prepared[role]
+    end
   end
   state.left = state.diff_windows.middle or state.diff_windows.base or state.diff_windows.right
   state.original = state.diff_windows.middle and state.diff_windows.base or nil
@@ -1593,14 +1651,10 @@ show_diff = function(context, panes)
   state.top, state.path, state.diff_context, state.diff_panes = state.left, code.path, context, panes
   context.panes = panes
   if middle_buf then
-    comment_diff.highlight(middle_buf, context.versions, code.binary, working_buf and local_text(working_buf))
     comment_diff.window(state.diff_windows.middle, true)
   end
-  for buf in pairs(previous_buffers) do
-    local meta = buffers[buf]
-    if meta and meta.state == state and meta.kind == 'diff' and #vim.fn.win_findbuf(buf) == 0 and not editor.retains(buf) then
-      api.nvim_buf_delete(buf, { force = true })
-    end
+  for buf, meta in pairs(buffers) do
+    if meta.state == state then retire_source(buf) end
   end
   api.nvim_set_current_win(panes.right and panes.right.kind == 'local' and state.left or state.diff_windows.right or state.left)
   activate(api.nvim_get_current_buf())
@@ -1657,12 +1711,6 @@ local function show_code(state, code)
 end
 
 local function show_historical_hunk(state, response, id)
-  tab(state)
-  close_original(state)
-  if valid(state.right) then leave_diff(state.right); api.nvim_win_close(state.right, true) end
-  state.right = nil
-  state.left = valid(state.left) and state.left or (valid(state.top) and state.top or api.nvim_get_current_win())
-  leave_diff(state.left)
   local lines = { 'Historical context unavailable', response.message or '', '' }
   vim.list_extend(lines, vim.split(response.diff_hunk or '', '\n', { plain = true }))
   local buf, meta = scratch(state, 'historical', id, lines)
@@ -1670,11 +1718,18 @@ local function show_historical_hunk(state, response, id)
   meta.path = response.anchor and response.anchor.path
   for line = 1, #lines do meta.rows[line] = { comment = id } end
   vim.bo[buf].filetype = 'diff'
+  tab(state)
+  close_original(state)
+  if valid(state.right) then leave_diff(state.right); api.nvim_win_close(state.right, true) end
+  state.right = nil
+  state.left = valid(state.left) and state.left or (valid(state.top) and state.top or api.nvim_get_current_win())
+  leave_diff(state.left)
   show_buffer(state.left, buf)
   vim.wo[state.left].winbar = 'Historical reference · recorded hunk'
   state.top, state.path = state.left, meta.path
   state.diff_windows = nil
   api.nvim_set_current_win(state.left)
+  for old, entry in pairs(buffers) do if entry.state == state then retire_source(old) end end
 end
 
 local function reveal_location(left, right, location)
@@ -2528,6 +2583,26 @@ local function context(state, row)
     if err then notify(err, vim.log.levels.ERROR); return end
     if state.repository.current ~= selection or state.repository.navigation ~= navigation or protected(state.repository.current) then return end
     local ctx = response.context
+    local base, head, single
+    local function source(buf)
+      local meta = buffers[buf]
+      for at = 1, api.nvim_buf_line_count(buf) do meta.rows[at] = { comment = content(row).id } end
+      local ft = vim.filetype.match({ filename = ctx.anchor and ctx.anchor.path or '' })
+      if ft then vim.bo[buf].filetype = ft end
+    end
+    if ctx.base_content ~= nil and ctx.head_content ~= nil then
+      base = scratch(state, 'context', content(row).id, vim.split(ctx.base_content, '\n', { plain = true }), false, 'context:base')
+      head = scratch(state, 'context', content(row).id, vim.split(ctx.head_content, '\n', { plain = true }), false, 'context:head')
+      source(base)
+      source(head)
+    elseif ctx.content ~= nil then
+      single = scratch(state, 'context', content(row).id, vim.split(ctx.content, '\n', { plain = true }))
+      source(single)
+    else
+      local lines = { 'Original context: ' .. content(row).id, 'Location unavailable', ctx.message or '', '', ctx.diff_hunk or ctx.hunk or '', '', content(row).body }
+      single = scratch(state, 'context', content(row).id, vim.split(table.concat(lines, '\n'), '\n', { plain = true }))
+      for at = 1, api.nvim_buf_line_count(single) do buffers[single].rows[at] = { comment = content(row).id } end
+    end
     if state.context_tab and api.nvim_tabpage_is_valid(state.context_tab) then
       api.nvim_set_current_tabpage(state.context_tab)
       if not valid(state.context_left) then
@@ -2541,51 +2616,40 @@ local function context(state, row)
     end
     leave_diff(state.context_left)
     if valid(state.context_right) then leave_diff(state.context_right) end
-    if not (ctx.base_content ~= nil and ctx.head_content ~= nil) and valid(state.context_right) then
-      api.nvim_win_close(state.context_right, false)
+    if not base and valid(state.context_right) then
+      api.nvim_win_hide(state.context_right)
       state.context_right = nil
     end
     api.nvim_set_current_win(state.context_left)
-    local title = 'Original context: ' .. content(row).id
-    local lines = { title, 'Location unavailable', ctx.message or '', '', ctx.diff_hunk or ctx.hunk or '', '', content(row).body }
-    local function source(buf, side, commit)
-      local meta = buffers[buf]
-      for at = 1, api.nvim_buf_line_count(buf) do meta.rows[at] = { comment = content(row).id } end
+    local function bind(buf, side, commit)
+      show_buffer(0, buf)
       local location = ctx.anchor
       local path = location and location.path or ''
-      local ft = vim.filetype.match({ filename = path })
-      if ft then vim.bo[buf].filetype = ft end
       vim.wo.winbar = ('Original %s %s  %s'):format(side, commit or '', path):gsub('%%', '%%%%')
     end
-    if ctx.base_content ~= nil and ctx.head_content ~= nil then
-      local base = scratch(state, 'context', content(row).id, vim.split(ctx.base_content, '\n', { plain = true }), false, 'context:base')
-      local head = scratch(state, 'context', content(row).id, vim.split(ctx.head_content, '\n', { plain = true }), false, 'context:head')
-      show_buffer(0, base)
+    if base then
+      bind(base, 'base', ctx.anchor and ctx.anchor.revision.base)
       local base_win = api.nvim_get_current_win()
-      vim.cmd('diffthis')
-      source(base, 'base', ctx.anchor and ctx.anchor.revision.base)
       if not valid(state.context_right) then
         vim.cmd('keepjumps rightbelow vsplit')
         state.context_right = api.nvim_get_current_win()
         leave_diff(state.context_right)
       else api.nvim_set_current_win(state.context_right) end
-      show_buffer(0, head)
+      bind(head, 'head', ctx.anchor and ctx.anchor.revision.head)
+      api.nvim_win_call(base_win, function() vim.cmd('diffthis') end)
+      managed_diffs[base_win] = base
       vim.cmd('diffthis')
-      source(head, 'head', ctx.anchor and ctx.anchor.revision.head)
+      managed_diffs[api.nvim_get_current_win()] = head
       reveal_location(base_win, api.nvim_get_current_win(), ctx.anchor)
     elseif ctx.content ~= nil then
-      lines = vim.split(ctx.content, '\n', { plain = true })
-      local buf = scratch(state, 'context', content(row).id, lines)
-      show_buffer(0, buf)
       local side = ctx.anchor and ctx.anchor.range and ctx.anchor.range.start.side or 'head'
-      source(buf, side, ctx.anchor and ctx.anchor.revision[side])
+      bind(single, side, ctx.anchor and ctx.anchor.revision[side])
       reveal_location(api.nvim_get_current_win(), api.nvim_get_current_win(), ctx.anchor)
     else
-      local buf, meta = scratch(state, 'context', content(row).id, vim.split(table.concat(lines, '\n'), '\n', { plain = true }))
-      for at = 1, api.nvim_buf_line_count(buf) do meta.rows[at] = { comment = content(row).id } end
-      show_buffer(0, buf)
+      show_buffer(0, single)
       vim.wo.winbar = 'Original context unavailable; recorded discussion'
     end
+    for old, entry in pairs(buffers) do if entry.state == state then retire_source(old) end end
   end, false)
 end
 

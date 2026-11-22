@@ -16,7 +16,7 @@ vim.g.mapleader = ' '
 local fixture, hits = vim.fn.tempname(), {}
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 if mode == 'preservation' then
   for _, key in ipairs({ ' rs', ']r', '[f', '[R', ']c' }) do

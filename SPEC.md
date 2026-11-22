@@ -604,15 +604,21 @@ action-list API, preserving cursor and scroll position without navigation.
 Historical code cannot mark a current file viewed; mark the comment Done from
 its discussion instead. Native `[c`/`]c` remain diff-hunk navigation.
 
-Reuse stable numbered reader buffers by review and reader kind/side. Navigation
-replaces the contents and resets target metadata, highlights and filetype together.
-Do not retarget a reader displayed outside its managed pane, including other tabs;
-use another slot instead. Such copies retain their original target and continue
-normal refreshes for that target. Composers keep private buffers, and their return
-readers cannot be reassigned until the composer closes.
-Unregister outgoing managed diff panes before replacing or closing them. Hidden
-reader slots must not accumulate native diff membership, and unrelated user diffs
-remain untouched. Register only the new displayed pair.
+Home, discussion and browser readers reuse numbered buffers by review and reader
+kind. Each new code comparison, including original context, gets fresh immutable
+buffers with its own target metadata, highlights and filetype. Prepare them
+off-screen while the current comparison stays visible; fetching must not clear
+the existing view. Once ready, synchronously unregister the outgoing managed
+diff, replace the existing panes' buffers and register the new comparison,
+without waiting or explicitly redrawing between those steps.
+Retire old code buffers when no window displays them and no composer retains
+them. Manual copies, including other tabs, retain their original target and
+continue normal refreshes for that target. Composers keep private buffers, and
+their return readers stay reserved until close.
+The same detach rule applies when replacing a native Local pane's buffer or
+closing its window: preserve the ordinary file buffer and unsaved edits while
+removing its Review diff state. Hidden buffers must not remain in that comparison;
+unrelated user diffs remain untouched.
 Use native `keepjumps` for internal buffer switches and pane creation, including
 composer returns and original-context tabs. Preserve existing jump history;
 ordinary user motions retain their native jump behavior.

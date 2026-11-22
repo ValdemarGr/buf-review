@@ -2,7 +2,7 @@ local api = vim.api
 local repository, fixture = vim.fn.getcwd(), vim.fn.tempname()
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 vim.cmd('runtime plugin/buf_review.lua')
 local notices = {}
@@ -88,21 +88,30 @@ end
 row('a.lua', true); require('buf_review').enter()
 wait(function() return kind() == 'diff' end, 'Lua file missing')
 local slots, windows = pair('a.lua')
-local original_name = api.nvim_buf_get_name(slots.head)
 local original_autocmds = #api.nvim_get_autocmds({ buffer = slots.head })
+local function fresh(path, filetype, fragment)
+  local previous = slots
+  local current, current_windows = pair(path)
+  assert(current.base ~= previous.base and current.head ~= previous.head, 'New comparison reused source buffers')
+  assert(vim.deep_equal(current_windows, windows), 'New comparison recreated existing windows')
+  for _, buf in pairs(previous) do assert(not api.nvim_buf_is_valid(buf), 'Retired source buffer survived replacement') end
+  slots = current
+  named(slots.base); named(slots.head)
+  assert(vim.bo[slots.head].filetype == filetype and text(slots.head):find(fragment, 1, true), 'Fresh comparison has wrong content or filetype')
+  assert(#api.nvim_get_autocmds({ buffer = slots.head }) == original_autocmds, 'Fresh source setup accumulated handlers')
+end
 for _ = 1, 4 do
   command('next file'); wait(function() return kind() == 'diff' and vim.b.buf_review.path == 'b.md' end, 'Markdown file missing')
-  assert(vim.deep_equal(pair('b.md'), slots), 'File navigation replaced reader buffers')
-  assert(vim.bo[slots.head].filetype == 'markdown' and text(slots.head):find('After docs', 1, true), 'Reused reader retained old code or filetype')
+  fresh('b.md', 'markdown', 'After docs')
   command('next file'); wait(function() return kind() == 'diff' and vim.b.buf_review.path == 'plain' end, 'Untyped file missing')
-  assert(vim.deep_equal(pair('plain'), slots) and vim.bo[slots.head].filetype == 'review', 'Unknown file inherited previous source filetype')
+  fresh('plain', 'review', 'After plain')
   command('previous file'); wait(function() return kind() == 'diff' and vim.b.buf_review.path == 'b.md' end, 'Previous Markdown missing')
+  fresh('b.md', 'markdown', 'After docs')
   command('previous file'); wait(function() return kind() == 'diff' and vim.b.buf_review.path == 'a.lua' end, 'Previous Lua missing')
-  assert(vim.deep_equal(pair('a.lua'), slots) and api.nvim_buf_get_name(slots.head) == original_name, 'Reader identity or name changed')
+  fresh('a.lua', 'lua', 'local after')
 end
-named(home_buffer); named(slots.base); named(slots.head)
-assert(vim.bo[slots.head].filetype == 'lua' and #api.nvim_get_autocmds({ buffer = slots.head }) == original_autocmds, 'Reader reuse accumulated handlers or retained filetype')
-assert(vim.fn.maparg('a', 'x', false, true).callback, 'Reused code lost visual append')
+named(home_buffer)
+assert(vim.fn.maparg('a', 'x', false, true).callback, 'Fresh code lost visual append')
 home()
 assert(vim.b.buf_review.path == nil and vim.b.buf_review.side == nil and vim.bo.filetype == 'review', 'Overview inherited source metadata')
 assert(vim.fn.maparg('a', 'x') == '' and vim.fn.maparg('dd', 'n') ~= '', 'Reader role mappings leaked across views')
@@ -115,8 +124,8 @@ wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'b' end
 assert(api.nvim_get_current_buf() == thread and text():find('Feedback b', 1, true) and not text():find('Feedback a', 1, true), 'Thread reader identity or object was stale')
 open('historical')
 local historical_slots = pair('a.lua')
-assert(historical_slots.base == slots.base and historical_slots.head == slots.head, 'Historical pair allocated new reader buffers')
-assert(vim.b[slots.base].buf_review.historical, 'Historical setup lost source identity')
+assert(historical_slots.base ~= slots.base and historical_slots.head ~= slots.head, 'Historical pair reused current source buffers')
+assert(vim.b[historical_slots.base].buf_review.historical, 'Historical setup lost source identity')
 
 -- Refreshing original context keeps a manually retained source snapshot visible.
 local review_tab = api.nvim_get_current_tabpage()
@@ -140,8 +149,9 @@ local _, historical_windows = pair('a.lua')
 api.nvim_set_current_win(historical_windows.head)
 command('next file')
 wait(function() return kind() == 'diff' and vim.b.buf_review.path == 'b.md' end, 'Current code after historical view missing')
-assert(vim.deep_equal(pair('b.md'), slots), 'Historical/current switch replaced reader buffers')
-for _, buf in pairs(slots) do
+local current_slots = pair('b.md')
+assert(current_slots.base ~= historical_slots.base and current_slots.head ~= historical_slots.head, 'Historical/current switch reused source buffers')
+for _, buf in pairs(current_slots) do
   local meta = vim.b[buf].buf_review
   assert(not meta.historical and not meta.provenance and meta.source_path == 'b.md' and vim.deep_equal(meta.revision, revision), 'Historical metadata leaked into current code')
 end
@@ -160,8 +170,8 @@ for index = 1, 12 do
   local current = pair(path)
   assert(current.head ~= snapshot and vim.deep_equal(vim.b[snapshot].buf_review, metadata) and text(snapshot) == contents, 'Navigation repurposed visible snapshot')
   api.nvim_win_close(extra, true)
-  assert(api.nvim_buf_is_valid(snapshot) and text(snapshot) == contents, 'Closing snapshot wiped or unloaded its content')
-  assert(count_readers() <= before + 1, 'Repeated snapshots allocated unbounded reader slots')
+  wait(function() return not api.nvim_buf_is_valid(snapshot) end, 'Closing last snapshot window did not retire source')
+  assert(count_readers() <= before + 1, 'Repeated snapshots retained hidden source buffers')
   assert(not vim.v.errmsg:find('E96', 1, true), 'Hidden reader slots remained in native diff membership')
 end
 
@@ -200,6 +210,6 @@ command('prs'); wait(function() return kind() == 'prs' end, 'Return PR browser m
 row('#1 Fixture review'); require('buf_review').enter()
 wait(function() return kind() == 'home' and vim.b.buf_review.workspace == current.id end, 'Original session missing')
 assert(api.nvim_get_current_buf() == home_buffer, 'Returning session replaced its home reader')
-print('Neovim reusable reader slots passed')
+print('Neovim fresh source buffers and reusable discussion readers passed')
 vim.fn.delete(fixture, 'rf')
 vim.cmd('qa!')

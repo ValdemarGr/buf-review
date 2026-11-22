@@ -61,7 +61,7 @@ if not resume then
 end
 vim.env.BUF_REVIEW_LOCAL_PR_LOG = sandbox .. '/gh.jsonl'
 vim.env.PATH = bin .. ':' .. vim.env.PATH
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 require('buf_review').setup({ executable = executable })
 vim.cmd('runtime plugin/buf_review.lua')
 vim.cmd.cd(project)

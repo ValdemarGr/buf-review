@@ -1,6 +1,6 @@
 -- Separate editor process: shutdown and final-window close must never submit.
 local api = vim.api
-vim.opt.runtimepath:append(vim.fn.getcwd())
+vim.opt.runtimepath:prepend(vim.fn.getcwd())
 require('buf_review').setup({ executable = vim.fn.getcwd() .. '/tests/nvim/fixture_pr.py' })
 vim.notify = function() end
 vim.cmd('runtime plugin/buf_review.lua')

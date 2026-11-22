@@ -219,9 +219,16 @@ hunk above the thread. Historical code remains a reference: replies and Done wor
 in the thread, while new inline comments and file-viewed marks require current
 code.
 PR-wide comments open their discussion without changing code.
-Readers reuse stable numbered buffers during navigation. A manual split keeps
-its existing target; navigation uses another slot when needed. Composers remain
-separate, and their return readers stay reserved until the composer closes.
+Home, discussion and browser readers reuse numbered buffers. Each new code
+comparison gets fresh immutable buffers prepared off-screen while the existing
+comparison stays visible. Once ready, a synchronous swap detaches the old managed
+diff, replaces buffers in the existing panes and enables the new diff. Retired
+code buffers are deleted once no window displays them and no composer retains
+them. Manual splits keep their original snapshots; composers keep their private
+buffers and reserve their return readers until close.
+Replacing a Local pane's buffer or closing its window clears its Review diff
+state while preserving the ordinary file buffer and unsaved edits. Unrelated
+user diff windows remain intact.
 PR/session navigation and `o` use the active view's tab. Closing that tab does
 not create a replacement; the next `:Review` uses its invoking window and tab.
 

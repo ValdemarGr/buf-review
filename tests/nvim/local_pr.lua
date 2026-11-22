@@ -31,7 +31,7 @@ assert(vim.fn.setfperm(bin .. '/gh', 'rwxr-xr-x') == 1)
 vim.env.BUF_REVIEW_GH_LOG = gh_log
 vim.env.PATH = bin .. ':' .. vim.env.PATH
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 vim.cmd('runtime plugin/buf_review.lua')
 vim.cmd.cd(project)

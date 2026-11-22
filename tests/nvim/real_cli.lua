@@ -1,6 +1,6 @@
 -- Invoked by the Rust integration harness with an isolated Git/gh fixture.
 local api = vim.api
-vim.opt.runtimepath:append(assert(vim.env.BUF_REVIEW_RUNTIME))
+vim.opt.runtimepath:prepend(assert(vim.env.BUF_REVIEW_RUNTIME))
 local executable = assert(vim.env.BUF_REVIEW_PR)
 require('buf_review').setup({ executable = executable })
 vim.cmd('runtime plugin/buf_review.lua')

@@ -1,7 +1,7 @@
 -- Native command composition must finish each local composer before consuming
 -- the remaining command stream. No remote provider is involved in this fixture.
 local api = vim.api
-vim.opt.runtimepath:append(vim.fn.getcwd())
+vim.opt.runtimepath:prepend(vim.fn.getcwd())
 local editor = require('buf_review.editor')
 local origin = api.nvim_get_current_buf()
 api.nvim_buf_set_lines(origin, 0, -1, false, { 'first', 'second', 'third' })

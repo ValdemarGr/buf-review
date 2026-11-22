@@ -2,7 +2,7 @@ local api = vim.api
 local repository, fixture = vim.fn.getcwd(), vim.fn.tempname()
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 vim.cmd('runtime plugin/buf_review.lua')
 local notices = {}
@@ -79,12 +79,12 @@ end
 command(''); wait(function() return kind() == 'home' end, 'home missing')
 row(path(1)); require('buf_review').enter()
 local previous = open_file(1)
-local initial_pair = vim.deepcopy(previous)
--- More than eight files reuse the same real diff buffers without a reset break.
+-- More than eight files use fresh buffers without retaining hidden diff state.
 for index = 2, 12 do
   command('next file')
   local current = open_file(index)
-  assert(vim.deep_equal(current, initial_pair), 'file navigation replaced reusable diff buffers')
+  assert(not vim.deep_equal(current, previous), 'file navigation reused previous comparison buffers')
+  for _, buf in ipairs(previous) do assert(not api.nvim_buf_is_valid(buf), 'retired comparison buffer was not deleted') end
   assert(owned_count() == 2, 'file navigation allocated additional diff buffers')
   previous = current
 end
@@ -144,7 +144,10 @@ for index = 1, 12 do
   wait(function() return kind() == 'context' and api.nvim_get_current_line() == contents
     and #api.nvim_tabpage_list_wins(0) == 2 end, 'original context did not open')
   local current = pair(nil, 'context')
-  if context_previous then assert(vim.deep_equal(current, context_previous), 'context refresh replaced reusable source buffers') end
+  if context_previous then
+    assert(not vim.deep_equal(current, context_previous), 'context refresh reused previous source buffers')
+    for _, buf in ipairs(context_previous) do assert(not api.nvim_buf_is_valid(buf), 'retired context buffer survived replacement') end
+  end
   for _, buf in ipairs(main_pair) do assert(api.nvim_buf_is_valid(buf), 'context replacement wiped visible review code') end
   assert(api.nvim_buf_is_valid(preserved_other) and api.nvim_buf_is_valid(preserved_extra), 'context cleanup wiped another visible reader')
   assert(api.nvim_buf_is_valid(ordinary) and vim.wo[ordinary_window].diff, 'context cleanup altered user diff')
@@ -163,7 +166,7 @@ api.nvim_set_current_tabpage(review_tab)
 command('previous comment')
 wait(function() return kind() == 'thread' and vim.b.buf_review.object == 'comment-10' end, 'navigation after retained readers closed failed')
 pair(path(10), 'comment')
-assert(api.nvim_buf_is_valid(preserved_extra) and api.nvim_buf_is_valid(preserved_other), 'hidden reader slots were wiped instead of retained for reuse')
+wait(function() return not api.nvim_buf_is_valid(preserved_extra) and not api.nvim_buf_is_valid(preserved_other) end, 'closed source snapshots were not retired')
 assert(owned_count() <= 6, 'closed snapshots allocated more reader slots')
 assert(api.nvim_buf_is_valid(ordinary) and vim.wo[ordinary_window].diff, 'ordinary user diff was not preserved')
 api.nvim_win_close(ordinary_window, true)

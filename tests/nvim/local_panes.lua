@@ -2,7 +2,7 @@ local api = vim.api
 local repository, project = vim.fn.getcwd(), vim.fn.tempname()
 vim.fn.mkdir(project, 'p')
 vim.env.BUF_REVIEW_FIXTURE = project
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 local function git(...)
   local result = vim.system(vim.list_extend({ 'git' }, { ... }), { cwd = project, text = true }):wait()

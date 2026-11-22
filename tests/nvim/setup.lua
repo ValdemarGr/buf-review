@@ -1,7 +1,7 @@
 local api = vim.api
 local repository, directory = vim.fn.getcwd(), vim.fn.tempname() .. ' executable paths'
 vim.fn.mkdir(directory, 'p')
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 local function executable(name, selected)
   local path = directory .. '/' .. name
   vim.fn.writefile({ '#!/bin/sh', "printf '%s\\n' '" .. vim.json.encode({ selected = selected }) .. "'" }, path)

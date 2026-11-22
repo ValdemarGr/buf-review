@@ -465,11 +465,17 @@ imports/sessions. PR preparation refetches locally pruned objects when possible.
 SQLite shares fetched payloads; workspace history stores references and field
 changes. Unchanged fetches reuse matching snapshots. Only the current database
 format is supported; incompatible databases are rejected without conversion.
-Reader buffers have stable numbered names and are reused during navigation.
-Manual splits keep their original target, including in other tabs; another slot
-is used when needed. Composers keep private buffers and reserve their return
-readers until close. Outgoing panes leave diff mode before reuse; hidden slots
-do not remain registered in native diffs. Ordinary user diff buffers stay intact.
+Home, discussion and browser readers reuse numbered buffers. Each new code
+comparison, including original context, uses fresh immutable buffers prepared
+off-screen while the existing view stays visible. Once ready, a synchronous
+swap detaches the old managed diff, replaces buffers in the existing panes and
+enables the new diff, without waiting or explicitly redrawing midway.
+Retired code buffers are deleted once no window displays them and no composer
+retains them. Manual splits keep their original snapshots, including in other
+tabs. Composers keep private buffers and reserve their return readers until close.
+Replacing a Local pane's buffer or closing its window clears its Review diff
+state while preserving the ordinary file buffer and unsaved edits. Hidden
+buffers do not remain in that comparison; unrelated user diff windows stay intact.
 
                                                         *buf-review-validation*
 Offline fixture workflows: >sh

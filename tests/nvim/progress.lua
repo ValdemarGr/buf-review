@@ -2,7 +2,7 @@ local api = vim.api
 local repository, fixture = vim.fn.getcwd(), vim.fn.tempname()
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_progress.py' })
 local client = require('buf_review.client')
 local function wait(predicate, reason)

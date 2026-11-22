@@ -2,7 +2,7 @@ local api = vim.api
 local repository, fixture = vim.fn.getcwd(), vim.fn.tempname()
 vim.fn.mkdir(fixture, 'p')
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 vim.cmd('runtime plugin/buf_review.lua')
 local notices = {}
@@ -239,11 +239,10 @@ for _, buf in ipairs(api.nvim_list_bufs()) do
     owned = owned + 1
     if #vim.fn.win_findbuf(buf) == 0 then
       hidden = hidden + 1
-      assert(meta.comment_role == 'selected_head', 'hidden non-selected pane retained')
     end
   end
 end
-assert(owned == 3 and hidden == 1, 'historical/current switching accumulated diff buffers: ' .. owned .. '/' .. hidden)
+assert(owned == 2 and hidden == 0, 'historical/current switching retained obsolete source buffers: ' .. owned .. '/' .. hidden)
 input('a')
 wait(function() return kind() == 'composer' end, 'reply composer missing')
 api.nvim_buf_set_lines(0, 0, -1, false, { 'Unsaved reply' })

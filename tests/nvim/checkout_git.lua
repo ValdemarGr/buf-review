@@ -1,4 +1,4 @@
-vim.opt.runtimepath:append(vim.fn.getcwd())
+vim.opt.runtimepath:prepend(vim.fn.getcwd())
 local checkout = require('buf_review.checkout')
 local api = vim.api
 local root, bin = vim.fn.tempname(), vim.fn.tempname()

@@ -20,7 +20,7 @@ local history = vim.fn.getjumplist()
 assert(#history[1] == 2 and history[1][1].lnum == 3 and history[1][2].lnum == 7, 'User jump history was not seeded')
 
 vim.env.BUF_REVIEW_FIXTURE = fixture
-vim.opt.runtimepath:append(repository)
+vim.opt.runtimepath:prepend(repository)
 require('buf_review').setup({ executable = repository .. '/tests/nvim/fixture_pr.py' })
 vim.cmd('runtime plugin/buf_review.lua')
 local notices = {}
