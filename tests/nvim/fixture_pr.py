@@ -460,7 +460,8 @@ elif op == "log":
          "raw": json.dumps({"generation": 0, "action": {"action": "open"}}, indent=2).splitlines()}
     ]
 elif op == "get":
-    response["workspace"] = view
+    print(json.dumps({"workspace": view}))
+    sys.exit(0)
 elif op == "actions":
     applied = 0
     generation = request["generation"]
@@ -479,8 +480,6 @@ elif op == "actions":
     response["workspace"], response["applied"] = view, applied
     with (directory / "action_results.jsonl").open("a") as stream:
         stream.write(json.dumps(response) + "\n")
-elif op == "get":
-    response["workspace"] = view
 elif op in {"active", "open", "refresh", "apply_refresh", "compare_latest", "publish", "submit"}:
     response = mutate(request)
 else:

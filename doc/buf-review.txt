@@ -312,6 +312,9 @@ Corrections use new comments or replies. PR-wide comments retain targets.
 
 Composers contain only ordinary Markdown. Target and status appear in the
 window winbar, without virtual headers in the buffer.
+Review headers stay with their views. Leaving a view restores the previous
+local winbar, preserving global inheritance and user overrides; ordinary file
+opens do not inherit Review headers.
     :w      Save locally; keep composer open. Never publish.
     :wq     Save locally; return to originating reader/context on success.
     :q      Normal modified-buffer protection; never publish comments.

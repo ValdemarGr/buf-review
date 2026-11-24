@@ -238,6 +238,10 @@ Current-comparison Base/Head diff winbars show `[viewed]` or `[unviewed]` beside
 the file path, preserving their revision/path labels. Derive this marker from
 projected local progress: both panes update after `s`/`u` without publishing.
 Historical winbars retain their existing labels.
+Review headers belong to their views, including the editable Local pane. Restore
+the previous local winbar when the view leaves; preserve global inheritance and
+user overrides. Reopening a native file in another window must not inherit a
+Review header from its saved window options.
 
 Opening a discussion uses one reusable split below both code panes:
 

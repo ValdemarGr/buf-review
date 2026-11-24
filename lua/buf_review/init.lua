@@ -8,6 +8,7 @@ local comment_diff = require('buf_review.comment_diff')
 local progress_ui = require('buf_review.progress')
 local repositories, buffers = {}, {}
 local managed_diffs = {}
+local managed_headers = {}
 local namespace = api.nvim_create_namespace('buf-review')
 local range_namespace = api.nvim_create_namespace('buf-review-comment-range')
 local highlighted, range_matches, range_pending = {}, {}, false
@@ -53,6 +54,42 @@ end
 local function valid(win)
   return win and api.nvim_win_is_valid(win)
 end
+
+local function set_winbar(win, buf, value)
+  if not valid(win) or api.nvim_win_get_buf(win) ~= buf then return end
+  local current = api.nvim_get_option_value('winbar', { win = win, scope = 'local' })
+  local header = managed_headers[win]
+  if not header or header.buffer ~= buf or current ~= header.value then
+    header = { buffer = buf, previous = current }
+    managed_headers[win] = header
+  end
+  header.value = value
+  vim.wo[win].winbar = value
+end
+
+local function restore_winbar(win)
+  local header = managed_headers[win]
+  if not header or not valid(win) or api.nvim_win_get_buf(win) ~= header.buffer then return end
+  if api.nvim_get_option_value('winbar', { win = win, scope = 'local' }) == header.value then
+    vim.wo[win].winbar = header.previous
+  end
+  managed_headers[win] = nil
+end
+
+local split_header
+api.nvim_create_autocmd('WinLeave', { callback = function()
+  local win = api.nvim_get_current_win()
+  local header = managed_headers[win]
+  split_header = header and api.nvim_get_option_value('winbar', { win = win, scope = 'local' }) == header.value
+    and vim.deepcopy(header) or nil
+end })
+api.nvim_create_autocmd('WinNew', { callback = function(event)
+  local win = tonumber(event.match)
+  if split_header and valid(win) and api.nvim_win_get_buf(win) == split_header.buffer
+    and api.nvim_get_option_value('winbar', { win = win, scope = 'local' }) == split_header.value then
+    managed_headers[win] = vim.deepcopy(split_header)
+  end
+end })
 
 local function show_buffer(win, buf)
   api.nvim_win_call(win, function()
@@ -293,6 +330,7 @@ end
 
 local function leave_diff(win)
   if win then managed_diffs[win] = nil end
+  if win then restore_winbar(win) end
   if valid(win) then comment_diff.window(win, false) end
   if valid(win) and vim.wo[win].diff then
     api.nvim_win_call(win, function() vim.cmd('diffoff') end)
@@ -302,27 +340,32 @@ end
 api.nvim_create_autocmd('BufWinLeave', { callback = function(event)
   local meta = buffers[event.buf]
   for _, win in ipairs(vim.fn.win_findbuf(event.buf)) do
-    if managed_diffs[win] == event.buf or meta and meta.role then leave_diff(win) end
+    if managed_diffs[win] == event.buf or meta and meta.role then leave_diff(win)
+    elseif managed_headers[win] and managed_headers[win].buffer == event.buf then restore_winbar(win) end
   end
 end })
 
 api.nvim_create_autocmd({ 'BufEnter', 'BufWinEnter' }, { callback = function()
-  for win, previous in pairs(managed_diffs) do
-    if not valid(win) then managed_diffs[win] = nil
+  local previous_buffers = vim.tbl_extend('force', {}, managed_diffs)
+  for win, header in pairs(managed_headers) do previous_buffers[win] = header.buffer end
+  for win, previous in pairs(previous_buffers) do
+    if not valid(win) then managed_diffs[win], managed_headers[win] = nil, nil
     elseif api.nvim_win_get_buf(win) ~= previous then
+      local diff = managed_diffs[win] == previous
       managed_diffs[win] = nil
       if api.nvim_buf_is_valid(previous) then
         api.nvim_win_call(win, function()
           local current, view = api.nvim_get_current_buf(), vim.fn.winsaveview()
           local hidden = vim.bo[current].bufhidden
-          -- Clear this window's remembered diff options for the outgoing file,
+          -- Clear this window's saved Review options for the outgoing file,
           -- including when another window still displays that file.
           vim.bo[current].bufhidden = 'hide'
           local ok, err = pcall(function()
             api.nvim_cmd({ cmd = 'buffer', args = { tostring(previous) }, mods = {
               noautocmd = true, keepalt = true, keepjumps = true, hide = true,
             } }, {})
-            if vim.wo.diff then api.nvim_cmd({ cmd = 'diffoff', mods = { noautocmd = true } }, {}) end
+            if diff and vim.wo.diff then api.nvim_cmd({ cmd = 'diffoff', mods = { noautocmd = true } }, {}) end
+            restore_winbar(win)
           end)
           api.nvim_cmd({ cmd = 'buffer', args = { tostring(current) }, mods = {
             noautocmd = true, keepalt = true, keepjumps = true, hide = true,
@@ -332,6 +375,20 @@ api.nvim_create_autocmd({ 'BufEnter', 'BufWinEnter' }, { callback = function()
           comment_diff.window(win, false)
           if not ok then error(err) end
         end)
+      end
+    end
+  end
+  local win, buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
+  if not managed_headers[win] then
+    local value = api.nvim_get_option_value('winbar', { win = win, scope = 'local' })
+    if value ~= '' then
+      for owner, header in pairs(managed_headers) do
+        if header.buffer == buf and header.value == value and valid(owner) and api.nvim_win_get_buf(owner) == buf
+          and api.nvim_get_option_value('winbar', { win = owner, scope = 'local' }) == header.value then
+          if buffers[buf] then managed_headers[win] = vim.deepcopy(header)
+          else vim.wo[win].winbar = header.previous end
+          break
+        end
       end
     end
   end
@@ -356,7 +413,8 @@ api.nvim_create_autocmd('WinClosed', { callback = function(event)
   local win = tonumber(event.match)
   comment_diff.window(win, false)
   local meta = valid(win) and buffers[api.nvim_win_get_buf(win)]
-  if managed_diffs[win] or meta and meta.role then leave_diff(win) end
+  if managed_diffs[win] or meta and meta.role then leave_diff(win)
+  elseif managed_headers[win] then restore_winbar(win) end
 end })
 
 local function tab(state)
@@ -482,7 +540,7 @@ local function scratch(state, kind, object, lines, writable, role)
   if not fresh then return buf, meta end
   api.nvim_create_autocmd('BufWipeout', { buffer = buf, once = true, callback = function() buffers[buf] = nil end })
   api.nvim_create_autocmd({ 'BufEnter', 'BufWinEnter', 'WinEnter', 'WinLeave', 'CursorMoved' }, { buffer = buf, callback = function()
-    if meta.kind == 'composer' then vim.wo.winbar = '%{get(b:, "buf_review_context", "")}' end
+    if meta.kind == 'composer' then set_winbar(api.nvim_get_current_win(), buf, '%{get(b:, "buf_review_context", "")}') end
     if meta.dirty then render_reader(buf, 'position') end
     activate(buf)
   end })
@@ -583,7 +641,7 @@ local function render_file_winbar(buf, meta, view)
   end
   local title = meta.pane_label and (meta.pane_label .. progress)
     or ('%s %s  %s%s'):format(meta.side == 'base' and 'Base' or 'Head', meta.revision[meta.side], meta.source_path, progress):gsub('%%', '%%%%')
-  for _, win in ipairs(vim.fn.win_findbuf(buf)) do vim.wo[win].winbar = title end
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do set_winbar(win, buf, title) end
 end
 
 local function annotate(buf, meta, view)
@@ -1223,7 +1281,7 @@ local function display_home(state)
   leave_diff(state.top)
   show_buffer(state.top, buf)
   vim.wo[state.top].diff = false
-  vim.wo[state.top].winbar = ''
+  set_winbar(state.top, buf, '')
   vim.wo[state.top].foldmethod = state.loading and 'manual' or 'expr'
   vim.wo[state.top].foldexpr = "v:lua.require'buf_review'.foldexpr()"
   vim.wo[state.top].foldtext = 'getline(v:foldstart)'
@@ -1263,7 +1321,8 @@ local function show_browser(state, buf)
   leave_diff(state.top)
   show_buffer(state.top, buf)
   api.nvim_set_current_win(state.top)
-  vim.wo.diff, vim.wo.winbar, vim.wo.foldmethod = false, '', 'manual'
+  vim.wo.diff, vim.wo.foldmethod = false, 'manual'
+  set_winbar(api.nvim_get_current_win(), buf, '')
 end
 
 local function render_prs(state, pulls, err)
@@ -1632,7 +1691,7 @@ show_diff = function(context, panes)
     state.diff_windows[role] = win
     show_buffer(win, buf)
     if pane.kind == 'local' then
-      vim.wo[win].winbar = ('Working tree  %s'):format(code.path):gsub('%%', '%%%%')
+      set_winbar(win, buf, ('Working tree  %s'):format(code.path):gsub('%%', '%%%%'))
     else
       render_file_winbar(buf, buffers[buf], state.view)
     end
@@ -1725,7 +1784,7 @@ local function show_historical_hunk(state, response, id)
   state.left = valid(state.left) and state.left or (valid(state.top) and state.top or api.nvim_get_current_win())
   leave_diff(state.left)
   show_buffer(state.left, buf)
-  vim.wo[state.left].winbar = 'Historical reference · recorded hunk'
+  set_winbar(state.left, buf, 'Historical reference · recorded hunk')
   state.top, state.path = state.left, meta.path
   state.diff_windows = nil
   api.nvim_set_current_win(state.left)
@@ -2002,7 +2061,7 @@ end
 local function composer_winbar(buf, message)
   if api.nvim_buf_is_valid(buf) then
     vim.b[buf].buf_review_context = message:gsub('[\r\n]+', ' | ')
-    for _, win in ipairs(vim.fn.win_findbuf(buf)) do vim.wo[win].winbar = '%{get(b:, "buf_review_context", "")}' end
+    for _, win in ipairs(vim.fn.win_findbuf(buf)) do set_winbar(win, buf, '%{get(b:, "buf_review_context", "")}') end
   end
 end
 
@@ -2625,7 +2684,7 @@ local function context(state, row)
       show_buffer(0, buf)
       local location = ctx.anchor
       local path = location and location.path or ''
-      vim.wo.winbar = ('Original %s %s  %s'):format(side, commit or '', path):gsub('%%', '%%%%')
+      set_winbar(api.nvim_get_current_win(), buf, ('Original %s %s  %s'):format(side, commit or '', path):gsub('%%', '%%%%'))
     end
     if base then
       bind(base, 'base', ctx.anchor and ctx.anchor.revision.base)
@@ -2647,7 +2706,7 @@ local function context(state, row)
       reveal_location(api.nvim_get_current_win(), api.nvim_get_current_win(), ctx.anchor)
     else
       show_buffer(0, single)
-      vim.wo.winbar = 'Original context unavailable; recorded discussion'
+      set_winbar(api.nvim_get_current_win(), single, 'Original context unavailable; recorded discussion')
     end
     for old, entry in pairs(buffers) do if entry.state == state then retire_source(old) end end
   end, false)
